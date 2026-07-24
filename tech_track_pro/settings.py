@@ -37,6 +37,7 @@ THIRD_PARTY_APPS = [
 LOCAL_APPS = [
     'apps.users.apps.UsersConfig',
     'apps.tenants.apps.TenantsConfig',
+    'apps.jobber.apps.JobberConfig',
 ]
 
 INSTALLED_APPS = DJANGO_APPS + THIRD_PARTY_APPS + LOCAL_APPS
@@ -120,6 +121,45 @@ CORS_ALLOWED_ORIGINS = config(
     'CORS_ALLOWED_ORIGINS',
     default='http://localhost:5173',
 ).split(',')
+
+# ── Jobber OAuth / API ────────────────────────────────────────────────────────
+# Credentials come from the Jobber Developer Center (developer.getjobber.com).
+# REDIRECT_URI must match the OAuth callback URL registered on the app exactly.
+# Endpoint/version defaults track Jobber's public API and rarely change.
+
+JOBBER_CLIENT_ID = config('JOBBER_CLIENT_ID', default='')
+JOBBER_CLIENT_SECRET = config('JOBBER_CLIENT_SECRET', default='')
+JOBBER_REDIRECT_URI = config(
+    'JOBBER_REDIRECT_URI',
+    default='http://localhost:8000/v1/jobber/callback/',
+)
+# Space-separated scopes requested during authorization (read-only by default).
+JOBBER_SCOPES = config('JOBBER_SCOPES', default='read_clients read_jobs')
+
+JOBBER_AUTHORIZE_URL = config(
+    'JOBBER_AUTHORIZE_URL',
+    default='https://api.getjobber.com/api/oauth/authorize',
+)
+JOBBER_TOKEN_URL = config(
+    'JOBBER_TOKEN_URL',
+    default='https://api.getjobber.com/api/oauth/token',
+)
+JOBBER_GRAPHQL_URL = config(
+    'JOBBER_GRAPHQL_URL',
+    default='https://api.getjobber.com/api/graphql',
+)
+# Jobber GraphQL API version (X-JOBBER-GRAPHQL-VERSION header).
+JOBBER_API_VERSION = config('JOBBER_API_VERSION', default='2025-04-16')
+
+# Frontend URLs the callback redirects the browser to after the OAuth round-trip.
+JOBBER_CONNECT_SUCCESS_URL = config(
+    'JOBBER_CONNECT_SUCCESS_URL',
+    default='http://localhost:5173/jobber/connected',
+)
+JOBBER_CONNECT_FAILURE_URL = config(
+    'JOBBER_CONNECT_FAILURE_URL',
+    default='http://localhost:5173/jobber/failed',
+)
 
 # ── Swagger ───────────────────────────────────────────────────────────────────
 

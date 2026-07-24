@@ -34,4 +34,9 @@ MESSAGES = dict(
     # ── Token ─────────────────────────────────────────────────────────────────
     INVALID_TOKEN="Token is invalid or expired.",
     TOKEN_BLACKLISTED="Token has already been invalidated.",
+
+    # ── Jobber integration ────────────────────────────────────────────────────
+    JOBBER_NOT_CONFIGURED="Jobber integration is not configured. Please contact support.",
+    JOBBER_NOT_CONNECTED="No Jobber account is connected.",
+    JOBBER_DISCONNECTED="Jobber account disconnected successfully.",
 )
