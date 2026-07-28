@@ -193,6 +193,10 @@ class JobberDisconnectView(APIView):
                     success=False,
                 )
 
+            # Notify Jobber we initiated the disconnect so it can immediately
+            # invalidate the tokens on its side. Best-effort — failure is
+            # logged inside call_app_disconnect and does not block cleanup.
+            client.call_app_disconnect(account)
             account.delete()
             return api_response_parser(
                 data=data,
