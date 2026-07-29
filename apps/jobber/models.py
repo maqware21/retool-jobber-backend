@@ -58,9 +58,11 @@ class JobberAccount(DateModel):
         """
         Persist a token payload from Jobber's token endpoint.
 
-        Handles both the initial code exchange and refreshes. Jobber does not
-        always return a fresh ``refresh_token`` on refresh, so the existing one
-        is kept when absent.
+        Handles both the initial code exchange and refreshes. Refresh Token
+        Rotation is mandatory for our app, so Jobber always returns a new
+        refresh token on every refresh. The ``if`` guard is defensive — it
+        protects against the (invalid) state of rotation being temporarily
+        disabled, not normal behaviour.
         """
         self.access_token = token_data['access_token']
         if token_data.get('refresh_token'):

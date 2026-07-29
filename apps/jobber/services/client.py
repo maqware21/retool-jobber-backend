@@ -5,12 +5,14 @@ Thin wrapper over Jobber's public API:
   - authorize URL construction
   - authorization-code exchange and refresh-token rotation
   - authenticated GraphQL calls that transparently refresh a stale token
+    and handle rate limiting with a single retry
 
 All network failures surface as ``JobberAPIError`` so views can handle a single
 exception type.
 """
 
 import logging
+import time
 from urllib.parse import urlencode
 
 import requests
@@ -20,6 +22,10 @@ logger = logging.getLogger(__name__)
 
 # Network timeout (connect, read) for every Jobber call, in seconds.
 REQUEST_TIMEOUT = 30
+
+# Jobber's bucket refills at 500 points/second. Waiting 2 s restores 1 000 points,
+# which is enough headroom for all but the heaviest single queries.
+THROTTLE_RETRY_DELAY = 2.0
 
 
 class JobberAPIError(Exception):
@@ -85,6 +91,31 @@ def _post_token(payload):
 
 # ── GraphQL ─────────────────────────────────────────────────────────────────
 
+def _log_throttle_status(body, tenant_id):
+    """Log the throttle bucket state returned in every Jobber response."""
+    throttle = (
+        (body.get('extensions') or {})
+        .get('cost', {})
+        .get('throttleStatus', {})
+    )
+    if throttle:
+        logger.info(
+            "Jobber throttle status tenant=%s: %s/%s pts available (restore %s pts/s)",
+            tenant_id,
+            throttle.get('currentlyAvailable'),
+            throttle.get('maximumAvailable'),
+            throttle.get('restoreRate'),
+        )
+
+
+def _is_throttled(body):
+    """Return True when Jobber signalled a THROTTLED cost error."""
+    return any(
+        (err.get('extensions') or {}).get('code') == 'THROTTLED'
+        for err in (body.get('errors') or [])
+    )
+
+
 def get_valid_access_token(account):
     """
     Return a usable access token for ``account``, refreshing (and persisting)
@@ -101,8 +132,21 @@ def execute(account, query, variables=None):
     """
     Run a GraphQL query/mutation against Jobber on behalf of ``account``.
 
-    Refreshes a stale token up front, and retries once on a 401 in case Jobber
-    invalidated the token early. Returns the ``data`` object from the response.
+    Token handling:
+      - Refreshes a stale token up front.
+      - Retries once on 401 in case Jobber invalidated the token early.
+
+    Rate-limit handling:
+      - Logs ``throttleStatus`` from every response for visibility.
+      - On a THROTTLED response, waits ``THROTTLE_RETRY_DELAY`` seconds and
+        retries once. Still throttled after that → raises JobberAPIError with
+        a distinct message so callers can tell "throttled" from other failures.
+
+    Error handling:
+      - Standard GraphQL errors arrive as a top-level ``errors`` array.
+      - Two non-standard shapes are also checked explicitly (see comments).
+
+    Returns the ``data`` object from the response.
     """
     token = get_valid_access_token(account)
     response = _post_graphql(token, query, variables)
@@ -119,8 +163,43 @@ def execute(account, query, variables=None):
         raise JobberAPIError("Jobber API request failed.")
 
     body = response.json()
+    _log_throttle_status(body, account.tenant_id)
+
+    # ── Rate limit handling ────────────────────────────────────────────────────
+    if _is_throttled(body):
+        logger.warning(
+            "Jobber API throttled for tenant=%s; retrying after %.1fs",
+            account.tenant_id,
+            THROTTLE_RETRY_DELAY,
+        )
+        time.sleep(THROTTLE_RETRY_DELAY)
+        response = _post_graphql(account.access_token, query, variables)
+        body = response.json()
+        _log_throttle_status(body, account.tenant_id)
+        if _is_throttled(body):
+            raise JobberAPIError(
+                "Jobber API rate limit exceeded — still throttled after retry. "
+                "Reduce query cost or add delays between requests."
+            )
+
+    # ── Non-standard error shapes ──────────────────────────────────────────────
+    # Jobber uses these two shapes for auth-level rejections instead of the
+    # normal GraphQL top-level "errors" array:
+
+    # Singular "error" object: returned when the connected Jobber account is
+    # inactive (e.g. subscription lapsed).
+    if 'error' in body:
+        msg = (body['error'] or {}).get('message', 'Jobber returned an account error')
+        raise JobberAPIError(msg)
+
+    # Root-level "message" without a "data" key: returned when the Jobber user
+    # has disconnected the app from their account and the token is no longer valid.
+    if 'data' not in body and 'message' in body:
+        raise JobberAPIError(body['message'])
+
+    # ── Standard GraphQL errors ────────────────────────────────────────────────
     if body.get('errors'):
-        logger.error("Jobber GraphQL errors: %s", body['errors'])
+        logger.error("Jobber GraphQL errors for tenant=%s: %s", account.tenant_id, body['errors'])
         raise JobberAPIError("Jobber API returned errors.")
 
     return body.get('data')
@@ -144,9 +223,13 @@ def _post_graphql(access_token, query, variables):
         raise JobberAPIError("Could not reach the Jobber API.") from exc
 
 
-# ── Convenience queries ───────────────────────────────────────────────────────
+# ── Convenience queries / mutations ───────────────────────────────────────────
 
 _ACCOUNT_QUERY = "query { account { id name } }"
+
+# Notifies Jobber that we (not the user) initiated the disconnect. Jobber
+# immediately invalidates all tokens for the app on that account.
+_APP_DISCONNECT_MUTATION = "mutation { appDisconnect { userErrors { message } } }"
 
 
 def fetch_account_info(account):
@@ -160,3 +243,22 @@ def fetch_account_info(account):
     except JobberAPIError:
         logger.warning("Could not fetch Jobber account info for tenant=%s", account.tenant_id)
         return {}
+
+
+def call_app_disconnect(account):
+    """
+    Notify Jobber that we are initiating the disconnection of ``account``.
+
+    Best-effort: if the call fails (e.g. tokens already invalid, account
+    already disconnected on Jobber's side), the error is logged and swallowed
+    so the caller can still proceed with local cleanup.
+    """
+    try:
+        execute(account, _APP_DISCONNECT_MUTATION)
+        logger.info("appDisconnect mutation succeeded for tenant=%s", account.tenant_id)
+    except JobberAPIError as exc:
+        logger.warning(
+            "appDisconnect mutation failed for tenant=%s (proceeding with local cleanup): %s",
+            account.tenant_id,
+            exc,
+        )
