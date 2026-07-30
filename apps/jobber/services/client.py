@@ -243,6 +243,35 @@ _ACCOUNT_QUERY = "query { account { id name } }"
 # immediately invalidates all tokens for the app on that account.
 _APP_DISCONNECT_MUTATION = "mutation { appDisconnect { userErrors { message } } }"
 
+# Deliberately excludes lineItems/jobCosting — confirmed against a live job
+# (see PROJECT_CONTEXT.md) that lineItems.category can only ever be
+# PRODUCT/SERVICE (never a trade/category taxonomy), so querying it here
+# would spend query-cost budget for a field the Jobs list can't use.
+_JOBS_QUERY = """
+query GetJobs($first: Int!, $after: String) {
+  jobs(first: $first, after: $after) {
+    nodes {
+      id
+      jobNumber
+      title
+      instructions
+      jobStatus
+      total
+      startAt
+      createdAt
+      client { id name }
+      property { street city province postalCode }
+      visits(first: 1) {
+        nodes {
+          assignedUsers(first: 5) { nodes { id name { full } } }
+        }
+      }
+    }
+    pageInfo { hasNextPage endCursor }
+  }
+}
+"""
+
 
 def fetch_account_info(account):
     """
@@ -255,6 +284,21 @@ def fetch_account_info(account):
     except JobberAPIError:
         logger.warning("Could not fetch Jobber account info for tenant=%s", account.tenant_id)
         return {}
+
+
+def fetch_jobs(account, first=25, after=None):
+    """
+    Return the raw ``jobs`` connection for ``account``:
+    ``{'nodes': [...], 'pageInfo': {'hasNextPage': ..., 'endCursor': ...}}``.
+
+    Live proxy — no local caching. Raises JobberAPIError on failure like
+    every other call through ``execute()``; callers decide how to surface it.
+    """
+    data = execute(account, _JOBS_QUERY, {'first': first, 'after': after})
+    return (data or {}).get('jobs') or {
+        'nodes': [],
+        'pageInfo': {'hasNextPage': False, 'endCursor': None},
+    }
 
 
 def call_app_disconnect(account):
