@@ -86,7 +86,19 @@ def _post_token(payload):
         logger.error("Jobber token endpoint %s: %s", response.status_code, response.text)
         raise JobberAPIError("Jobber rejected the token request.")
 
-    return response.json()
+    body = response.json()
+
+    # Per OAuth 2.0 (RFC 6749 §5.1), a provider MAY omit "scope" from the token
+    # response when the granted scope matches what was requested — and Jobber
+    # does exactly that; its token endpoint never returns a "scope" key.
+    # Jobber's consent screen does not support partial/selectable scope grants
+    # (the user approves the full requested set or denies it), so the scope we
+    # requested is the scope that was granted. Fill it in here so every caller
+    # (store_tokens included) sees a usable value instead of storing None.
+    if not body.get('scope'):
+        body['scope'] = settings.JOBBER_SCOPES
+
+    return body
 
 
 # ── GraphQL ─────────────────────────────────────────────────────────────────
