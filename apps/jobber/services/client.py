@@ -273,6 +273,26 @@ query GetJobs($first: Int!, $after: String) {
 """
 
 
+_INVOICES_QUERY = """
+query GetInvoices($first: Int!, $after: String) {
+  invoices(first: $first, after: $after) {
+    nodes {
+      id
+      invoiceNumber
+      total
+      issuedDate
+      dueDate
+      invoiceStatus
+      amounts { invoiceBalance }
+      client { id name }
+      jobs(first: 3) { nodes { jobNumber } }
+    }
+    pageInfo { hasNextPage endCursor }
+  }
+}
+"""
+
+
 def fetch_account_info(account):
     """
     Return ``{'id': ..., 'name': ...}`` for the connected Jobber account, or an
@@ -296,6 +316,21 @@ def fetch_jobs(account, first=25, after=None):
     """
     data = execute(account, _JOBS_QUERY, {'first': first, 'after': after})
     return (data or {}).get('jobs') or {
+        'nodes': [],
+        'pageInfo': {'hasNextPage': False, 'endCursor': None},
+    }
+
+
+def fetch_invoices(account, first=25, after=None):
+    """
+    Return the raw ``invoices`` connection for ``account``:
+    ``{'nodes': [...], 'pageInfo': {'hasNextPage': ..., 'endCursor': ...}}``.
+
+    Live proxy — no local caching. Raises JobberAPIError on failure like
+    every other call through ``execute()``; callers decide how to surface it.
+    """
+    data = execute(account, _INVOICES_QUERY, {'first': first, 'after': after})
+    return (data or {}).get('invoices') or {
         'nodes': [],
         'pageInfo': {'hasNextPage': False, 'endCursor': None},
     }
