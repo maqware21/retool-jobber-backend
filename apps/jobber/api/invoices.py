@@ -36,6 +36,18 @@ def _status_display(raw_status):
     return _STATUS_DISPLAY_MAP.get(raw_status, raw_status.replace('_', ' ').title())
 
 
+def _safe_int(value):
+    """
+    Jobber returns invoiceNumber as a STRING (confirmed live: "1", not 1),
+    unlike Job.jobNumber which is already an Int. Falls back to None (not 0)
+    on anything unparseable so a sort never silently treats it as smallest.
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _format_job_refs(jobs_data):
     """
     "JOB-{n}" comma-joined for every job linked to the invoice, "—" if none.
@@ -56,6 +68,11 @@ def _map_invoice(node):
     return {
         'id': f"INV-{node.get('invoiceNumber')}",
         'jobber_id': node.get('id'),
+        # Genuine numeric field for sorting — "id" is a display string
+        # ("INV-10"), and a plain string/locale sort on it puts "INV-10"
+        # before "INV-9" once an account passes 9 invoices. The frontend
+        # must sort on this field, never on "id".
+        'invoice_number': _safe_int(node.get('invoiceNumber')),
         'customer': client_data.get('name'),
         'job_ids': _format_job_refs(node.get('jobs')),
         'amount': node.get('total'),
