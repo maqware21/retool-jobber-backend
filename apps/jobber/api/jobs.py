@@ -59,6 +59,13 @@ def _map_job(node):
     return {
         'id': f"JOB-{node.get('jobNumber')}",
         'jobber_id': node.get('id'),
+        # Genuine numeric field for sorting — "id" is a display string
+        # ("JOB-10"), and a plain string/locale sort on it puts "JOB-10"
+        # before "JOB-9" once an account passes 9 jobs. The frontend must
+        # sort on this field, never on "id". (Job.jobNumber is already a
+        # real int from Jobber, unlike Invoice.invoiceNumber which is a
+        # string — no parsing needed here.)
+        'job_number': node.get('jobNumber'),
         'customer': client_data.get('name'),
         # Confirmed dead end against a live query: Jobber has no trade/service
         # category taxonomy anywhere reachable from Job. Always null — the
