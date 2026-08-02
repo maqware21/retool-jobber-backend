@@ -1,5 +1,6 @@
 from django.urls import path
 
+from apps.jobber.api.invoices import JobberInvoicesView
 from apps.jobber.api.jobs import JobberJobsView
 from apps.jobber.api.oauth import (
     JobberCallbackView,
@@ -22,6 +23,7 @@ urlpatterns = [
 
     # ── Data (live proxy — no local caching) ────────────────────────────────────
     path('jobs/', JobberJobsView.as_view(), name='jobs'),
+    path('invoices/', JobberInvoicesView.as_view(), name='invoices'),
 
     # ── Webhooks (public — authenticated via HMAC-SHA256 signature) ────────────
     # Register this URL in the Jobber Developer Center for the APP_DISCONNECT
