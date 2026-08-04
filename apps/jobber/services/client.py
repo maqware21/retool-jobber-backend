@@ -261,7 +261,7 @@ query GetJobs($first: Int!, $after: String) {
       createdAt
       client { id name }
       property { street city province postalCode }
-      visits(first: 1) {
+      visits(first: 10) {
         nodes {
           assignedUsers(first: 5) { nodes { id name { full } } }
         }
