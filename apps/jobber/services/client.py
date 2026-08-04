@@ -261,7 +261,7 @@ query GetJobs($first: Int!, $after: String) {
       createdAt
       client { id name }
       property { street city province postalCode }
-      visits(first: 1) {
+      visits(first: 10) {
         nodes {
           assignedUsers(first: 5) { nodes { id name { full } } }
         }
@@ -291,6 +291,56 @@ query GetInvoices($first: Int!, $after: String) {
   }
 }
 """
+
+
+_USERS_QUERY = """
+query GetUsers($first: Int!, $after: String) {
+  users(first: $first, after: $after) {
+    nodes {
+      id
+      name { full }
+      isAccountAdmin
+      isAccountOwner
+    }
+    pageInfo { hasNextPage endCursor }
+  }
+}
+"""
+
+# Safety cap per collection for fetch_all_pages(): 20 pages x 25 records =
+# 500 records. Endpoints that need a complete picture (rankings, rosters —
+# where partial data could produce a WRONG result, not just an incomplete
+# list) use this instead of a single live-proxy page.
+FETCH_ALL_PAGE_SIZE = 25
+FETCH_ALL_MAX_PAGES = 20
+
+
+def fetch_all_pages(fetch_fn, account, label, first=FETCH_ALL_PAGE_SIZE, max_pages=FETCH_ALL_MAX_PAGES):
+    """
+    Loop ``fetch_fn(account, first=first, after=cursor)`` following the real
+    ``page_info.end_cursor`` until Jobber reports no more pages, or
+    ``max_pages`` is hit. Returns the full list of nodes collected.
+
+    If the cap is hit while more pages still exist, logs a clear warning —
+    the caller's result is based on a bounded sample, not literally
+    everything, and that should be visible in the logs, not silent.
+    """
+    all_nodes = []
+    cursor = None
+    for _page_num in range(max_pages):
+        page = fetch_fn(account, first=first, after=cursor)
+        all_nodes.extend(page.get('nodes') or [])
+        page_info = page.get('pageInfo') or {}
+        if not page_info.get('hasNextPage'):
+            return all_nodes
+        cursor = page_info.get('endCursor')
+
+    logger.warning(
+        "%s: hit the %d-page safety cap (%d records) for tenant=%s — "
+        "result is based on a bounded sample, not the full account.",
+        label, max_pages, max_pages * first, account.tenant_id,
+    )
+    return all_nodes
 
 
 def fetch_account_info(account):
@@ -331,6 +381,21 @@ def fetch_invoices(account, first=25, after=None):
     """
     data = execute(account, _INVOICES_QUERY, {'first': first, 'after': after})
     return (data or {}).get('invoices') or {
+        'nodes': [],
+        'pageInfo': {'hasNextPage': False, 'endCursor': None},
+    }
+
+
+def fetch_users(account, first=25, after=None):
+    """
+    Return the raw ``users`` connection for ``account``:
+    ``{'nodes': [...], 'pageInfo': {'hasNextPage': ..., 'endCursor': ...}}``.
+
+    Live proxy — no local caching. Raises JobberAPIError on failure like
+    every other call through ``execute()``; callers decide how to surface it.
+    """
+    data = execute(account, _USERS_QUERY, {'first': first, 'after': after})
+    return (data or {}).get('users') or {
         'nodes': [],
         'pageInfo': {'hasNextPage': False, 'endCursor': None},
     }

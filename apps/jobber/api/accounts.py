@@ -13,42 +13,6 @@ from helpers.utils import api_response_parser
 
 logger = logging.getLogger(__name__)
 
-PAGE_SIZE = 25
-# Safety cap per collection: 20 pages x 25 records = 500 records. A ranking
-# needs the complete picture (partial data could produce a WRONG order, not
-# just an incomplete list) — unlike Jobs/Invoices, where a single page is an
-# acceptable simplification. This cap exists so a very large real account
-# can't turn one request into an unbounded pull.
-MAX_PAGES = 20
-
-
-def _fetch_all(fetch_fn, account, label):
-    """
-    Loop `fetch_fn(account, first=PAGE_SIZE, after=cursor)` following the
-    real page_info.end_cursor until Jobber reports no more pages, or
-    MAX_PAGES is hit. Returns the full list of nodes collected.
-
-    If the cap is hit while more pages still exist, logs a clear warning —
-    the caller's ranking is based on a bounded sample, not literally
-    everything, and that should be visible in the logs, not silent.
-    """
-    all_nodes = []
-    cursor = None
-    for _page_num in range(MAX_PAGES):
-        page = fetch_fn(account, first=PAGE_SIZE, after=cursor)
-        all_nodes.extend(page.get('nodes') or [])
-        page_info = page.get('pageInfo') or {}
-        if not page_info.get('hasNextPage'):
-            return all_nodes
-        cursor = page_info.get('endCursor')
-
-    logger.warning(
-        "%s: hit the %d-page safety cap (%d records) for tenant=%s — "
-        "the Accounts ranking is based on a bounded sample, not the full account.",
-        label, MAX_PAGES, MAX_PAGES * PAGE_SIZE, account.tenant_id,
-    )
-    return all_nodes
-
 
 def _rank_accounts(job_nodes, invoice_nodes):
     """
@@ -103,10 +67,10 @@ class JobberAccountsView(APIView):
     computes the complete ranking, that's the whole point.
 
     UNCACHED: every request re-pulls every job and every invoice (bounded
-    by MAX_PAGES) and re-ranks from scratch. This needs a caching layer
-    (e.g. 15-30 min per tenant) before real customer data volume — see
-    PROJECT_CONTEXT.md. Deliberately shipped uncached for now; flagging,
-    not deferring silently.
+    by client.fetch_all_pages's safety cap) and re-ranks from scratch. This
+    needs a caching layer (e.g. 15-30 min per tenant) before real customer
+    data volume — see PROJECT_CONTEXT.md. Deliberately shipped uncached for
+    now; flagging, not deferring silently.
     """
     permission_classes = [CustomerPermission]
 
@@ -122,8 +86,8 @@ class JobberAccountsView(APIView):
                     success=True,
                 )
 
-            job_nodes = _fetch_all(client.fetch_jobs, account, 'fetch_jobs')
-            invoice_nodes = _fetch_all(client.fetch_invoices, account, 'fetch_invoices')
+            job_nodes = client.fetch_all_pages(client.fetch_jobs, account, 'fetch_jobs')
+            invoice_nodes = client.fetch_all_pages(client.fetch_invoices, account, 'fetch_invoices')
 
             data = {
                 'connected': True,
