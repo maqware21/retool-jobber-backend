@@ -1,6 +1,7 @@
 from django.urls import path
 
 from apps.jobber.api.accounts import JobberAccountsView
+from apps.jobber.api.employees import JobberEmployeesView
 from apps.jobber.api.invoices import JobberInvoicesView
 from apps.jobber.api.jobs import JobberJobsView
 from apps.jobber.api.oauth import (
@@ -26,6 +27,7 @@ urlpatterns = [
     path('jobs/', JobberJobsView.as_view(), name='jobs'),
     path('invoices/', JobberInvoicesView.as_view(), name='invoices'),
     path('accounts/', JobberAccountsView.as_view(), name='accounts'),
+    path('employees/', JobberEmployeesView.as_view(), name='employees'),
 
     # ── Webhooks (public — authenticated via HMAC-SHA256 signature) ────────────
     # Register this URL in the Jobber Developer Center for the APP_DISCONNECT
