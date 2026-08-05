@@ -97,6 +97,12 @@ def _compute_summary(invoices):
     client-side pagination (see PROJECT_CONTEXT.md). Not a full-account
     aggregate; will undercount once an account has more invoices than a
     single page fetches.
+
+    Draft invoices are excluded from total_billed (and its count) — a
+    draft hasn't been sent yet, so it isn't "billed." Drafts still appear
+    in the invoice list itself; this only changes the summary card math.
+    Resolves the previously-open "does Draft count toward Total Billed"
+    question per TL decision.
     """
     def bucket(label):
         return [inv for inv in invoices if inv['status_display'] == label]
@@ -104,10 +110,11 @@ def _compute_summary(invoices):
     paid = bucket('Paid')
     pending = bucket('Pending')
     overdue = bucket('Overdue')
+    billed = [inv for inv in invoices if inv['status_display'] != 'Draft']
 
     return {
-        'total_billed': sum(inv['amount'] for inv in invoices),
-        'total_billed_count': len(invoices),
+        'total_billed': sum(inv['amount'] for inv in billed),
+        'total_billed_count': len(billed),
         'paid': sum(inv['amount'] for inv in paid),
         'paid_count': len(paid),
         'pending': sum(inv['amount'] for inv in pending),

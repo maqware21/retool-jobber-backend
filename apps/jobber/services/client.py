@@ -243,10 +243,19 @@ _ACCOUNT_QUERY = "query { account { id name } }"
 # immediately invalidates all tokens for the app on that account.
 _APP_DISCONNECT_MUTATION = "mutation { appDisconnect { userErrors { message } } }"
 
-# Deliberately excludes lineItems/jobCosting — confirmed against a live job
-# (see PROJECT_CONTEXT.md) that lineItems.category can only ever be
-# PRODUCT/SERVICE (never a trade/category taxonomy), so querying it here
-# would spend query-cost budget for a field the Jobs list can't use.
+# lineItems: re-added per TL approval (2026-08-05) — jobCosting remains
+# excluded (still no need for it here). lineItems.category is still a
+# confirmed dead end (PRODUCT/SERVICE only, never a trade taxonomy) and is
+# NOT queried; only linkedProductOrService.name is, for a free-text "Trade"
+# label. Only the first line item is fetched — that's all _job_service_type
+# uses. client.tags: added per TL approval for a free-text Accounts "Type"
+# column (Tag only has id/label — NOT name — confirmed against the schema).
+#
+# This query is shared by three consumers: the Jobs single-page endpoint,
+# and the Accounts/Employees full-pulls (via client.fetch_all_pages). Widening
+# it adds a small per-request cost to ALL THREE, not just Jobs — acceptable
+# per TL's approval, revisit if a real account's job list grows large enough
+# to matter.
 _JOBS_QUERY = """
 query GetJobs($first: Int!, $after: String) {
   jobs(first: $first, after: $after) {
@@ -259,8 +268,13 @@ query GetJobs($first: Int!, $after: String) {
       total
       startAt
       createdAt
-      client { id name }
+      client { id name tags(first: 5) { nodes { label } } }
       property { street city province postalCode }
+      lineItems(first: 1) {
+        nodes {
+          linkedProductOrService { name }
+        }
+      }
       visits(first: 10) {
         nodes {
           assignedUsers(first: 5) { nodes { id name { full } } }
@@ -273,6 +287,9 @@ query GetJobs($first: Int!, $after: String) {
 """
 
 
+# client.tags added per TL approval — same free-text Accounts "Type" reasoning
+# as _JOBS_QUERY. Shared by the Invoices single-page endpoint and Accounts'
+# full-pull; the extra field is fetched but unused by Invoices itself.
 _INVOICES_QUERY = """
 query GetInvoices($first: Int!, $after: String) {
   invoices(first: $first, after: $after) {
@@ -284,7 +301,7 @@ query GetInvoices($first: Int!, $after: String) {
       dueDate
       invoiceStatus
       amounts { invoiceBalance }
-      client { id name }
+      client { id name tags(first: 5) { nodes { label } } }
       jobs(first: 3) { nodes { jobNumber } }
     }
     pageInfo { hasNextPage endCursor }

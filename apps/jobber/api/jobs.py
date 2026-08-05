@@ -53,6 +53,24 @@ def _first_assignee(job_node):
     return name.get('full') or 'Unassigned'
 
 
+def _job_service_type(job_node):
+    """
+    The job's first line item's linked product/service name, or None if the
+    job has no line items or used a freeform line item (no linked catalog
+    entry). Free-text, not a fixed taxonomy — whatever the account named
+    their catalog entries. Same derivation Accounts' service_type_breakdown
+    tally uses (duplicated there rather than cross-imported, consistent with
+    every other api/*.py module in this app).
+    """
+    line_items = (job_node.get('lineItems') or {}).get('nodes') or []
+    if not line_items:
+        return None
+    linked = line_items[0].get('linkedProductOrService')
+    if not linked:
+        return None
+    return linked.get('name')
+
+
 def _map_job(node):
     client_data = node.get('client') or {}
     raw_status = node.get('jobStatus') or ''
@@ -67,10 +85,10 @@ def _map_job(node):
         # string — no parsing needed here.)
         'job_number': node.get('jobNumber'),
         'customer': client_data.get('name'),
-        # Confirmed dead end against a live query: Jobber has no trade/service
-        # category taxonomy anywhere reachable from Job. Always null — the
-        # frontend renders this as "—", not hidden.
-        'type': None,
+        # Free-text, from the job's first line item's linked catalog entry —
+        # not a fixed taxonomy (Jobber has none). None if the job has no
+        # line items or used a freeform one; frontend renders "—".
+        'type': _job_service_type(node),
         'description': node.get('instructions') or node.get('title') or '',
         'assigned_to': _first_assignee(node),
         'status': raw_status,
