@@ -11,3 +11,13 @@ USER_PERMISSIONS = [
     ('admin', 'admin'),
     ('customer', 'customer'),
 ]
+
+# JobberSyncRun.status. Index positions are used directly (e.g.
+# JOBBER_SYNC_STATUS[0][0]) — do not reorder.
+# Index 0 = running, 1 = success, 2 = partial, 3 = failed.
+JOBBER_SYNC_STATUS = [
+    ('running', 'running'),
+    ('success', 'success'),
+    ('partial', 'partial'),
+    ('failed', 'failed'),
+]
