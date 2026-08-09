@@ -105,13 +105,54 @@ def _map_job(node):
 class JobberJobsView(APIView):
     """
     GET /v1/jobber/jobs/?first=&after=
-    Live-proxies Jobber's `jobs` query for the authenticated customer's
-    connected Jobber account. No local caching or sync engine — every call
-    hits Jobber fresh (deliberate "live proxy" design, see PROJECT_CONTEXT.md).
+
+    Phase 2 cutover: now reads from local tables via _local_jobs_response()
+    (ensure_fresh() + local tables), not Jobber directly. The original
+    live-proxy body is preserved, unused, in _get_live() below for a fast
+    rollback if needed — revert by having get() call self._get_live(request)
+    instead of _local_jobs_response(). Invoices/Accounts/Employees are
+    unchanged — still live-proxy, per the current comparison-only rollout.
     """
     permission_classes = [CustomerPermission]
 
     def get(self, request):
+        data = {'connected': False, 'jobs': [], 'page_info': None}
+        try:
+            first = self._parse_first(request.query_params.get('first'))
+            after = request.query_params.get('after') or None
+
+            data = _local_jobs_response(request.user, first=first, after=after)
+            return api_response_parser(
+                data=data,
+                message=MESSAGES['SUCCESS'],
+                status=status.HTTP_200_OK,
+                success=True,
+            )
+        except Exception as ve:
+            success, msg, st = validator_errors(ve)
+            return api_response_parser(data=data, message=msg, status=st, success=success)
+
+    @staticmethod
+    def _account_for(user):
+        if not user.tenant_id:
+            return None
+        return JobberAccount.objects.filter(tenant_id=user.tenant_id, is_active=True).first()
+
+    @staticmethod
+    def _parse_first(raw_value):
+        try:
+            n = int(raw_value)
+        except (TypeError, ValueError):
+            return DEFAULT_PAGE_SIZE
+        return max(1, min(n, MAX_PAGE_SIZE))
+
+    def _get_live(self, request):
+        """
+        DEAD CODE — deliberately kept, not called from anywhere. This is the
+        exact live-proxy body get() used before the Phase 2 cutover above.
+        Rollback: make get() call self._get_live(request) again instead of
+        _local_jobs_response().
+        """
         data = {'connected': False, 'jobs': [], 'page_info': None}
         try:
             account = self._account_for(request.user)
@@ -146,20 +187,6 @@ class JobberJobsView(APIView):
         except Exception as ve:
             success, msg, st = validator_errors(ve)
             return api_response_parser(data=data, message=msg, status=st, success=success)
-
-    @staticmethod
-    def _account_for(user):
-        if not user.tenant_id:
-            return None
-        return JobberAccount.objects.filter(tenant_id=user.tenant_id, is_active=True).first()
-
-    @staticmethod
-    def _parse_first(raw_value):
-        try:
-            n = int(raw_value)
-        except (TypeError, ValueError):
-            return DEFAULT_PAGE_SIZE
-        return max(1, min(n, MAX_PAGE_SIZE))
 
 
 # ── Local-table read path (Phase 2) ──────────────────────────────────────────
