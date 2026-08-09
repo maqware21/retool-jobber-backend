@@ -5,15 +5,17 @@ from django.conf import settings
 from django.core import signing
 from django.db import transaction
 from django.http import HttpResponseRedirect
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.views import APIView
 
-from apps.jobber.models import JobberAccount
+from apps.jobber.models import JobberAccount, JobberSyncRun
 from apps.jobber.services import client
 from apps.jobber.services import state as state_service
 from apps.tenants.models import Tenant
 from apps.users.models import User
 from helpers.api_exception import validator_errors
+from helpers.constants import JOBBER_SYNC_STATUS
 from helpers.messages import MESSAGES
 from helpers.user_permissions import CustomerPermission
 from helpers.utils import api_response_parser
@@ -118,6 +120,26 @@ class JobberCallbackView(APIView):
             account = JobberAccount(tenant=tenant, access_token='', refresh_token='')
         account.is_active = True
         account.store_tokens(token_data)
+
+        # Phase 2 local-sync bootstrap: seed the tenant's first JobberSyncRun
+        # row as an already-finished SUCCESS with zero counts, in the same
+        # transaction as the JobberAccount row above. The sync engine's
+        # concurrency guard (select_for_update on the tenant's latest
+        # JobberSyncRun row) assumes one already exists — this is the only
+        # place a brand-new tenant gets one. Seeding SUCCESS (not RUNNING)
+        # means the very first real sync sees a plain "stale, never synced"
+        # tenant and takes the normal stale-request path, with no
+        # special-cased "first sync ever" branch needed anywhere in the sync
+        # engine. Guarded by .exists() so a tenant reconnecting Jobber after
+        # a disconnect doesn't get a second bootstrap row wiping/duplicating
+        # real sync history.
+        if not JobberSyncRun.objects.filter(tenant=tenant).exists():
+            JobberSyncRun.objects.create(
+                tenant=tenant,
+                status=JOBBER_SYNC_STATUS[1][0],
+                finished_at=timezone.now(),
+            )
+
         return account
 
     def _enrich_account(self, account):

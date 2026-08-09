@@ -3,8 +3,9 @@ import logging
 from rest_framework import status
 from rest_framework.views import APIView
 
-from apps.jobber.models import JobberAccount
+from apps.jobber.models import JobberAccount, JobberInvoice
 from apps.jobber.services import client
+from apps.jobber.services.sync import ensure_fresh
 from helpers.api_exception import validator_errors
 from helpers.messages import MESSAGES
 from helpers.user_permissions import CustomerPermission
@@ -184,3 +185,84 @@ class JobberInvoicesView(APIView):
         except (TypeError, ValueError):
             return DEFAULT_PAGE_SIZE
         return max(1, min(n, MAX_PAGE_SIZE))
+
+
+# ── Local-table read path (Phase 2) ──────────────────────────────────────────
+# Built alongside the live-proxy code above, NOT wired into JobberInvoicesView
+# yet. See the accompanying compare_invoices.py script.
+
+def _isoformat(value):
+    return value.isoformat() if value else None
+
+
+def _local_format_job_refs(invoice):
+    """Local equivalent of _format_job_refs() — "JOB-{n}" comma-joined, "—" if none."""
+    numbers = [j.job_number for j in invoice.jobs.filter(is_active=True) if j.job_number is not None]
+    if not numbers:
+        return '—'
+    return ', '.join(f"JOB-{n}" for n in numbers)
+
+
+def _map_local_invoice(invoice):
+    """Local-table equivalent of _map_invoice() — same keys, same field types."""
+    return {
+        'id': f"INV-{invoice.invoice_number}",
+        'jobber_id': invoice.jobber_id,
+        'invoice_number': invoice.invoice_number,
+        'customer': invoice.client.name if invoice.client else None,
+        'job_ids': _local_format_job_refs(invoice),
+        'amount': float(invoice.amount) if invoice.amount is not None else None,
+        'balance': float(invoice.balance) if invoice.balance is not None else None,
+        'issued_date': _isoformat(invoice.issued_date),
+        'due_date': _isoformat(invoice.due_date),
+        'status': invoice.invoice_status,
+        'status_display': invoice.status_display,
+    }
+
+
+def _local_invoices_response(user, first=DEFAULT_PAGE_SIZE, after=None):
+    """
+    Local-table equivalent of JobberInvoicesView.get()'s `data` dict. Calls
+    ensure_fresh() first, then reads local tables — never Jobber directly.
+
+    Same OFFSET-based local pagination caveat as jobs.py's
+    _local_jobs_response(). The summary is deliberately still computed over
+    just this page (matching _compute_summary()'s existing page-only
+    limitation exactly) rather than upgraded to a full-account aggregate —
+    that upgrade is real and available once local tables are the source of
+    truth, but doing it here would make the live and local outputs diverge
+    in a way that looks like a bug during this round's side-by-side
+    comparison, when it would actually just be an intentional improvement
+    saved for the cutover step.
+    """
+    tenant_id = user.tenant_id
+    if not tenant_id:
+        return {'connected': False, 'invoices': [], 'summary': None, 'page_info': None}
+
+    account = JobberAccount.objects.filter(tenant_id=tenant_id, is_active=True).first()
+    if account is None:
+        return {'connected': False, 'invoices': [], 'summary': None, 'page_info': None}
+
+    fresh = ensure_fresh(account.tenant, entities=['clients', 'jobs', 'invoices'])
+
+    queryset = JobberInvoice.objects.filter(tenant_id=tenant_id, is_active=True).select_related('client').order_by('id')
+    offset = int(after) if after else 0
+    page = list(queryset[offset:offset + first])
+    has_next_page = queryset.count() > offset + first
+    end_cursor = str(offset + first) if has_next_page else None
+
+    invoices = [_map_local_invoice(inv) for inv in page]
+
+    data = {
+        'connected': True,
+        'invoices': invoices,
+        'summary': _compute_summary(invoices),
+        'page_info': {
+            'has_next_page': has_next_page,
+            'end_cursor': end_cursor,
+        },
+        'last_synced_at': _isoformat(fresh['last_synced_at']),
+    }
+    if fresh['sync_warning']:
+        data['sync_warning'] = fresh['sync_warning']
+    return data

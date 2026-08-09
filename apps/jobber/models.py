@@ -3,11 +3,18 @@ from datetime import timedelta
 from django.db import models
 from django.utils import timezone
 
+from helpers.constants import JOBBER_SYNC_STATUS
 from helpers.models import DateModel
 
 # Refresh a little before the real expiry so an in-flight request never races
 # the token going stale.
 TOKEN_EXPIRY_LEEWAY = timedelta(seconds=60)
+
+# A RUNNING JobberSyncRun whose lock heartbeat (claimed_at, falling back to
+# started_at) is older than this is treated as orphaned — the worker that
+# claimed it almost certainly died mid-sync (a recycle is routine, not
+# exotic), not one still legitimately in flight. See JobberSyncRun.is_stuck.
+SYNC_RUN_STALE_AFTER = timedelta(minutes=5)
 
 
 class JobberAccount(DateModel):
@@ -77,3 +84,291 @@ class JobberAccount(DateModel):
 
         self.save()
         return self
+
+
+class JobberClient(DateModel):
+    """
+    Local mirror of one Jobber Client, populated and refreshed by the sync
+    engine (Phase 2). A full sync pass no longer seeing a previously-synced
+    jobber_id sets is_active=False rather than deleting the row.
+    """
+
+    tenant = models.ForeignKey(
+        'tenants.Tenant',
+        on_delete=models.CASCADE,
+        related_name='jobber_clients',
+    )
+    jobber_id = models.CharField(max_length=255, db_index=True)
+    name = models.CharField(max_length=255)
+    # Comma-joined tag labels — reuses _client_tags_display()'s exact
+    # derivation verbatim. Free-text, not a fixed taxonomy.
+    tags_display = models.CharField(max_length=255, null=True, blank=True)
+    synced_at = models.DateTimeField()
+
+    class Meta:
+        db_table = 'jobber_clients'
+        verbose_name = 'jobber client'
+        verbose_name_plural = 'jobber clients'
+        constraints = [
+            models.UniqueConstraint(fields=['tenant', 'jobber_id'], name='unique_jobber_client_tenant_jobber_id'),
+        ]
+
+    def __str__(self):
+        return f"JobberClient(tenant={self.tenant_id}, jobber_id={self.jobber_id})"
+
+
+class JobberUser(DateModel):
+    """
+    Local mirror of one Jobber User/Technician, populated and refreshed by
+    the sync engine.
+    """
+
+    tenant = models.ForeignKey(
+        'tenants.Tenant',
+        on_delete=models.CASCADE,
+        related_name='jobber_users',
+    )
+    jobber_id = models.CharField(max_length=255, db_index=True)
+    name = models.CharField(max_length=255)
+    # Already fetched live today via _USERS_QUERY but not exposed anywhere.
+    # Kept here for the still-open "filter admins/owners from the roster?"
+    # question (see PROJECT_CONTEXT.md) — not resolved by this model.
+    is_account_admin = models.BooleanField(default=False)
+    is_account_owner = models.BooleanField(default=False)
+    synced_at = models.DateTimeField()
+
+    class Meta:
+        db_table = 'jobber_users'
+        verbose_name = 'jobber user'
+        verbose_name_plural = 'jobber users'
+        constraints = [
+            models.UniqueConstraint(fields=['tenant', 'jobber_id'], name='unique_jobber_user_tenant_jobber_id'),
+        ]
+
+    def __str__(self):
+        return f"JobberUser(tenant={self.tenant_id}, jobber_id={self.jobber_id})"
+
+
+class JobberJob(DateModel):
+    """
+    Local mirror of one Jobber Job, populated and refreshed by the sync
+    engine.
+    """
+
+    tenant = models.ForeignKey(
+        'tenants.Tenant',
+        on_delete=models.CASCADE,
+        related_name='jobber_jobs',
+    )
+    client = models.ForeignKey(
+        JobberClient,
+        on_delete=models.CASCADE,
+        related_name='jobs',
+    )
+    jobber_id = models.CharField(max_length=255, db_index=True)
+    # Real int from Jobber — the same field the sort-bug fix on the
+    # live-proxy jobs.py endpoint already established (id is a display
+    # string like "JOB-10" and sorts wrong past single digits).
+    job_number = models.IntegerField(null=True, blank=True)
+    title = models.CharField(max_length=255)
+    # Reuses the "instructions or title" fallback already proven live.
+    description = models.TextField(null=True, blank=True)
+    job_status = models.CharField(max_length=50)
+    # Reuses _humanize_status() verbatim.
+    status_display = models.CharField(max_length=50)
+    # Reuses _job_service_type() verbatim — free-text, not a fixed taxonomy,
+    # same caveat already documented for the live endpoints.
+    service_type = models.CharField(max_length=255, null=True, blank=True)
+    # DecimalField, not float — a stored financial figure, unlike the
+    # live-proxy code's display-only JSON float pass-through.
+    total = models.DecimalField(max_digits=12, decimal_places=2)
+    jobber_created_at = models.DateTimeField(null=True, blank=True)
+    start_at = models.DateTimeField(null=True, blank=True)
+    # Reuses _format_address() verbatim.
+    address = models.CharField(max_length=500, null=True, blank=True)
+    # From Jobber's jobCosting { labourDuration labourCost } — added now
+    # rather than in a later migration, for the Electricians "Avg Job
+    # Duration" card. labourDuration is a Seconds int scalar; labour_cost
+    # gets the same float-to-Decimal treatment as total.
+    labour_duration_seconds = models.IntegerField(null=True, blank=True)
+    labour_cost = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    synced_at = models.DateTimeField()
+
+    class Meta:
+        db_table = 'jobber_jobs'
+        verbose_name = 'jobber job'
+        verbose_name_plural = 'jobber jobs'
+        constraints = [
+            models.UniqueConstraint(fields=['tenant', 'jobber_id'], name='unique_jobber_job_tenant_jobber_id'),
+        ]
+
+    def __str__(self):
+        return f"JobberJob(tenant={self.tenant_id}, jobber_id={self.jobber_id})"
+
+    # ── Properties ────────────────────────────────────────────────────────────
+
+    @property
+    def labour_duration_hours(self):
+        if self.labour_duration_seconds is None:
+            return None
+        return round(self.labour_duration_seconds / 3600, 2)
+
+
+class JobberVisit(DateModel):
+    """
+    Local mirror of one Jobber Visit. A Job's assignee is a Visit's
+    assignee, not the Job's own field — confirmed by the live-proxy's own
+    _first_assignee, which reads job.visits[0].assignedUsers. Storing this
+    as a real table (instead of a denormalized name string on Job) is the
+    actual upgrade this phase enables.
+    """
+
+    tenant = models.ForeignKey(
+        'tenants.Tenant',
+        on_delete=models.CASCADE,
+        related_name='jobber_visits',
+    )
+    job = models.ForeignKey(
+        JobberJob,
+        on_delete=models.CASCADE,
+        related_name='visits',
+    )
+    # Nullable — "Unassigned" becomes null instead of a string.
+    assigned_user = models.ForeignKey(
+        JobberUser,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='visits',
+    )
+    jobber_id = models.CharField(max_length=255, db_index=True)
+    synced_at = models.DateTimeField()
+
+    class Meta:
+        db_table = 'jobber_visits'
+        verbose_name = 'jobber visit'
+        verbose_name_plural = 'jobber visits'
+        constraints = [
+            models.UniqueConstraint(fields=['tenant', 'jobber_id'], name='unique_jobber_visit_tenant_jobber_id'),
+        ]
+
+    def __str__(self):
+        return f"JobberVisit(tenant={self.tenant_id}, jobber_id={self.jobber_id})"
+
+    # ── Properties ────────────────────────────────────────────────────────────
+
+    @property
+    def assigned_user_name(self):
+        return self.assigned_user.name if self.assigned_user else 'Unassigned'
+
+
+class JobberInvoice(DateModel):
+    """
+    Local mirror of one Jobber Invoice, populated and refreshed by the sync
+    engine.
+    """
+
+    tenant = models.ForeignKey(
+        'tenants.Tenant',
+        on_delete=models.CASCADE,
+        related_name='jobber_invoices',
+    )
+    client = models.ForeignKey(
+        JobberClient,
+        on_delete=models.CASCADE,
+        related_name='invoices',
+    )
+    # An invoice can reference zero or multiple jobs — reuses the exact
+    # insight _format_job_refs() already proved live. Not a single FK.
+    jobs = models.ManyToManyField(JobberJob, related_name='invoices', blank=True)
+    jobber_id = models.CharField(max_length=255, db_index=True)
+    # Jobber returns this as a STRING, unlike Job.jobNumber — via _safe_int().
+    invoice_number = models.IntegerField(null=True, blank=True)
+    amount = models.DecimalField(max_digits=12, decimal_places=2)
+    # Genuinely distinct from amount — a partially paid invoice has
+    # balance < amount.
+    balance = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    # Raw; a genuinely null issued_date on a real draft invoice is already
+    # confirmed against live data, not hypothetical.
+    issued_date = models.DateTimeField(null=True, blank=True)
+    due_date = models.DateTimeField(null=True, blank=True)
+    invoice_status = models.CharField(max_length=50)
+    # Reuses _STATUS_DISPLAY_MAP/_status_display() verbatim, including the
+    # already-resolved "Draft excluded from billed totals" decision.
+    status_display = models.CharField(max_length=50)
+    synced_at = models.DateTimeField()
+
+    class Meta:
+        db_table = 'jobber_invoices'
+        verbose_name = 'jobber invoice'
+        verbose_name_plural = 'jobber invoices'
+        constraints = [
+            models.UniqueConstraint(fields=['tenant', 'jobber_id'], name='unique_jobber_invoice_tenant_jobber_id'),
+        ]
+
+    def __str__(self):
+        return f"JobberInvoice(tenant={self.tenant_id}, jobber_id={self.jobber_id})"
+
+
+class JobberSyncRun(models.Model):
+    """
+    One row per sync attempt for a tenant (not one mutable row per tenant —
+    FR-308 needs history). Does double duty as both the FR-308 audit trail
+    and the concurrency lock: claiming a row IS starting a sync run, via
+    select_for_update() in the sync engine (not built in this step).
+
+    Deliberately does NOT inherit DateModel — its is_active toggle doesn't
+    mean anything for a historical run record; a past run isn't "inactive,"
+    it already finished. One conscious, stated exception to this app's
+    base-class convention, not a silent departure from it.
+    """
+
+    tenant = models.ForeignKey(
+        'tenants.Tenant',
+        on_delete=models.CASCADE,
+        related_name='jobber_sync_runs',
+    )
+    status = models.CharField(max_length=10, choices=JOBBER_SYNC_STATUS, default=JOBBER_SYNC_STATUS[0][0])
+    started_at = models.DateTimeField(auto_now_add=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+    # The lock heartbeat the concurrency guard uses to tell a genuinely
+    # in-flight sync apart from one whose worker died mid-run.
+    claimed_at = models.DateTimeField(null=True, blank=True)
+    # Same "log the real exception message" convention JobberAPIError
+    # already establishes.
+    error_message = models.TextField(null=True, blank=True)
+    # Per-entity breakdown of what this run actually synced, so "which
+    # entity types are stale right now" is answerable without re-deriving
+    # it from the entity tables themselves.
+    clients_synced = models.IntegerField(default=0)
+    users_synced = models.IntegerField(default=0)
+    jobs_synced = models.IntegerField(default=0)
+    visits_synced = models.IntegerField(default=0)
+    invoices_synced = models.IntegerField(default=0)
+
+    class Meta:
+        db_table = 'jobber_sync_runs'
+        verbose_name = 'jobber sync run'
+        verbose_name_plural = 'jobber sync runs'
+        ordering = ['-started_at']
+
+    def __str__(self):
+        return f"JobberSyncRun(tenant={self.tenant_id}, status={self.status}, started_at={self.started_at})"
+
+    # ── Properties ────────────────────────────────────────────────────────────
+
+    @property
+    def duration_seconds(self):
+        if not self.finished_at:
+            return None
+        return (self.finished_at - self.started_at).total_seconds()
+
+    @property
+    def is_stuck(self):
+        """True when this run is still RUNNING but its lock heartbeat is stale — the worker that claimed it almost certainly died mid-sync."""
+        if self.status != JOBBER_SYNC_STATUS[0][0]:
+            return False
+        heartbeat = self.claimed_at or self.started_at
+        if not heartbeat:
+            return True
+        return timezone.now() >= (heartbeat + SYNC_RUN_STALE_AFTER)

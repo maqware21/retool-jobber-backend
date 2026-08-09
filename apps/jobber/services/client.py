@@ -17,6 +17,7 @@ from urllib.parse import urlencode
 
 import requests
 from django.conf import settings
+from django.utils import timezone
 
 logger = logging.getLogger(__name__)
 
@@ -256,6 +257,19 @@ _APP_DISCONNECT_MUTATION = "mutation { appDisconnect { userErrors { message } } 
 # it adds a small per-request cost to ALL THREE, not just Jobs — acceptable
 # per TL's approval, revisit if a real account's job list grows large enough
 # to matter.
+#
+# The Phase 2 local-sync engine (apps/jobber/services/sync.py) needs two
+# fields these three live consumers don't: jobCosting (labour_cost /
+# labour_duration_seconds on JobberJob) and each visit's own id (needed to
+# key JobberVisit rows — the three live views only ever read
+# visit.assignedUsers, never the visit's own identity). Rather than widen
+# THIS query and add that cost to all three live consumers for something
+# only the sync engine needs, there's a separate _SYNC_JOBS_QUERY /
+# fetch_jobs_for_sync() below, used only by sync.py. Revisit merging the two
+# if/when jobs.py/accounts.py/employees.py migrate to reading from the local
+# tables instead of calling Jobber live (see the design doc's
+# endpoint-migration section) — at that point this query has only one
+# caller left (the sync engine) and the two can merge safely.
 _JOBS_QUERY = """
 query GetJobs($first: Int!, $after: String) {
   jobs(first: $first, after: $after) {
@@ -324,6 +338,62 @@ query GetUsers($first: Int!, $after: String) {
 }
 """
 
+
+# New for the sync engine — Clients were previously only ever seen nested
+# inside Job/Invoice nodes (client { id name tags }), never pulled
+# independently. Not shared with any live-proxy view, so no cost tradeoff
+# to weigh here the way there is for _SYNC_JOBS_QUERY below.
+_CLIENTS_QUERY = """
+query GetClients($first: Int!, $after: String) {
+  clients(first: $first, after: $after) {
+    nodes {
+      id
+      name
+      tags(first: 5) { nodes { label } }
+    }
+    pageInfo { hasNextPage endCursor }
+  }
+}
+"""
+
+
+# Sync-only — see the comment on _JOBS_QUERY above for why this isn't just
+# _JOBS_QUERY widened in place. Adds jobCosting (for JobberJob.labour_cost /
+# labour_duration_seconds) and each visit's own id (for JobberVisit.jobber_id
+# — visits are synced by extracting them from these same job nodes, not via
+# a separate top-level query; see sync.py's sync_visits() docstring for why).
+_SYNC_JOBS_QUERY = """
+query GetJobsForSync($first: Int!, $after: String) {
+  jobs(first: $first, after: $after) {
+    nodes {
+      id
+      jobNumber
+      title
+      instructions
+      jobStatus
+      total
+      startAt
+      createdAt
+      client { id name tags(first: 5) { nodes { label } } }
+      property { street city province postalCode }
+      lineItems(first: 1) {
+        nodes {
+          linkedProductOrService { name }
+        }
+      }
+      jobCosting { labourCost labourDuration }
+      visits(first: 10) {
+        nodes {
+          id
+          assignedUsers(first: 5) { nodes { id name { full } } }
+        }
+      }
+    }
+    pageInfo { hasNextPage endCursor }
+  }
+}
+"""
+
 # Safety cap per collection for fetch_all_pages(): 20 pages x 25 records =
 # 500 records. Endpoints that need a complete picture (rankings, rosters —
 # where partial data could produce a WRONG result, not just an incomplete
@@ -360,6 +430,57 @@ def fetch_all_pages(fetch_fn, account, label, first=FETCH_ALL_PAGE_SIZE, max_pag
     return all_nodes
 
 
+def fetch_all_pages_bounded(fetch_fn, account, label, deadline, first=FETCH_ALL_PAGE_SIZE, max_pages=FETCH_ALL_MAX_PAGES):
+    """
+    Same pagination loop as fetch_all_pages(), for the sync engine
+    specifically (apps/jobber/services/sync.py). Two differences, both
+    needed for the local-sync design doc's §3 wall-clock ceiling and §2's
+    deactivation-sweep fix:
+
+      - Checks ``deadline`` (a timezone-aware datetime) before starting each
+        new page fetch — stops cleanly, without starting one more Jobber
+        call, once the whole-sync wall-clock ceiling is reached.
+      - Returns ``(nodes, complete)`` instead of just nodes. ``complete`` is
+        True only when Jobber's own hasNextPage said there was nothing left;
+        False on a deadline stop OR on hitting max_pages, since either way
+        ``nodes`` may not be every record that exists. sync.py uses this to
+        decide whether an entity's deactivation sweep is safe to run this
+        pass — running it against a partial node list would incorrectly
+        deactivate real, still-active records that simply weren't re-seen
+        this run.
+
+    A sibling to fetch_all_pages(), not a replacement for it — kept
+    completely separate so fetch_all_pages()'s three existing live-proxy
+    callers (jobs.py's single-page view aside, accounts.py's and
+    employees.py's full-pulls) are entirely unaffected; their return
+    contract (a plain node list, no deadline) doesn't change.
+    """
+    all_nodes = []
+    cursor = None
+    for _page_num in range(max_pages):
+        if timezone.now() >= deadline:
+            logger.warning(
+                "%s: sync wall-clock ceiling reached for tenant=%s after %d record(s) — "
+                "stopping this entity's pull short this run.",
+                label, account.tenant_id, len(all_nodes),
+            )
+            return all_nodes, False
+
+        page = fetch_fn(account, first=first, after=cursor)
+        all_nodes.extend(page.get('nodes') or [])
+        page_info = page.get('pageInfo') or {}
+        if not page_info.get('hasNextPage'):
+            return all_nodes, True
+        cursor = page_info.get('endCursor')
+
+    logger.warning(
+        "%s: hit the %d-page safety cap (%d records) for tenant=%s — "
+        "result is based on a bounded sample, not the full account this run.",
+        label, max_pages, max_pages * first, account.tenant_id,
+    )
+    return all_nodes, False
+
+
 def fetch_account_info(account):
     """
     Return ``{'id': ..., 'name': ...}`` for the connected Jobber account, or an
@@ -383,6 +504,36 @@ def fetch_jobs(account, first=25, after=None):
     """
     data = execute(account, _JOBS_QUERY, {'first': first, 'after': after})
     return (data or {}).get('jobs') or {
+        'nodes': [],
+        'pageInfo': {'hasNextPage': False, 'endCursor': None},
+    }
+
+
+def fetch_jobs_for_sync(account, first=25, after=None):
+    """
+    Sync-only variant of fetch_jobs() — same return shape, but via
+    _SYNC_JOBS_QUERY (adds jobCosting and each visit's own id, neither
+    needed by the three live-proxy consumers of fetch_jobs()/_JOBS_QUERY).
+    Used only by apps/jobber/services/sync.py.
+    """
+    data = execute(account, _SYNC_JOBS_QUERY, {'first': first, 'after': after})
+    return (data or {}).get('jobs') or {
+        'nodes': [],
+        'pageInfo': {'hasNextPage': False, 'endCursor': None},
+    }
+
+
+def fetch_clients(account, first=25, after=None):
+    """
+    Return the raw ``clients`` connection for ``account``:
+    ``{'nodes': [...], 'pageInfo': {'hasNextPage': ..., 'endCursor': ...}}``.
+
+    New for the sync engine — no live-proxy view fetches Clients
+    independently today. Raises JobberAPIError on failure like every other
+    call through ``execute()``.
+    """
+    data = execute(account, _CLIENTS_QUERY, {'first': first, 'after': after})
+    return (data or {}).get('clients') or {
         'nodes': [],
         'pageInfo': {'hasNextPage': False, 'endCursor': None},
     }
