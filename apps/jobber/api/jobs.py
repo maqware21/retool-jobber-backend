@@ -202,7 +202,7 @@ def _isoformat(value):
 
 def _local_first_assignee(job):
     """
-    Local equivalent of _first_assignee(): the assigned_user_name of this
+    Local equivalent of _first_assignee():the assigned_user_name of this
     job's first Visit (by local insertion order — JobberVisit has no
     explicit ordinal field, so this is "whichever visit was synced first,"
     an analog to live's "whichever visit Jobber returns first," not a
