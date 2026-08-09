@@ -3,8 +3,9 @@ import logging
 from rest_framework import status
 from rest_framework.views import APIView
 
-from apps.jobber.models import JobberAccount
+from apps.jobber.models import JobberAccount, JobberJob
 from apps.jobber.services import client
+from apps.jobber.services.sync import ensure_fresh
 from helpers.api_exception import validator_errors
 from helpers.messages import MESSAGES
 from helpers.user_permissions import CustomerPermission
@@ -159,3 +160,90 @@ class JobberJobsView(APIView):
         except (TypeError, ValueError):
             return DEFAULT_PAGE_SIZE
         return max(1, min(n, MAX_PAGE_SIZE))
+
+
+# ── Local-table read path (Phase 2) ──────────────────────────────────────────
+# Built alongside the live-proxy code above, NOT wired into JobberJobsView
+# yet — JobberJobsView.get() still calls client.fetch_jobs()/_map_job()
+# exactly as it does today. This exists so the two paths can be compared
+# side by side (see the accompanying compare_jobs.py script) before anything
+# gets swapped.
+
+def _isoformat(value):
+    return value.isoformat() if value else None
+
+
+def _local_first_assignee(job):
+    """
+    Local equivalent of _first_assignee(): the assigned_user_name of this
+    job's first Visit (by local insertion order — JobberVisit has no
+    explicit ordinal field, so this is "whichever visit was synced first,"
+    an analog to live's "whichever visit Jobber returns first," not a
+    byte-for-byte reproduction of it), falling back to 'Unassigned'.
+    """
+    visit = job.visits.filter(is_active=True).order_by('id').first()
+    if visit is None:
+        return 'Unassigned'
+    return visit.assigned_user_name
+
+
+def _map_local_job(job):
+    """Local-table equivalent of _map_job() — same keys, same field types."""
+    return {
+        'id': f"JOB-{job.job_number}",
+        'jobber_id': job.jobber_id,
+        'job_number': job.job_number,
+        'customer': job.client.name if job.client else None,
+        'type': job.service_type,
+        'description': job.description or '',
+        'assigned_to': _local_first_assignee(job),
+        'status': job.job_status,
+        'status_display': job.status_display,
+        'value': float(job.total) if job.total is not None else None,
+        # ISO string, matching the live field's type — not guaranteed to be
+        # byte-identical to Jobber's own raw string (e.g. "Z" vs "+00:00"
+        # timezone suffix), but both are valid ISO8601 and parse identically
+        # client-side.
+        'date': _isoformat(job.start_at or job.jobber_created_at),
+        'address': job.address,
+    }
+
+
+def _local_jobs_response(user, first=DEFAULT_PAGE_SIZE, after=None):
+    """
+    Local-table equivalent of JobberJobsView.get()'s `data` dict. Calls
+    ensure_fresh() first, then reads local tables — never Jobber directly.
+
+    Pagination is OFFSET-based here, not Jobber's own cursor — `after` is a
+    local, opaque numeric-string offset (matching the field's String type,
+    not its original cursor semantics). Fine for comparing outputs now;
+    would need real thought before this ever backs paginated production UI.
+    """
+    tenant_id = user.tenant_id
+    if not tenant_id:
+        return {'connected': False, 'jobs': [], 'page_info': None}
+
+    account = JobberAccount.objects.filter(tenant_id=tenant_id, is_active=True).first()
+    if account is None:
+        return {'connected': False, 'jobs': [], 'page_info': None}
+
+    fresh = ensure_fresh(account.tenant, entities=['clients', 'users', 'jobs', 'visits'])
+
+    queryset = JobberJob.objects.filter(tenant_id=tenant_id, is_active=True).select_related('client').order_by('id')
+    offset = int(after) if after else 0
+    page = list(queryset[offset:offset + first])
+    has_next_page = queryset.count() > offset + first
+    end_cursor = str(offset + first) if has_next_page else None
+
+    data = {
+        'connected': True,
+        'jobs': [_map_local_job(job) for job in page],
+        'page_info': {
+            'has_next_page': has_next_page,
+            'end_cursor': end_cursor,
+        },
+        'last_synced_at': _isoformat(fresh['last_synced_at']),
+    }
+    if fresh['sync_warning']:
+        data['sync_warning'] = fresh['sync_warning']
+    return data

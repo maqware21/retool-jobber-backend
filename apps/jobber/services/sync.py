@@ -7,10 +7,12 @@ then Visits, then Invoices), inside a bounded wall-clock ceiling, recording
 one JobberSyncRun row per attempt and using that same row as the
 cross-process concurrency lock (select_for_update()).
 
-Not built here (a later step): anything that actually calls sync_tenant()
-from a view (ensure_fresh()), and migrating jobs.py/invoices.py/accounts.py/
-employees.py to read from these tables instead of Jobber live. This module
-only makes the local tables accurately mirror Jobber when invoked.
+ensure_fresh(tenant, entities, require_complete) is the stale-request
+trigger built on top of sync_tenant() — it's what a view calls before
+reading local tables. Not built here (a later step): actually wiring any
+view to call it and read local data instead of Jobber live — that's a
+separate, explicit cutover step once the local-read paths built alongside
+the live ones have been compared and approved.
 """
 
 import logging
@@ -18,13 +20,12 @@ from datetime import timedelta
 from decimal import Decimal
 
 from django.db import transaction
+from django.db.models import Max
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 
-from apps.jobber.api.accounts import _client_tags_display
-from apps.jobber.api.invoices import _safe_int, _status_display
-from apps.jobber.api.jobs import _format_address, _humanize_status, _job_service_type
 from apps.jobber.models import (
+    JobberAccount,
     JobberClient,
     JobberInvoice,
     JobberJob,
@@ -44,6 +45,19 @@ logger = logging.getLogger(__name__)
 SYNC_WALL_CLOCK_CEILING = timedelta(seconds=25)
 
 ALL_ENTITIES = ('clients', 'users', 'jobs', 'visits', 'invoices')
+
+# ensure_fresh()'s staleness threshold — the design doc's proposed default
+# (20 minutes, inside the 15-30 min window already flagged elsewhere in this
+# codebase), not yet measured against real usage.
+STALENESS_THRESHOLD = timedelta(minutes=20)
+
+ENTITY_MODELS = {
+    'clients': JobberClient,
+    'users': JobberUser,
+    'jobs': JobberJob,
+    'visits': JobberVisit,
+    'invoices': JobberInvoice,
+}
 
 
 def _to_decimal(value):
@@ -120,6 +134,15 @@ def _claim_run(tenant):
 
 def sync_clients(account, tenant, deadline):
     """Pull every Client, upsert, deactivate vanished ones (if this pull was complete)."""
+    # Imported here, not at module level: accounts.py now imports
+    # ensure_fresh from this module (Step 3), and this module imports
+    # _client_tags_display from accounts.py (Step 2) — a genuine circular
+    # import between the two. Deferring to call time breaks the cycle
+    # without giving up the "import and reuse, don't rewrite" reuse this
+    # was written for; by the time this function actually runs, both
+    # modules have finished loading.
+    from apps.jobber.api.accounts import _client_tags_display
+
     nodes, complete = client.fetch_all_pages_bounded(client.fetch_clients, account, 'fetch_clients', deadline)
     seen_ids = set()
     count = 0
@@ -198,6 +221,10 @@ def sync_jobs(account, tenant, deadline, clients_complete):
     being trustworthy inherits the correct, dependency-aware signal without
     having to re-derive it.
     """
+    # Deferred import — same circular-import reason as sync_clients()'s
+    # _client_tags_display import above, jobs.py side of the cycle this time.
+    from apps.jobber.api.jobs import _format_address, _humanize_status, _job_service_type
+
     nodes, own_complete = client.fetch_all_pages_bounded(
         client.fetch_jobs_for_sync, account, 'fetch_jobs_for_sync', deadline,
     )
@@ -367,6 +394,10 @@ def sync_invoices(account, tenant, deadline, clients_complete, jobs_complete):
     wasn't asked for this round. Flagging as a known limitation, not a
     silent gap.
     """
+    # Deferred import — same circular-import reason as sync_clients()'s
+    # _client_tags_display import above, invoices.py side of the cycle this time.
+    from apps.jobber.api.invoices import _safe_int, _status_display
+
     nodes, own_complete = client.fetch_all_pages_bounded(client.fetch_invoices, account, 'fetch_invoices', deadline)
     seen_ids = set()
     count = 0
@@ -509,3 +540,113 @@ def sync_tenant(account, entities=None):
 
     _finish_run(run, wanted, counts, had_failure, error_message)
     return run
+
+
+def _entity_synced_at(tenant, entity):
+    """Latest synced_at across this entity's currently-active local rows, or None if it's never synced."""
+    model = ENTITY_MODELS[entity]
+    return model.objects.filter(tenant=tenant, is_active=True).aggregate(latest=Max('synced_at'))['latest']
+
+
+def _last_run_was_unclean(tenant):
+    """
+    If the tenant's most recent JobberSyncRun wasn't a clean SUCCESS, its
+    entities' synced_at timestamps can look artificially fresh — a PARTIAL
+    run still stamps synced_at on whatever it did manage to upsert before
+    being cut short, even though the overall picture is known-incomplete.
+    JobberSyncRun only records one overall status per run, not a per-entity
+    complete flag, so this can't pinpoint which specific entity was the
+    problem — it's a coarse "the last attempt wasn't clean, don't trust
+    synced_at alone this time" signal, applied to every entity ensure_fresh()
+    is asked about on this call, not just whichever ones that past run
+    happened to touch.
+    """
+    latest = JobberSyncRun.objects.filter(tenant=tenant).order_by('-started_at').first()
+    if latest is None:
+        return True
+    return latest.status in (JOBBER_SYNC_STATUS[2][0], JOBBER_SYNC_STATUS[3][0])
+
+
+def ensure_fresh(tenant, entities=None, require_complete=False):
+    """
+    Sync-on-demand for a stale request, per the design doc's "wait-for-fresh"
+    architecture. Not wired into any view yet — built for the views to call
+    once the local-read paths are approved.
+
+    entities: which entities THIS caller needs (e.g. ['jobs', 'clients',
+    'visits'] for the Jobs panel). Defaults to ALL_ENTITIES.
+
+    require_complete: True for callers that need a full, correct picture to
+    rank from (Accounts, Employees) — per the design doc's section on what
+    ensure_fresh() does when a needed entity comes back PARTIAL: exactly one
+    synchronous retry if the first attempt comes back PARTIAL, then accept
+    PARTIAL either way rather than retrying forever. Paginated callers
+    (Jobs, Invoices) tolerate a PARTIAL/stale pass fine (that's already
+    pagination's normal contract) and should leave this False.
+
+    NOTE: this parameter isn't part of the task's literal two-argument
+    description of this function — it's added because the retry-once-if-
+    PARTIAL rule for Accounts/Employees specifically can't be implemented
+    without ensure_fresh() knowing which kind of caller it is. Flagging this
+    as an addition, not a silent one.
+
+    Returns a small result dict:
+      - 'last_synced_at': the OLDEST synced_at among the requested entities
+        after this call (the honest "as of" time for a view rendering all
+        of them together) — a real datetime, or None if nothing has ever
+        synced.
+      - 'sync_warning': a short string when the requested entities aren't
+        known-fully-fresh after this call (the sync this call triggered
+        came back anything other than a clean SUCCESS), else None.
+      - 'sync_status': the status of the sync this call triggered
+        ('success'/'partial'/'failed'), or None if nothing was stale enough
+        to trigger one.
+      - 'entities': per-entity {'was_stale': bool, 'synced_at': datetime}
+        detail — mainly for the comparison test scripts.
+    """
+    wanted = tuple(entities) if entities else ALL_ENTITIES
+
+    account = JobberAccount.objects.filter(tenant=tenant, is_active=True).first()
+    if account is None:
+        # No connected account — nothing to sync. Every real caller already
+        # gates on JobberAccount existing before reaching here; this is a
+        # defensive fallback, not the expected path.
+        return {
+            'last_synced_at': None,
+            'sync_warning': None,
+            'sync_status': None,
+            'entities': {e: {'was_stale': True, 'synced_at': None} for e in wanted},
+        }
+
+    force_resync = _last_run_was_unclean(tenant)
+    synced_at_before = {e: _entity_synced_at(tenant, e) for e in wanted}
+    stale_entities = [
+        e for e in wanted
+        if force_resync or synced_at_before[e] is None
+        or timezone.now() - synced_at_before[e] >= STALENESS_THRESHOLD
+    ]
+
+    run = None
+    if stale_entities:
+        run = sync_tenant(account, entities=stale_entities)
+        if require_complete and run.status == JOBBER_SYNC_STATUS[2][0]:
+            run = sync_tenant(account, entities=stale_entities)
+
+    synced_at_after = {e: _entity_synced_at(tenant, e) for e in wanted}
+
+    sync_warning = None
+    if run is not None and run.status != JOBBER_SYNC_STATUS[1][0]:
+        sync_warning = f"Some data may be out of date (last sync: {run.status})."
+
+    fresh_timestamps = [t for t in synced_at_after.values() if t is not None]
+    last_synced_at = min(fresh_timestamps) if fresh_timestamps else None
+
+    return {
+        'last_synced_at': last_synced_at,
+        'sync_warning': sync_warning,
+        'sync_status': run.status if run is not None else None,
+        'entities': {
+            e: {'was_stale': e in stale_entities, 'synced_at': synced_at_after[e]}
+            for e in wanted
+        },
+    }

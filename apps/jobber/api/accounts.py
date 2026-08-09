@@ -4,8 +4,9 @@ from django.utils import timezone
 from rest_framework import status
 from rest_framework.views import APIView
 
-from apps.jobber.models import JobberAccount
+from apps.jobber.models import JobberAccount, JobberInvoice, JobberJob
 from apps.jobber.services import client
+from apps.jobber.services.sync import ensure_fresh
 from helpers.api_exception import validator_errors
 from helpers.messages import MESSAGES
 from helpers.user_permissions import CustomerPermission
@@ -166,3 +167,87 @@ class JobberAccountsView(APIView):
         if not user.tenant_id:
             return None
         return JobberAccount.objects.filter(tenant_id=user.tenant_id, is_active=True).first()
+
+
+# ── Local-table read path (Phase 2) ──────────────────────────────────────────
+# Built alongside the live-proxy code above, NOT wired into JobberAccountsView
+# yet. See the accompanying compare_accounts.py script.
+#
+# Structurally different from _rank_accounts()/_service_type_breakdown() by
+# necessity, not by choice: those two derive type/service-type fields from
+# raw GraphQL node shapes on every call. That derivation already happened
+# once, at sync time — JobberClient.tags_display and JobberJob.service_type
+# are already the derived values — so this just aggregates over plain
+# stored fields, it doesn't re-derive anything from a nested dict shape.
+
+def _rank_local_accounts(tenant_id):
+    """Local-table equivalent of _rank_accounts() — same grouping/output shape."""
+    clients = {}
+
+    for job in JobberJob.objects.filter(tenant_id=tenant_id, is_active=True).select_related('client'):
+        if job.client is None:
+            continue
+        entry = clients.setdefault(job.client.id, {
+            'name': job.client.name,
+            'job_count': 0,
+            'revenue': 0.0,
+            'type': job.client.tags_display,
+        })
+        entry['job_count'] += 1
+
+    for invoice in JobberInvoice.objects.filter(tenant_id=tenant_id, is_active=True).select_related('client'):
+        if invoice.client is None:
+            continue
+        entry = clients.setdefault(invoice.client.id, {
+            'name': invoice.client.name,
+            'job_count': 0,
+            'revenue': 0.0,
+            'type': invoice.client.tags_display,
+        })
+        entry['revenue'] += float(invoice.amount or 0)
+
+    ranked = sorted(clients.values(), key=lambda c: c['revenue'], reverse=True)
+    return [
+        {'name': c['name'], 'job_count': c['job_count'], 'revenue': c['revenue'], 'type': c['type']}
+        for c in ranked
+    ]
+
+
+def _local_service_type_breakdown(tenant_id):
+    """Local-table equivalent of _service_type_breakdown()."""
+    counts = {}
+    jobs = JobberJob.objects.filter(tenant_id=tenant_id, is_active=True).exclude(service_type__isnull=True).exclude(service_type='')
+    for job in jobs:
+        counts[job.service_type] = counts.get(job.service_type, 0) + 1
+
+    ranked = sorted(counts.items(), key=lambda item: item[1], reverse=True)
+    return [{'name': name, 'count': count} for name, count in ranked]
+
+
+def _local_accounts_response(user):
+    """
+    Local-table equivalent of JobberAccountsView.get()'s `data` dict. Calls
+    ensure_fresh() first (require_complete=True — a ranking over an
+    incomplete pull is a wrong answer, not just a stale one, per the design
+    doc), then reads local tables — never Jobber directly.
+    """
+    tenant_id = user.tenant_id
+    if not tenant_id:
+        return {'connected': False, 'accounts': [], 'service_type_breakdown': [], 'computed_at': None}
+
+    account = JobberAccount.objects.filter(tenant_id=tenant_id, is_active=True).first()
+    if account is None:
+        return {'connected': False, 'accounts': [], 'service_type_breakdown': [], 'computed_at': None}
+
+    fresh = ensure_fresh(account.tenant, entities=['clients', 'jobs', 'invoices'], require_complete=True)
+
+    data = {
+        'connected': True,
+        'accounts': _rank_local_accounts(tenant_id),
+        'service_type_breakdown': _local_service_type_breakdown(tenant_id),
+        'computed_at': timezone.now().isoformat(),
+        'last_synced_at': fresh['last_synced_at'].isoformat() if fresh['last_synced_at'] else None,
+    }
+    if fresh['sync_warning']:
+        data['sync_warning'] = fresh['sync_warning']
+    return data
