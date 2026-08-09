@@ -9,7 +9,15 @@ from django.utils import timezone
 from rest_framework import status
 from rest_framework.views import APIView
 
-from apps.jobber.models import JobberAccount, JobberSyncRun
+from apps.jobber.models import (
+    JobberAccount,
+    JobberClient,
+    JobberInvoice,
+    JobberJob,
+    JobberSyncRun,
+    JobberUser,
+    JobberVisit,
+)
 from apps.jobber.services import client
 from apps.jobber.services import state as state_service
 from apps.tenants.models import Tenant
@@ -116,10 +124,17 @@ class JobberCallbackView(APIView):
             user.save(update_fields=['tenant'])
 
         account = JobberAccount.objects.filter(tenant=tenant).first()
+        # A JobberAccount already existing for this tenant means this is a
+        # RECONNECT, not this tenant's first-ever Jobber connect — see
+        # _invalidate_local_data() below for why that distinction matters.
+        is_reconnect = account is not None
         if account is None:
             account = JobberAccount(tenant=tenant, access_token='', refresh_token='')
         account.is_active = True
         account.store_tokens(token_data)
+
+        if is_reconnect:
+            self._invalidate_local_data(tenant)
 
         # Phase 2 local-sync bootstrap: seed the tenant's first JobberSyncRun
         # row as an already-finished SUCCESS with zero counts, in the same
@@ -141,6 +156,37 @@ class JobberCallbackView(APIView):
             )
 
         return account
+
+    @staticmethod
+    def _invalidate_local_data(tenant):
+        """
+        A tenant reconnecting Jobber may be pointing at a DIFFERENT
+        underlying Jobber account than whatever last synced this tenant's
+        local tables — those tables are scoped by Tenant only, not by which
+        specific JobberAccount synced them, so old data would otherwise
+        keep looking "fresh" by timestamp even though it belongs to a
+        since-replaced connection. Real gap, found via manual testing.
+
+        Fix: mark every existing entity row for this tenant inactive.
+        ensure_fresh() already treats "no active rows for this entity" as
+        "never synced, definitely stale" — the exact same path already
+        proven correct for a brand-new tenant's first-ever connect — so the
+        very next normal page load triggers a real, correct sync
+        automatically. No new sync call here on purpose: this only needs to
+        make the existing staleness check see the truth, and staying fast
+        and dumb keeps this transaction quick rather than slowing down the
+        OAuth redirect itself.
+
+        Called only when is_reconnect is True (see _link_account above) —
+        a brand-new tenant has no rows here yet, so this would be a no-op
+        for it regardless, but there's no reason to run five empty UPDATE
+        queries on the one path (first-ever connect) that can never need them.
+        """
+        JobberClient.objects.filter(tenant=tenant, is_active=True).update(is_active=False)
+        JobberUser.objects.filter(tenant=tenant, is_active=True).update(is_active=False)
+        JobberJob.objects.filter(tenant=tenant, is_active=True).update(is_active=False)
+        JobberVisit.objects.filter(tenant=tenant, is_active=True).update(is_active=False)
+        JobberInvoice.objects.filter(tenant=tenant, is_active=True).update(is_active=False)
 
     def _enrich_account(self, account):
         info = client.fetch_account_info(account)
