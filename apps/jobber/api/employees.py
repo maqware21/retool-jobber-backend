@@ -76,18 +76,44 @@ def _rank_employees(job_nodes, user_nodes):
 class JobberEmployeesView(APIView):
     """
     GET /v1/jobber/employees/
-    A basic roster with job counts for the authenticated customer's
-    connected Jobber account. Pulls the full job set (reusing fetch_jobs —
-    no new jobs query) and the full user roster once via
-    client.fetch_all_pages, groups jobs by each job's first-visit
-    assignedUsers, merges so zero-job employees still appear.
 
-    UNCACHED, same caveat as Accounts — every request re-pulls and
-    re-groups from scratch. See PROJECT_CONTEXT.md.
+    Phase 2 cutover: now reads from local tables via
+    _local_employees_response() (ensure_fresh(require_complete=True) +
+    local tables), not Jobber directly. The original live-proxy body is
+    preserved, unused, in _get_live() below for a fast rollback if needed —
+    revert by having get() call self._get_live(request) instead of
+    _local_employees_response(). Jobs, Invoices, and Accounts are also cut
+    over — all four endpoints now read from local tables.
     """
     permission_classes = [CustomerPermission]
 
     def get(self, request):
+        data = {'connected': False, 'employees': [], 'computed_at': None}
+        try:
+            data = _local_employees_response(request.user)
+            return api_response_parser(
+                data=data,
+                message=MESSAGES['SUCCESS'],
+                status=status.HTTP_200_OK,
+                success=True,
+            )
+        except Exception as ve:
+            success, msg, st = validator_errors(ve)
+            return api_response_parser(data=data, message=msg, status=st, success=success)
+
+    @staticmethod
+    def _account_for(user):
+        if not user.tenant_id:
+            return None
+        return JobberAccount.objects.filter(tenant_id=user.tenant_id, is_active=True).first()
+
+    def _get_live(self, request):
+        """
+        DEAD CODE — deliberately kept, not called from anywhere. This is the
+        exact live-proxy body get() used before the Phase 2 cutover above.
+        Rollback: make get() call self._get_live(request) again instead of
+        _local_employees_response().
+        """
         data = {'connected': False, 'employees': [], 'computed_at': None}
         try:
             account = self._account_for(request.user)
@@ -116,12 +142,6 @@ class JobberEmployeesView(APIView):
         except Exception as ve:
             success, msg, st = validator_errors(ve)
             return api_response_parser(data=data, message=msg, status=st, success=success)
-
-    @staticmethod
-    def _account_for(user):
-        if not user.tenant_id:
-            return None
-        return JobberAccount.objects.filter(tenant_id=user.tenant_id, is_active=True).first()
 
 
 # ── Local-table read path (Phase 2) ──────────────────────────────────────────
