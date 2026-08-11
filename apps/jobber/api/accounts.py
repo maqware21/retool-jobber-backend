@@ -113,20 +113,49 @@ def _service_type_breakdown(job_nodes):
 class JobberAccountsView(APIView):
     """
     GET /v1/jobber/accounts/
-    Computes a full "Top Accounts" ranking (accounts) plus a
-    "Jobs by Service Type" tally (service_type_breakdown) for the
-    authenticated customer's connected Jobber account. No pagination
-    params — this endpoint always computes both, that's the whole point.
 
-    UNCACHED: every request re-pulls every job and every invoice (bounded
-    by client.fetch_all_pages's safety cap) and re-ranks from scratch. This
-    needs a caching layer (e.g. 15-30 min per tenant) before real customer
-    data volume — see PROJECT_CONTEXT.md. Deliberately shipped uncached for
-    now; flagging, not deferring silently.
+    Phase 2 cutover: now reads from local tables via
+    _local_accounts_response() (ensure_fresh(require_complete=True) + local
+    tables), not Jobber directly. The original live-proxy body is
+    preserved, unused, in _get_live() below for a fast rollback if needed —
+    revert by having get() call self._get_live(request) instead of
+    _local_accounts_response(). Jobs and Invoices are also cut over;
+    Employees is unchanged — still live-proxy, per the current rollout.
     """
     permission_classes = [CustomerPermission]
 
     def get(self, request):
+        data = {
+            'connected': False,
+            'accounts': [],
+            'service_type_breakdown': [],
+            'computed_at': None,
+        }
+        try:
+            data = _local_accounts_response(request.user)
+            return api_response_parser(
+                data=data,
+                message=MESSAGES['SUCCESS'],
+                status=status.HTTP_200_OK,
+                success=True,
+            )
+        except Exception as ve:
+            success, msg, st = validator_errors(ve)
+            return api_response_parser(data=data, message=msg, status=st, success=success)
+
+    @staticmethod
+    def _account_for(user):
+        if not user.tenant_id:
+            return None
+        return JobberAccount.objects.filter(tenant_id=user.tenant_id, is_active=True).first()
+
+    def _get_live(self, request):
+        """
+        DEAD CODE — deliberately kept, not called from anywhere. This is the
+        exact live-proxy body get() used before the Phase 2 cutover above.
+        Rollback: make get() call self._get_live(request) again instead of
+        _local_accounts_response().
+        """
         data = {
             'connected': False,
             'accounts': [],
@@ -161,12 +190,6 @@ class JobberAccountsView(APIView):
         except Exception as ve:
             success, msg, st = validator_errors(ve)
             return api_response_parser(data=data, message=msg, status=st, success=success)
-
-    @staticmethod
-    def _account_for(user):
-        if not user.tenant_id:
-            return None
-        return JobberAccount.objects.filter(tenant_id=user.tenant_id, is_active=True).first()
 
 
 # ── Local-table read path (Phase 2) ──────────────────────────────────────────
