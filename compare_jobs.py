@@ -13,7 +13,7 @@ from apps.jobber.api.jobs import _map_job, _local_jobs_response
 from apps.jobber.models import JobberAccount
 from apps.jobber.services import client
 
-account = JobberAccount.objects.filter(is_active=True).first()
+account = JobberAccount.objects.filter(is_active=True, tenant_id=1).first()
 user = account.tenant.users.first()
 print("tenant_id:", account.tenant_id, "user_id:", user.id if user else None)
 

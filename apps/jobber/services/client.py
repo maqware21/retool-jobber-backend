@@ -362,9 +362,13 @@ query GetClients($first: Int!, $after: String) {
 # labour_duration_seconds), each visit's own id (for JobberVisit.jobber_id
 # — visits are synced by extracting them from these same job nodes, not via
 # a separate top-level query; see sync.py's sync_visits() docstring for why),
-# and completedAt (for JobberJob.completed_at — confirmed live 2026-08-16 to
+# completedAt (for JobberJob.completed_at — confirmed live 2026-08-16 to
 # track when invoicing clears, not when work physically finished; see the
-# model field's own comment for the full verification).
+# model field's own comment for the full verification), and timeSheetEntries
+# (for JobberTimeSheetEntry — same "no viable standalone root query" situation
+# as Visits, confirmed against the schema: Query.timeSheetEntries exists but
+# has no job filter at all, so this is the only path; see
+# JobberTimeSheetEntry's model docstring and sync.py's sync_timesheet_entries()).
 _SYNC_JOBS_QUERY = """
 query GetJobsForSync($first: Int!, $after: String) {
   jobs(first: $first, after: $after) {
@@ -390,6 +394,15 @@ query GetJobsForSync($first: Int!, $after: String) {
         nodes {
           id
           assignedUsers(first: 5) { nodes { id name { full } } }
+        }
+      }
+      timeSheetEntries(first: 25) {
+        nodes {
+          id
+          startAt
+          endAt
+          finalDuration
+          user { id }
         }
       }
     }

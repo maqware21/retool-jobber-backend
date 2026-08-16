@@ -328,6 +328,81 @@ class JobberInvoice(DateModel):
         return f"JobberInvoice(tenant={self.tenant_id}, jobber_id={self.jobber_id})"
 
 
+class JobberTimeSheetEntry(DateModel):
+    """
+    Local mirror of one Jobber TimeSheetEntry, populated and refreshed by
+    the sync engine. Motivated by a confirmed finding (2026-08-16):
+    Job.jobCosting.labourDuration does NOT reflect real logged time — 6 of
+    13 real archived jobs have genuine TimeSheetEntry records (real
+    technicians, real non-zero finalDuration) while jobCosting reports 0
+    for all of them. "Avg Job Duration" needs this real entity, not a
+    derived jobCosting field.
+
+    Like JobberVisit, there is no viable standalone root-level query for
+    this — Query.timeSheetEntries exists but its own description is "All
+    timesheet entries for users on a given day" and its filter type
+    (TimeSheetEntriesFilterAttributes) has no job filter field at all
+    (confirmed against the schema, not assumed). The only path is
+    Job.timeSheetEntries(first, after), pulled per-job from the same job
+    nodes the sync already has in memory — identical situation to Visits.
+
+    Known real case, NOT yet handled by this model/sync step (Part B, not
+    built here): the SAME (job, user) pair can have multiple entries whose
+    time ranges genuinely overlap (confirmed real, not hypothetical — a
+    technician's own stop/restart mistake produced two overlapping entries
+    for one job in this project's real test data). Storing every raw entry
+    here, unmerged, is deliberate — this table is meant to hold Jobber's
+    real entries as they are; any overlap-merging or duration aggregation
+    happens downstream, over these rows, not by editing/dropping rows here.
+    """
+
+    tenant = models.ForeignKey(
+        'tenants.Tenant',
+        on_delete=models.CASCADE,
+        related_name='jobber_timesheet_entries',
+    )
+    job = models.ForeignKey(
+        JobberJob,
+        on_delete=models.CASCADE,
+        related_name='timesheet_entries',
+    )
+    # Nullable — same reasoning as JobberVisit.assigned_user: an entry
+    # whose user record isn't locally synced yet (or was later removed)
+    # shouldn't orphan the entry itself.
+    user = models.ForeignKey(
+        JobberUser,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='timesheet_entries',
+    )
+    jobber_id = models.CharField(max_length=255, db_index=True)
+    # From finalDuration: Seconds! (confirmed non-null in the schema) — the
+    # "stopped" duration for a completed entry, not the live in-progress
+    # `duration` field, which is the wrong one for a historical record.
+    final_duration_seconds = models.IntegerField()
+    # startAt is technically non-null in the schema (ISO8601DateTime!), but
+    # stored nullable here anyway — every other synced datetime in this
+    # project is nullable defensively, and this is the one field genuinely
+    # meant to distinguish "no data yet" from a real Jobber value.
+    started_at = models.DateTimeField(null=True, blank=True)
+    # endAt IS genuinely nullable in the schema — an entry with a currently
+    # running timer has no endAt yet.
+    ended_at = models.DateTimeField(null=True, blank=True)
+    synced_at = models.DateTimeField()
+
+    class Meta:
+        db_table = 'jobber_timesheet_entries'
+        verbose_name = 'jobber timesheet entry'
+        verbose_name_plural = 'jobber timesheet entries'
+        constraints = [
+            models.UniqueConstraint(fields=['tenant', 'jobber_id'], name='unique_jobber_timesheet_entry_tenant_jobber_id'),
+        ]
+
+    def __str__(self):
+        return f"JobberTimeSheetEntry(tenant={self.tenant_id}, jobber_id={self.jobber_id})"
+
+
 class JobberSyncRun(models.Model):
     """
     One row per sync attempt for a tenant (not one mutable row per tenant —

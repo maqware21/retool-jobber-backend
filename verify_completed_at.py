@@ -21,7 +21,7 @@ import json
 from apps.jobber.models import JobberAccount, JobberJob
 from apps.jobber.services import client
 
-account = JobberAccount.objects.filter(is_active=True).first()
+account = JobberAccount.objects.filter(is_active=True, tenant_id=1).first()
 tenant_id = account.tenant_id
 print("tenant_id:", tenant_id)
 
