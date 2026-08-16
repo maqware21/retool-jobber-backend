@@ -192,6 +192,24 @@ class JobberJob(DateModel):
     # gets the same float-to-Decimal treatment as total.
     labour_duration_seconds = models.IntegerField(null=True, blank=True)
     labour_cost = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    # From Jobber's own completedAt field (ISO8601DateTime, nullable in the
+    # schema). Confirmed via live cross-check (2026-08-16, 3 real archived
+    # jobs): this tracks when the INVOICING loop closes (invoice
+    # created/sent), NOT when the physical work was done — completedAt
+    # landed 10-23 seconds before each job's own invoice was issued, and
+    # about a full day after job.start_at. That's the correct field for
+    # "Jobs Completed" regardless (archived = completed, confirmed from 3
+    # separate angles — direct testing, Jobber's own docs, Jobber's support
+    # bot — see PROJECT_CONTEXT.md), it just doesn't mean "finished on-site
+    # that day." Nullable here because Jobber's own schema nulls it, and
+    # specifically because an archived job with NO linked invoice at all
+    # (skip-invoicing config, or a cancelled job — a real, valid case, not
+    # an error) may not populate it — untested in this project's real data
+    # as of 2026-08-16 (no such job existed in the test account at the
+    # time), so treated defensively rather than assumed safe. See
+    # sync.py's sync_jobs() and electricians_summary.py for how a null
+    # value here is handled (excluded, not defaulted to another date).
+    completed_at = models.DateTimeField(null=True, blank=True)
     synced_at = models.DateTimeField()
 
     class Meta:

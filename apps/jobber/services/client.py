@@ -359,9 +359,12 @@ query GetClients($first: Int!, $after: String) {
 
 # Sync-only — see the comment on _JOBS_QUERY above for why this isn't just
 # _JOBS_QUERY widened in place. Adds jobCosting (for JobberJob.labour_cost /
-# labour_duration_seconds) and each visit's own id (for JobberVisit.jobber_id
+# labour_duration_seconds), each visit's own id (for JobberVisit.jobber_id
 # — visits are synced by extracting them from these same job nodes, not via
-# a separate top-level query; see sync.py's sync_visits() docstring for why).
+# a separate top-level query; see sync.py's sync_visits() docstring for why),
+# and completedAt (for JobberJob.completed_at — confirmed live 2026-08-16 to
+# track when invoicing clears, not when work physically finished; see the
+# model field's own comment for the full verification).
 _SYNC_JOBS_QUERY = """
 query GetJobsForSync($first: Int!, $after: String) {
   jobs(first: $first, after: $after) {
@@ -374,6 +377,7 @@ query GetJobsForSync($first: Int!, $after: String) {
       total
       startAt
       createdAt
+      completedAt
       client { id name tags(first: 5) { nodes { label } } }
       property { street city province postalCode }
       lineItems(first: 1) {

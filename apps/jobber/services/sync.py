@@ -261,6 +261,7 @@ def sync_jobs(account, tenant, deadline, clients_complete):
                 'total': _to_decimal(node.get('total')) or Decimal('0'),
                 'jobber_created_at': _to_datetime(node.get('createdAt')),
                 'start_at': _to_datetime(node.get('startAt')),
+                'completed_at': _to_datetime(node.get('completedAt')),
                 'address': _format_address(node.get('property')),
                 'labour_duration_seconds': costing.get('labourDuration'),
                 'labour_cost': _to_decimal(costing.get('labourCost')),
