@@ -30,7 +30,7 @@ from datetime import timedelta
 from apps.jobber.models import JobberAccount, JobberSyncRun
 from apps.jobber.services import sync
 
-account = JobberAccount.objects.filter(is_active=True).first()
+account = JobberAccount.objects.filter(is_active=True, tenant_id=1).first()
 tenant = account.tenant
 print("tenant_id:", tenant.id)
 

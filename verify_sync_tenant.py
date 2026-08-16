@@ -20,7 +20,7 @@ from apps.jobber.models import (
 )
 from apps.jobber.services.sync import sync_tenant
 
-account = JobberAccount.objects.filter(is_active=True).first()
+account = JobberAccount.objects.filter(is_active=True, tenant_id=1).first()
 print("tenant_id:", account.tenant_id)
 
 run = sync_tenant(account)

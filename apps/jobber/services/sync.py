@@ -30,6 +30,7 @@ from apps.jobber.models import (
     JobberInvoice,
     JobberJob,
     JobberSyncRun,
+    JobberTimeSheetEntry,
     JobberUser,
     JobberVisit,
 )
@@ -44,7 +45,7 @@ logger = logging.getLogger(__name__)
 # fetch_all_pages_bounded(), not mid-page.
 SYNC_WALL_CLOCK_CEILING = timedelta(seconds=25)
 
-ALL_ENTITIES = ('clients', 'users', 'jobs', 'visits', 'invoices')
+ALL_ENTITIES = ('clients', 'users', 'jobs', 'visits', 'invoices', 'timesheet_entries')
 
 # ensure_fresh()'s staleness threshold — the design doc's proposed default
 # (20 minutes, inside the 15-30 min window already flagged elsewhere in this
@@ -57,6 +58,7 @@ ENTITY_MODELS = {
     'jobs': JobberJob,
     'visits': JobberVisit,
     'invoices': JobberInvoice,
+    'timesheet_entries': JobberTimeSheetEntry,
 }
 
 
@@ -360,6 +362,88 @@ def sync_visits(account, tenant, job_nodes, complete):
     return {'count': count, 'complete': complete}
 
 
+def sync_timesheet_entries(account, tenant, job_nodes, complete):
+    """
+    TimeSheetEntries are nested inside each Job node (job.timeSheetEntries),
+    not pulled via a standalone top-level query — same situation as Visits,
+    confirmed against the schema rather than assumed: Query.timeSheetEntries
+    does exist, but its own description is "All timesheet entries for users
+    on a given day" and its filter type (TimeSheetEntriesFilterAttributes)
+    has no job filter field at all — there is no way to ask the root query
+    "every entry for this job." So this derives JobberTimeSheetEntry rows
+    from the SAME job_nodes sync_jobs() already pulled this run (via the
+    sync-only jobs query, which asks for each entry's
+    id/startAt/endAt/finalDuration/user.id) — zero new schema risk, no
+    second per-job round-trip.
+
+    Stores every raw entry AS-IS, unmerged — even when the same (job, user)
+    pair has overlapping time ranges. This is a real, confirmed case, not
+    hypothetical: one technician's own stop/restart mistake produced two
+    genuinely overlapping entries for one real job in this project's test
+    data (04:00-08:00 and 04:00-09:00, same person). Merging overlapping
+    intervals into a duration figure — and the separate, still-open
+    question of how to handle DIFFERENT users overlapping on the same job
+    (default: sum each user's own post-merge hours independently, i.e. a
+    labour-hours definition, not wall-clock elapsed time — flagged as a
+    real open question to revisit if a genuine case ever appears, see
+    PROJECT_CONTEXT.md) — is explicitly Part B's job (the average/merge
+    math), not this sync step's. This table's only job is to mirror
+    Jobber's real entries faithfully; no row here is ever merged, split,
+    or dropped for overlap reasons.
+
+    `complete` is sync_jobs()'s own completeness flag for this run, passed
+    through unchanged — same reasoning as sync_visits(): entry data can't
+    be more complete than the job data it was extracted from, and that flag
+    is already dependency-aware (False whenever Clients came back PARTIAL
+    too), so this correctly inherits the same protection without needing
+    its own copy of that logic.
+    """
+    seen_ids = set()
+    count = 0
+    for job_node in job_nodes:
+        job_id = job_node.get('id')
+        if not job_id:
+            continue
+        job = JobberJob.objects.filter(tenant=tenant, jobber_id=job_id).first()
+        if job is None:
+            # The job itself was skipped in sync_jobs() (e.g. missing local
+            # client) — its timesheet entries can't be linked to anything,
+            # skip too.
+            continue
+
+        for entry_node in (job_node.get('timeSheetEntries') or {}).get('nodes') or []:
+            entry_id = entry_node.get('id')
+            if not entry_id:
+                continue
+
+            user_data = entry_node.get('user') or {}
+            entry_user = None
+            user_id = user_data.get('id')
+            if user_id:
+                entry_user = JobberUser.objects.filter(tenant=tenant, jobber_id=user_id).first()
+
+            seen_ids.add(entry_id)
+            JobberTimeSheetEntry.objects.update_or_create(
+                tenant=tenant,
+                jobber_id=entry_id,
+                defaults={
+                    'job': job,
+                    'user': entry_user,
+                    'final_duration_seconds': entry_node.get('finalDuration') or 0,
+                    'started_at': _to_datetime(entry_node.get('startAt')),
+                    'ended_at': _to_datetime(entry_node.get('endAt')),
+                    'synced_at': timezone.now(),
+                    'is_active': True,
+                },
+            )
+            count += 1
+
+    if complete:
+        JobberTimeSheetEntry.objects.filter(tenant=tenant, is_active=True).exclude(jobber_id__in=seen_ids).update(is_active=False)
+
+    return {'count': count, 'complete': complete}
+
+
 def sync_invoices(account, tenant, deadline, clients_complete, jobs_complete):
     """
     Pull every Invoice, upsert, deactivate vanished ones — but ONLY if this
@@ -455,6 +539,12 @@ def sync_invoices(account, tenant, deadline, clients_complete, jobs_complete):
 
 
 def _finish_run(run, wanted, counts, had_failure, error_message):
+    # NOTE: JobberSyncRun has no timesheet_entries_synced column (not added
+    # this round — Part A's scope was the new entity + sync logic only, see
+    # PROJECT_CONTEXT.md). any_progress/all_complete below still work
+    # correctly for 'timesheet_entries' (they iterate `wanted`/`counts`
+    # generically, no field-name dependency) — only the per-entity count
+    # persisted onto the JobberSyncRun row is skipped for this one entity.
     any_progress = any(counts.get(e, {}).get('count', 0) > 0 for e in wanted)
     all_complete = bool(wanted) and all(counts.get(e, {}).get('complete') for e in wanted)
 
@@ -521,13 +611,15 @@ def sync_tenant(account, entities=None):
             clients_complete = counts['clients']['complete']
         if 'users' in wanted:
             counts['users'] = sync_users(account, tenant, deadline)
-        if 'jobs' in wanted or 'visits' in wanted:
+        if 'jobs' in wanted or 'visits' in wanted or 'timesheet_entries' in wanted:
             job_result = sync_jobs(account, tenant, deadline, clients_complete)
             job_nodes = job_result.pop('nodes')
             jobs_complete = job_result['complete']
             counts['jobs'] = job_result
         if 'visits' in wanted:
             counts['visits'] = sync_visits(account, tenant, job_nodes, jobs_complete)
+        if 'timesheet_entries' in wanted:
+            counts['timesheet_entries'] = sync_timesheet_entries(account, tenant, job_nodes, jobs_complete)
         if 'invoices' in wanted:
             counts['invoices'] = sync_invoices(account, tenant, deadline, clients_complete, jobs_complete)
     except client.JobberAPIError as exc:

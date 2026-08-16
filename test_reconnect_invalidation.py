@@ -49,7 +49,7 @@ def total_counts(tenant_id):
     return {name: model.objects.filter(tenant_id=tenant_id).count() for name, model in ENTITY_MODELS.items()}
 
 
-account = JobberAccount.objects.filter(is_active=True).first()
+account = JobberAccount.objects.filter(is_active=True, tenant_id=1).first()
 tenant = account.tenant
 user = tenant.users.first()
 print("tenant_id:", tenant.id, "user_id:", user.id)
