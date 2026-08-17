@@ -7,7 +7,7 @@ from django.utils import timezone
 from rest_framework import status
 from rest_framework.views import APIView
 
-from apps.jobber.models import JobberAccount, JobberInvoice, JobberJob
+from apps.jobber.models import JobberAccount, JobberInvoice, JobberJob, JobberUser
 from apps.jobber.services.sync import ensure_fresh
 from helpers.api_exception import validator_errors
 from helpers.messages import MESSAGES
@@ -27,6 +27,7 @@ _NOT_CONNECTED_DATA = {
     'total_revenue': None,
     'jobs_completed': None,
     'avg_job_duration_seconds': None,
+    'top_earner': None,
     'period_months': PERIOD_MONTHS,
     'last_synced_at': None,
 }
@@ -264,14 +265,143 @@ def split_job_revenue_among_assignees(job_revenue, hours_by_user):
     return {u: job_revenue * (h / total_hours) for u, h in tracked.items()}
 
 
+def _gather_job_assignees(job):
+    """
+    Every REAL, locally-known assignee across ALL of a job's visits,
+    deduped by user id — the "assigned" side of Top Earner's split, from
+    JobberVisit.assigned_users (the additive M2M added in Part A). This is
+    NOT the same population as calculate_job_duration_by_user()'s keys,
+    which are keyed by whoever actually has a TimeSheetEntry (including a
+    possible synthetic no-user bucket that doesn't correspond to any real
+    assignee at all) — this function is strictly "who is assigned,"
+    independent of who tracked anything.
+
+    Returns {user_id: JobberUser}. Not optimized for scale (a per-job
+    query, same as every other per-job helper in this module) — fine at
+    this project's current real data volume (13 jobs, 14 visits total).
+    """
+    assignees = {}
+    for visit in job.visits.filter(is_active=True).prefetch_related('assigned_users'):
+        for assigned_user in visit.assigned_users.all():
+            assignees[assigned_user.id] = assigned_user
+    return assignees
+
+
+def calculate_job_revenue_shares(job):
+    """
+    Orchestration (impure — hits the DB) tying together every
+    already-verified Part A piece for ONE job's Top Earner contribution.
+    Nothing here is speculative; every piece below was individually
+    proven correct in Part A before this function combines them:
+
+      1. Every real assignee across the job's visits, deduped —
+         _gather_job_assignees() above, from the new assigned_users M2M.
+      2. Each assignee's tracked hours on this job —
+         calculate_job_duration_by_user(job), the EXACT SAME merge logic
+         already verified bit-for-bit against real data (job 2 -> 18000s,
+         confirmed). NOT re-derived here. An assignee with zero timesheet
+         entries gets 0 hours (not omitted) — they must still appear in
+         hours_by_user for split_job_revenue_among_assignees() to
+         correctly tell "no one tracked" from "everyone tracked" from
+         "partial."
+      3. job.total as revenue — same archived + completed_at population
+         jobs_completed/avg_job_duration_seconds already use, NOT the
+         Paid-invoice population Total Revenue uses (confirmed mismatch,
+         see split_job_revenue_among_assignees()'s own docstring).
+         Explicitly coerced to float here — job.total is a Decimal, and
+         split_job_revenue_among_assignees() does float division
+         internally (Decimal * float raises TypeError in Python); this is
+         the one place that conversion needs to happen, so it happens
+         here rather than inside the already-verified pure function.
+      4. split_job_revenue_among_assignees() — the already-verified pure
+         4-branch split, untouched.
+
+    KNOWN EDGE CASE, not silently absorbed: a TimeSheetEntry with no
+    linked local JobberUser (calculate_job_duration_by_user()'s synthetic
+    "_no_user_<entry_id>" bucket) doesn't correspond to any real assignee,
+    so its tracked hours are NOT included in hours_by_user at all here —
+    that time is invisible to the split, neither counted as "someone
+    tracked" evidence nor attributed to anyone's revenue share. Not yet
+    observed in real data (every real entry checked so far has a linked
+    user); flagged, not silently dropped.
+
+    Returns {user_id: revenue_share} for this one job — an empty dict if
+    the job has no assignees at all (nothing to attribute revenue to).
+    """
+    assignees = _gather_job_assignees(job)
+    if not assignees:
+        return {}
+
+    hours_by_entry_user = calculate_job_duration_by_user(job)
+    hours_by_user = {
+        user_id: hours_by_entry_user.get(user_id, 0)
+        for user_id in assignees
+    }
+
+    return split_job_revenue_among_assignees(float(job.total), hours_by_user)
+
+
+def calculate_top_earner(archived_jobs):
+    """
+    Accumulates each technician's revenue_share (calculate_job_revenue_shares())
+    across every job in `archived_jobs` into a running total for the whole
+    window. `archived_jobs` is passed in by the caller (the same
+    archived + completed_at-windowed queryset jobs_completed/
+    avg_job_duration_seconds already use) rather than re-queried here —
+    same "reuse, don't re-derive" discipline as the rest of this feature.
+
+    Returns {user_id: accumulated_revenue} across the whole window — not
+    yet resolved to a name or narrowed to a single "top" pick; see
+    pick_top_earner() for that. Empty dict if no job in the window has any
+    assignee at all.
+    """
+    totals = {}
+    for job in archived_jobs:
+        shares = calculate_job_revenue_shares(job)
+        for user_id, share in shares.items():
+            totals[user_id] = totals.get(user_id, 0) + share
+    return totals
+
+
+def pick_top_earner(totals, users_by_id):
+    """
+    totals: {user_id: accumulated_revenue} from calculate_top_earner().
+    users_by_id: {user_id: JobberUser}, for name resolution.
+
+    TIE-BREAK DECISION (2026-08-17, explicit, not silent): on an exact tie
+    for the highest accumulated revenue, the winner is whoever's name
+    sorts first alphabetically (ascending, case-insensitive). Simple,
+    fully deterministic — the "Top Earner" tile can never flicker between
+    two different people showing the identical number on repeat loads or
+    re-syncs of the exact same underlying data.
+
+    Returns {'name': str, 'revenue': float} (revenue rounded to 2 decimal
+    places for display — the only rounding point for this value; the
+    proportional-split arithmetic upstream can produce long floating
+    decimals, e.g. $333.333333...), or None if `totals` is empty (no
+    archived job in the window had any assignee at all — the null case
+    the endpoint contract requires, handled defensively here rather than
+    letting max()/min() raise on an empty sequence).
+    """
+    if not totals:
+        return None
+
+    max_revenue = max(totals.values())
+    tied_user_ids = [uid for uid, revenue in totals.items() if revenue == max_revenue]
+    winner_id = min(tied_user_ids, key=lambda uid: (users_by_id[uid].name or '').lower())
+
+    return {
+        'name': users_by_id[winner_id].name,
+        'revenue': round(float(max_revenue), 2),
+    }
+
+
 def _local_electricians_summary_response(user):
     """
-    Local-table source for the Electricians panel's KPI tiles, grown one
-    field at a time as each of the 4 mock tiles (Total Revenue, Jobs
-    Completed, Avg Job Duration, Top Earner) goes real — per TL decision,
-    replaced in place with no visual distinction from the ones still mock.
-    Currently `total_revenue` (Total Revenue), `jobs_completed` (Jobs
-    Completed), and `avg_job_duration_seconds` (Avg Job Duration).
+    Local-table source for the Electricians panel's KPI tiles — ALL 4 mock
+    tiles (Total Revenue, Jobs Completed, Avg Job Duration, Top Earner)
+    are now real, replaced in place with no visual distinction from the
+    original mock version, per TL decision.
 
     Calls ensure_fresh(require_complete=True) first — same reasoning
     already established for Accounts/Employees: a Sum/count/average
@@ -279,11 +409,17 @@ def _local_electricians_summary_response(user):
     just a stale one, so a PARTIAL sync gets one retry (via
     require_complete) before this proceeds regardless — see
     ensure_fresh()'s own docstring for exactly what that retry does and
-    doesn't guarantee. Now requests 'invoices', 'jobs', AND
-    'timesheet_entries' — avg_job_duration_seconds reads
-    JobberTimeSheetEntry via each job's timesheet_entries, same
-    completeness requirement as the other two fields reading their own
-    entities.
+    doesn't guarantee. Requests 'invoices', 'jobs', 'visits', AND
+    'timesheet_entries' — avg_job_duration_seconds and top_earner both
+    read JobberTimeSheetEntry via each job's timesheet_entries, same
+    completeness requirement as the other fields reading their own
+    entities. 'visits' is REQUIRED explicitly here, not implied by 'jobs'
+    — confirmed against sync_tenant()'s own branching: 'jobs'/
+    'timesheet_entries' only trigger the shared job_nodes fetch, but
+    sync_visits() (which populates JobberVisit.assigned_users, Part A)
+    only runs when 'visits' is itself in the requested entity set. Omitting
+    it here would silently leave top_earner reading stale/never-synced
+    assignee data.
 
     period_start uses dateutil.relativedelta(months=PERIOD_MONTHS), not
     timedelta(days=180) — a real calendar-month subtraction (e.g. Feb 12 ->
@@ -301,7 +437,7 @@ def _local_electricians_summary_response(user):
     if account is None:
         return dict(_NOT_CONNECTED_DATA)
 
-    fresh = ensure_fresh(account.tenant, entities=['invoices', 'jobs', 'timesheet_entries'], require_complete=True)
+    fresh = ensure_fresh(account.tenant, entities=['invoices', 'jobs', 'visits', 'timesheet_entries'], require_complete=True)
 
     period_start = timezone.now() - relativedelta(months=PERIOD_MONTHS)
 
@@ -350,6 +486,23 @@ def _local_electricians_summary_response(user):
         else None
     )
 
+    # Same archived-jobs population as jobs_completed/avg_job_duration_seconds
+    # above — the third and last consumer of this exact queryset. Revenue
+    # source is job.total (see split_job_revenue_among_assignees()'s and
+    # calculate_job_revenue_shares()'s own docstrings for the confirmed,
+    # deliberate population mismatch against this endpoint's own
+    # total_revenue field above, which uses Paid invoices instead).
+    top_earner_totals = calculate_top_earner(archived_jobs)
+    if top_earner_totals:
+        users_by_id = {u.id: u for u in JobberUser.objects.filter(id__in=top_earner_totals.keys())}
+        top_earner = pick_top_earner(top_earner_totals, users_by_id)
+    else:
+        # Null case per the endpoint contract: no archived job in the
+        # window had any assignee at all — not an error, handled
+        # defensively rather than letting pick_top_earner() see an empty
+        # dict unexpectedly (it also guards this itself, belt-and-braces).
+        top_earner = None
+
     data = {
         'connected': True,
         # Genuinely zero (no Paid invoices in the period) is a real,
@@ -359,6 +512,7 @@ def _local_electricians_summary_response(user):
         'total_revenue': float(total) if total is not None else 0.0,
         'jobs_completed': jobs_completed,
         'avg_job_duration_seconds': avg_job_duration_seconds,
+        'top_earner': top_earner,
         'period_months': PERIOD_MONTHS,
         'last_synced_at': fresh['last_synced_at'].isoformat() if fresh['last_synced_at'] else None,
     }
