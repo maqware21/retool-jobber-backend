@@ -302,14 +302,22 @@ def sync_visits(account, tenant, job_nodes, complete):
     direct pull is preferred later, this can be revisited — flagging that
     as a deliberate choice made under uncertainty, not an oversight.
 
-    Only the first assignedUser per visit is stored, matching
-    JobberVisit.assigned_user being a single nullable FK (per the approved
-    design) and the live-proxy's own existing "first assignee" convention
-    (_first_assignee). Known gap: a visit with more than one assignee only
-    gets its first one stored locally — any future local-table-based
-    employee ranking would undercount multi-assignee jobs relative to the
-    live-proxy's _rank_employees, which credits every assignee. Flagged, not
-    silently absorbed.
+    Only the first assignedUser per visit is stored on assigned_user
+    (single nullable FK, per the approved design, matching the live-proxy's
+    own existing "first assignee" convention — _first_assignee). This
+    field and its behavior are UNCHANGED here — still consumed by live,
+    shipped production code (JobberJobsView.get()'s "Assigned To" column
+    via jobs.py's _local_first_assignee()/assigned_user_name).
+
+    NEW (2026-08-17): assigned_users (M2M) additionally stores EVERY
+    assignedUser on the visit, not just the first — for Top Earner's
+    per-technician revenue split, which needs to know every assignee, not
+    a single "first" one. Populated from the SAME assignedUsers(first: 5)
+    data already fetched for assigned_user above — no new Jobber query
+    cost, no new schema risk. This is the fix for the gap this function's
+    own docstring used to flag here (a visit with more than one assignee
+    only having its first one stored locally) — additive, not a
+    replacement of the existing behavior.
 
     `complete` is sync_jobs()'s own completeness flag for this run, passed
     through unchanged — Visit data can't be any more complete than the Job
@@ -344,7 +352,7 @@ def sync_visits(account, tenant, job_nodes, complete):
                     assigned_user = JobberUser.objects.filter(tenant=tenant, jobber_id=assigned_user_id).first()
 
             seen_ids.add(visit_id)
-            JobberVisit.objects.update_or_create(
+            visit, _created = JobberVisit.objects.update_or_create(
                 tenant=tenant,
                 jobber_id=visit_id,
                 defaults={
@@ -354,6 +362,26 @@ def sync_visits(account, tenant, job_nodes, complete):
                     'is_active': True,
                 },
             )
+
+            # New: populate the additive assigned_users M2M with EVERY
+            # assignee, reusing the exact same `assigned` list resolved
+            # above — not a second Jobber fetch. .set() requires a saved
+            # instance, so this happens after update_or_create() returns,
+            # not inside its `defaults` (Django's update_or_create doesn't
+            # support M2M fields there). Any assignee not yet locally
+            # synced as a JobberUser is silently skipped, same "skip if
+            # not synced yet" reasoning already applied to assigned_user
+            # above — picked up on a future sync once that user exists.
+            all_assigned_users = []
+            for assignee_node in assigned:
+                assignee_id = assignee_node.get('id')
+                if not assignee_id:
+                    continue
+                assignee = JobberUser.objects.filter(tenant=tenant, jobber_id=assignee_id).first()
+                if assignee is not None:
+                    all_assigned_users.append(assignee)
+            visit.assigned_users.set(all_assigned_users)
+
             count += 1
 
     if complete:
