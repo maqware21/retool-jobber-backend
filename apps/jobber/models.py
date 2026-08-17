@@ -252,12 +252,40 @@ class JobberVisit(DateModel):
         related_name='visits',
     )
     # Nullable — "Unassigned" becomes null instead of a string.
+    #
+    # ADDITIVE-ONLY, deliberately not replaced (2026-08-17): this field and
+    # assigned_user_name below are consumed by LIVE, SHIPPED production
+    # code — JobberJobsView.get() (the real /v1/jobber/jobs/ endpoint,
+    # already cut over to local reads) reads assigned_user_name via
+    # jobs.py's _local_first_assignee() for the real "Assigned To" column
+    # customers see today. Changing this field's meaning or removing it
+    # would be a regression risk to already-shipped behavior, not just an
+    # internal refactor — so it stays completely untouched, same values,
+    # same "first assignee, 'Unassigned' fallback" semantics, forever
+    # (or until that live consumer is deliberately migrated off it).
+    # assigned_users (plural, below) is the new, separate, additive field
+    # for anything that needs EVERY assignee, not just the first.
     assigned_user = models.ForeignKey(
         JobberUser,
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
         related_name='visits',
+    )
+    # New (2026-08-17), for Top Earner's per-technician revenue split —
+    # Jobber's own schema has always supported multiple assignees per visit
+    # (Visit.assignedUsers is a UserConnection, confirmed against the
+    # schema, not assumed) and assignedUsers(first: 5) is already being
+    # fetched by the sync-only query for every visit; today's sync just
+    # discards everything past the first entry. This field captures all of
+    # them instead, at zero new Jobber query cost. related_name is
+    # 'assigned_visits', not 'visits' — assigned_user above already owns
+    # that reverse accessor name on JobberUser, and the two need to coexist
+    # without colliding.
+    assigned_users = models.ManyToManyField(
+        JobberUser,
+        related_name='assigned_visits',
+        blank=True,
     )
     jobber_id = models.CharField(max_length=255, db_index=True)
     synced_at = models.DateTimeField()

@@ -64,51 +64,64 @@ def _merge_intervals(intervals):
     return sum((end - start).total_seconds() for start, end in merged)
 
 
-def calculate_job_duration_seconds(job):
+def calculate_job_duration_by_user(job):
     """
-    Real, standalone, testable per-job duration calculation — deliberately
-    NOT inline in the endpoint, so it can be called directly (as
-    verify_avg_job_duration_calc.py does) against real JobberJob instances
-    without going through a request/view at all.
+    Same merge logic calculate_job_duration_seconds() below is built on —
+    grouped by user, each user's own overlapping timesheet-entry intervals
+    merged via _merge_intervals() before summing — extracted out
+    (2026-08-17) as its own function so Top Earner's per-technician revenue
+    split can reuse the EXACT SAME, already-proven merge math instead of
+    re-deriving hours independently from raw TimeSheetEntry rows.
+    Re-implementing this a second time would risk silently reintroducing
+    the exact Job 2 double-counting bug this logic exists to prevent.
 
-    Per the confirmed decisions (2026-08-16):
+    This is a PURE EXTRACTION of what used to be calculate_job_duration_seconds()'s
+    own body — the merge math itself is UNCHANGED, not just similar.
+    Verified bit-for-bit identical against real data via
+    verify_top_earner_step3.py (Step 3a): calculate_job_duration_seconds()
+    still returns exactly the same values for jobs 1, 2, 5, 6, 7, 12 as it
+    did before this refactor.
+
+    Per the confirmed decisions (2026-08-16, unchanged):
       - The SAME (job, user) pair's entries are merged into their time-range
         UNION before summing (via _merge_intervals above) — never a naive
         sum of each entry's own final_duration_seconds, which would
         double-count real overlapping time (the confirmed Job 2 case).
-      - DIFFERENT users overlapping the same job (not yet observed in real
-        data) are summed independently, each AFTER their own overlaps are
-        merged — a labour-hours definition (e.g. 2 people x 4 concurrent
-        hours = 8 labour-hours), not wall-clock elapsed time. This remains
-        an explicit, documented open assumption — see PROJECT_CONTEXT.md —
-        not re-decided here.
-      - A job with ZERO timesheet entries returns None, never 0 — the
-        caller (avg_job_duration_seconds() below) must treat that as "no
-        data," not as a real 0-duration job, same convention already
-        established for completed_at.
+      - An entry with no linked local user can't be safely grouped with
+        another no-user entry by identity — merging two unidentified
+        people's time as if they were the same person would be a WORSE
+        guess than not merging at all. Not yet observed in real data
+        (every real entry checked so far has a linked user); each such
+        entry gets its own group (keyed by the entry's own id) so it
+        contributes its own duration unmerged, rather than risking an
+        incorrect merge. Flagged, not silent.
+
+    Returns {user_id: merged_seconds} — RAW (unrounded) seconds, one entry
+    per user (or synthetic no-user group) who has at least one timesheet
+    entry on this job. A job with zero entries returns {} (empty dict),
+    not None — calculate_job_duration_seconds() below is the one that
+    turns "no data" into None, to preserve its existing contract exactly.
+    Deliberately NOT rounded per-user here: calculate_job_duration_seconds()
+    needs to sum-then-round exactly once, at the end, to reproduce its
+    pre-refactor behavior bit-for-bit — rounding each user's total first
+    and then summing the rounded values is not guaranteed to equal
+    rounding the sum, so that rounding step stays where it always was.
 
     Takes a JobberJob instance, not a bare id — lets this be called
     directly against real ORM objects in tests/verification scripts.
     """
     entries = list(job.timesheet_entries.filter(is_active=True))
     if not entries:
-        return None
+        return {}
 
     by_user = {}
     for entry in entries:
-        # An entry with no linked local user can't be safely grouped with
-        # another no-user entry by identity — merging two unidentified
-        # people's time as if they were the same person would be a WORSE
-        # guess than not merging at all. Not yet observed in real data
-        # (every real entry checked so far has a linked user); each such
-        # entry gets its own group (keyed by the entry's own id) so it
-        # contributes its own duration unmerged, rather than risking an
-        # incorrect merge. Flagged, not silent.
         group_key = entry.user_id if entry.user_id is not None else f'_no_user_{entry.id}'
         by_user.setdefault(group_key, []).append(entry)
 
-    total_seconds = 0
-    for user_entries in by_user.values():
+    per_user_totals = {}
+    for group_key, user_entries in by_user.items():
+        seconds = 0
         intervals = []
         for entry in user_entries:
             start = entry.started_at
@@ -119,7 +132,7 @@ def calculate_job_duration_seconds(job):
                 # stopped entries), but add its own duration unmerged
                 # rather than silently dropping real time. Flagged, not
                 # expected in practice.
-                total_seconds += entry.final_duration_seconds or 0
+                seconds += entry.final_duration_seconds or 0
                 continue
 
             end = entry.ended_at
@@ -132,9 +145,123 @@ def calculate_job_duration_seconds(job):
 
             intervals.append((start, end))
 
-        total_seconds += _merge_intervals(intervals)
+        seconds += _merge_intervals(intervals)
+        per_user_totals[group_key] = seconds
 
-    return int(round(total_seconds))
+    return per_user_totals
+
+
+def calculate_job_duration_seconds(job):
+    """
+    Real, standalone, testable per-job duration calculation — deliberately
+    NOT inline in the endpoint, so it can be called directly (as
+    verify_avg_job_duration_calc.py does) against real JobberJob instances
+    without going through a request/view at all.
+
+    Now a thin wrapper over calculate_job_duration_by_user() (2026-08-17
+    refactor) — that function owns the merge math; this just sums its
+    per-user breakdown and applies the same single sum-then-round step
+    this function always used, exactly reproducing pre-refactor behavior
+    bit-for-bit (verified via verify_top_earner_step3.py, Step 3a).
+
+    Per the confirmed decisions (2026-08-16, unchanged by this refactor):
+      - DIFFERENT users overlapping the same job (not yet observed in real
+        data) are summed independently, each AFTER their own overlaps are
+        merged — a labour-hours definition (e.g. 2 people x 4 concurrent
+        hours = 8 labour-hours), not wall-clock elapsed time. This remains
+        an explicit, documented open assumption — see PROJECT_CONTEXT.md —
+        not re-decided here.
+      - A job with ZERO timesheet entries returns None, never 0 — the
+        caller (avg_job_duration_seconds() below) must treat that as "no
+        data," not as a real 0-duration job, same convention already
+        established for completed_at.
+    """
+    per_user = calculate_job_duration_by_user(job)
+    if not per_user:
+        return None
+    return int(round(sum(per_user.values())))
+
+
+def split_job_revenue_among_assignees(job_revenue, hours_by_user):
+    """
+    "Top Earner" per-technician revenue split for one job — real,
+    standalone, testable pure function (plain numbers/dicts in and out, no
+    ORM/DB coupling), deliberately not inline in any endpoint/orchestration
+    code (none exists yet — this is Part A: schema + pure functions only).
+
+    hours_by_user: {user_id: tracked_seconds} — MUST include every person
+    actually ASSIGNED to the job as a key, with 0 for anyone assigned but
+    who tracked no time on it. This function has no concept of "assigned"
+    vs. "tracked" as separate things — the caller (future orchestration,
+    Part B) builds this dict from JobberVisit.assigned_users (every
+    assignee) and calculate_job_duration_by_user() (who actually tracked
+    what) before calling this.
+
+    Per Jobber's own confirmed attribution rule (Team Productivity Report +
+    support bot) — 3 discrete cases, plus one gap this project is filling
+    in with its own interpretation, flagged explicitly below:
+
+      1. Everyone assigned tracked time -> proportional split by hours.
+      2. No one tracked time -> EQUAL split among all assigned (per TL
+         decision, 2026-08-17: NOT excluded from Top Earner, even though a
+         job with zero tracked time is excluded from the separate Avg Job
+         Duration average — two different features, two different,
+         independently-confirmed rules for the same underlying "no time
+         data" situation).
+      3. Exactly one person tracked time -> 100% to that one person.
+      4. [GAP — not covered by Jobber's stated 3 rules. OUR INTERPRETATION,
+         NOT INDEPENDENTLY CONFIRMED for this exact sub-case]: some but not
+         all assigned people tracked time (2+ people tracked, but fewer
+         than everyone assigned) -> proportional split among only those who
+         tracked, excluding the 0-hour assignees from the pool entirely —
+         the natural extension of rule 1's "proportional by hours"
+         principle with non-trackers simply removed from the split, rather
+         than a new rule invented from nothing. Revisit against Jobber's
+         docs/support bot specifically for this sub-case before treating it
+         as settled.
+
+    Returns {user_id: revenue_share} — a plain dict, same currency unit as
+    job_revenue (no rounding applied here; that's a display concern for
+    whatever renders this).
+
+    Intended pairing (Part B, not built yet): job_revenue = Job.total for
+    an archived job in the same completed_at-windowed population
+    jobs_completed/avg_job_duration_seconds already use — NOT the Paid-
+    invoice-filtered population Total Revenue uses. This is a genuine,
+    confirmed population/definition mismatch, not an oversight: Top
+    Earner's per-technician shares, summed across every technician, will
+    NOT necessarily equal the page's own Total Revenue tile, since
+    Job.total counts an archived job's full billed value regardless of
+    that job's own invoice's payment status, while Total Revenue only
+    counts invoices already marked Paid. Flagged here so whoever wires up
+    the orchestration in Part B sees it at the exact point it matters, not
+    just in PROJECT_CONTEXT.md.
+    """
+    assignees = list(hours_by_user.keys())
+    if not assignees:
+        return {}
+
+    tracked = {u: h for u, h in hours_by_user.items() if h > 0}
+
+    if len(tracked) == len(assignees):
+        # Rule 1: everyone tracked — proportional split by hours.
+        total_hours = sum(tracked.values())
+        return {u: job_revenue * (h / total_hours) for u, h in tracked.items()}
+
+    if not tracked:
+        # Rule 2: no one tracked — equal split among all assigned.
+        share = job_revenue / len(assignees)
+        return {u: share for u in assignees}
+
+    if len(tracked) == 1:
+        # Rule 3: exactly one person tracked — 100% to them.
+        only_user = next(iter(tracked))
+        return {only_user: job_revenue}
+
+    # Rule 4 (gap-filling interpretation, see docstring) — some but not
+    # all tracked: proportional split among only those who tracked.
+    total_hours = sum(tracked.values())
+    return {u: job_revenue * (h / total_hours) for u, h in tracked.items()}
 
 
 def _local_electricians_summary_response(user):
