@@ -330,6 +330,7 @@ query GetUsers($first: Int!, $after: String) {
     nodes {
       id
       name { full }
+      phone { friendly }
       isAccountAdmin
       isAccountOwner
     }

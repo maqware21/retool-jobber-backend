@@ -130,6 +130,10 @@ class JobberUser(DateModel):
     )
     jobber_id = models.CharField(max_length=255, db_index=True)
     name = models.CharField(max_length=255)
+    # User.phone.friendly — confirmed real in Jobber's schema (2026-08-19),
+    # not previously synced. Nullable: a real user can have no phone on
+    # file in Jobber at all, not just "not yet synced."
+    phone = models.CharField(max_length=50, null=True, blank=True)
     # Already fetched live today via _USERS_QUERY but not exposed anywhere.
     # Kept here for the still-open "filter admins/owners from the roster?"
     # question (see PROJECT_CONTEXT.md) — not resolved by this model.
