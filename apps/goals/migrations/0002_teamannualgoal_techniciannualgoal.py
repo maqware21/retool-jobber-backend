@@ -93,7 +93,7 @@ class Migration(migrations.Migration):
             ),
         ),
         migrations.AddConstraint(
-            model_name="techniciannualgoal",
+            model_name="technicianannualgoal",
             constraint=models.UniqueConstraint(
                 fields=("tenant", "user", "year"),
                 name="unique_technician_annual_goal_tenant_user_year",
