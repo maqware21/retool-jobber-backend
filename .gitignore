@@ -25,6 +25,8 @@ env/
 local_settings.py
 db.sqlite3
 db.sqlite3-journal
+db_migration_test.sqlite3
+db_migration_test.sqlite3-journal
 media/
 staticfiles/
 static_root/
