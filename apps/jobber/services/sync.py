@@ -186,6 +186,7 @@ def sync_users(account, tenant, deadline):
             jobber_id=jobber_id,
             defaults={
                 'name': (node.get('name') or {}).get('full') or '',
+                'phone': (node.get('phone') or {}).get('friendly') or None,
                 'is_account_admin': bool(node.get('isAccountAdmin')),
                 'is_account_owner': bool(node.get('isAccountOwner')),
                 'synced_at': timezone.now(),

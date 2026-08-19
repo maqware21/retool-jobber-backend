@@ -11,6 +11,7 @@ from apps.jobber.api.oauth import (
     JobberDisconnectView,
     JobberStatusView,
 )
+from apps.jobber.api.technician_stats import JobberTechnicianStatsView
 from apps.jobber.api.webhook import JobberWebhookView
 
 app_name = 'jobber'
@@ -30,6 +31,7 @@ urlpatterns = [
     path('accounts/', JobberAccountsView.as_view(), name='accounts'),
     path('employees/', JobberEmployeesView.as_view(), name='employees'),
     path('electricians-summary/', JobberElectriciansSummaryView.as_view(), name='electricians-summary'),
+    path('technician-stats/', JobberTechnicianStatsView.as_view(), name='technician-stats'),
 
     # ── Webhooks (public — authenticated via HMAC-SHA256 signature) ────────────
     # Register this URL in the Jobber Developer Center for the APP_DISCONNECT
