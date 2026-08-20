@@ -324,6 +324,18 @@ query GetInvoices($first: Int!, $after: String) {
 """
 
 
+# customFields is a UNION (CustomFieldUnion -- confirmed against the
+# schema): [CustomFieldArea | CustomFieldDropdown | CustomFieldLink |
+# CustomFieldNumeric | CustomFieldText | CustomFieldTrueFalse]. Only the
+# 2 branches below are spread -- the CONFIRMED real shapes for this
+# account's "Expertise" (CustomFieldText) and "Experience"
+# (CustomFieldNumeric) Team custom fields (verify_user_custom_fields.py,
+# 2026-08-20). A different tenant's custom field of the same name
+# configured as a different type (or not configured at all) simply comes
+# back without a `label` match for our spread fragments -- GraphQL does
+# not error on an unmatched union member, it just omits the fields we
+# didn't ask for -- so this degrades to a clean, no-op skip in
+# _extract_custom_field() below, never a crash.
 _USERS_QUERY = """
 query GetUsers($first: Int!, $after: String) {
   users(first: $first, after: $after) {
@@ -333,6 +345,10 @@ query GetUsers($first: Int!, $after: String) {
       phone { friendly }
       isAccountAdmin
       isAccountOwner
+      customFields {
+        ... on CustomFieldText { label valueText }
+        ... on CustomFieldNumeric { label valueNumeric }
+      }
     }
     pageInfo { hasNextPage endCursor }
   }

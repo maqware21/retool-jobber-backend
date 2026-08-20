@@ -134,6 +134,21 @@ class JobberUser(DateModel):
     # not previously synced. Nullable: a real user can have no phone on
     # file in Jobber at all, not just "not yet synced."
     phone = models.CharField(max_length=50, null=True, blank=True)
+    # From User.customFields (a GraphQL UNION -- see _USERS_QUERY's own
+    # comment), matched by label after trimming whitespace (confirmed
+    # live, 2026-08-20: this account's real "Expertise" label has a
+    # trailing space). Both nullable -- a tenant without these exact
+    # Team custom fields configured (wrong label, wrong type, or simply
+    # never set up) gets a clean null, never a crash; confirmed real for
+    # THIS account only, not guaranteed for a future tenant.
+    expertise = models.CharField(max_length=255, null=True, blank=True)
+    # FloatField, not Decimal -- deliberately NOT the DecimalField(12, 2)
+    # money-field convention used elsewhere in this project: years of
+    # experience isn't a financial figure needing exact decimal
+    # arithmetic, and Jobber's own source field (CustomFieldNumeric.
+    # valueNumeric) is itself a Float, confirmed live ("4.0 Years", not
+    # necessarily always a whole number).
+    experience_years = models.FloatField(null=True, blank=True)
     # Already fetched live today via _USERS_QUERY but not exposed anywhere.
     # Kept here for the still-open "filter admins/owners from the roster?"
     # question (see PROJECT_CONTEXT.md) — not resolved by this model.
