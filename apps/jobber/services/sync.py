@@ -171,6 +171,31 @@ def sync_clients(account, tenant, deadline):
     return {'count': count, 'complete': complete}
 
 
+def _extract_custom_field(custom_fields, label, value_key):
+    """
+    custom_fields: the raw list from GetUsers' customFields selection --
+    each item is whatever our query's inline fragments matched for that
+    item's real type (a 'label' plus one value key), or an item with no
+    usable keys at all if its real type didn't match any fragment we
+    spread (see the comment on _USERS_QUERY).
+
+    label is matched via .strip() equality, NOT an exact match --
+    confirmed live (verify_user_custom_fields.py, 2026-08-20) that this
+    real account's "Expertise" field has a trailing space in its actual
+    label ("Expertise "). Hardcoding that exact string would only work by
+    accident for this one account and break the moment anyone re-types
+    the field name without the trailing space.
+
+    Returns None if genuinely absent -- a tenant without this exact
+    custom field configured at all (wrong label, wrong type, or simply
+    never set up) gets a clean null here, never a crash.
+    """
+    for field in custom_fields or []:
+        if (field.get('label') or '').strip() == label:
+            return field.get(value_key)
+    return None
+
+
 def sync_users(account, tenant, deadline):
     """Pull every User, upsert, deactivate vanished ones (if this pull was complete)."""
     nodes, complete = client.fetch_all_pages_bounded(client.fetch_users, account, 'fetch_users', deadline)
@@ -181,12 +206,15 @@ def sync_users(account, tenant, deadline):
         if not jobber_id:
             continue
         seen_ids.add(jobber_id)
+        custom_fields = node.get('customFields') or []
         JobberUser.objects.update_or_create(
             tenant=tenant,
             jobber_id=jobber_id,
             defaults={
                 'name': (node.get('name') or {}).get('full') or '',
                 'phone': (node.get('phone') or {}).get('friendly') or None,
+                'expertise': _extract_custom_field(custom_fields, 'Expertise', 'valueText'),
+                'experience_years': _extract_custom_field(custom_fields, 'Experience', 'valueNumeric'),
                 'is_account_admin': bool(node.get('isAccountAdmin')),
                 'is_account_owner': bool(node.get('isAccountOwner')),
                 'synced_at': timezone.now(),

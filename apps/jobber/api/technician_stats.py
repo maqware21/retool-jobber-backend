@@ -222,6 +222,15 @@ def _local_technician_stats_response(user):
         technicians.append({
             'user_id': tech.id,
             'name': tech.name,
+            # Already synced (JobberUser.phone) -- genuinely null for a
+            # real technician with no phone on file in Jobber itself, not
+            # "not yet synced". Passed through as-is, never coalesced.
+            'phone': tech.phone,
+            # From User.customFields ("Expertise"/"Experience" Team custom
+            # fields, confirmed real for this account) -- null for a
+            # tenant that hasn't configured them, never a crash.
+            'expertise': tech.expertise,
+            'experience_years': tech.experience_years,
             # Genuinely zero (no revenue this window) is a real, different
             # answer from "no data" -- always a number here, never null.
             'revenue': round(float(revenue), 2),
