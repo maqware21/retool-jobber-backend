@@ -1,6 +1,14 @@
 from apps.alerts.models import AlertRule
 from apps.jobber.api.technician_stats import get_technician_stats
 
+# Sort rank for the one required ordering rule (2026-08-21, confirmed
+# TL decision): Critical always before Warning, everywhere a
+# triggered-alerts list is displayed. Sorted ONCE here, server-side --
+# every consumer (AlarmPanel, the technician drawer's Active Alerts
+# section) reads this same already-sorted list via GET
+# /v1/alerts/triggered/, so neither has to re-sort it itself.
+_SEVERITY_SORT_RANK = {'critical': 0, 'warning': 1}
+
 
 def _actual_value(rule_type, tech, team_avg_revenue):
     """
@@ -60,11 +68,24 @@ def evaluate_alert_rules(tenant):
     live-proxy/local-sync endpoints' convention (which need `connected`
     because they show a "connect Jobber" prompt state that Alerts has no
     equivalent of).
+
+    Nothing is collapsed or hidden (2026-08-21, confirmed TL decision) --
+    every triggered entry is returned. The only ordering guarantee is
+    Critical before Warning; within the same severity, entries keep
+    whatever order they were generated in (rules ordered by `id`,
+    technicians already ordered by name via get_technician_stats()) --
+    a stable sort (list.sort(), guaranteed stable) preserves that
+    relative order rather than reshuffling it, so repeated calls against
+    the same underlying data return the same order every time.
     """
     if tenant is None:
         return []
 
-    rules = AlertRule.objects.filter(tenant=tenant, is_active=True, is_enabled=True)
+    # Explicit order_by -- without one, row order from the DB isn't
+    # guaranteed deterministic across calls, which would silently break
+    # the "stable secondary order" requirement above even though the
+    # severity-sort itself would still be correct.
+    rules = AlertRule.objects.filter(tenant=tenant, is_active=True, is_enabled=True).order_by('id')
     if not rules:
         return []
 
@@ -98,4 +119,10 @@ def evaluate_alert_rules(tenant):
                     'threshold_value': float(rule.threshold_value),
                     'actual_value': actual,
                 })
+
+    # Critical before Warning, everywhere -- sorted ONCE, here. A stable
+    # sort (list.sort()'s guarantee) leaves each severity group's
+    # internal order exactly as generated above (rule id, then
+    # technician name) rather than reshuffling it.
+    triggered.sort(key=lambda t: _SEVERITY_SORT_RANK[t['severity']])
     return triggered
