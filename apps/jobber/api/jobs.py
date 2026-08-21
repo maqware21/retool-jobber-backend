@@ -3,6 +3,7 @@ import logging
 from rest_framework import status
 from rest_framework.views import APIView
 
+from apps.jobber.api.electricians_summary import calculate_job_duration_seconds
 from apps.jobber.models import JobberAccount, JobberJob
 from apps.jobber.services import client
 from apps.jobber.services.sync import ensure_fresh
@@ -120,8 +121,9 @@ class JobberJobsView(APIView):
         try:
             first = self._parse_first(request.query_params.get('first'))
             after = request.query_params.get('after') or None
+            technician = self._parse_technician(request.query_params.get('technician'))
 
-            data = _local_jobs_response(request.user, first=first, after=after)
+            data = _local_jobs_response(request.user, first=first, after=after, technician=technician)
             return api_response_parser(
                 data=data,
                 message=MESSAGES['SUCCESS'],
@@ -145,6 +147,14 @@ class JobberJobsView(APIView):
         except (TypeError, ValueError):
             return DEFAULT_PAGE_SIZE
         return max(1, min(n, MAX_PAGE_SIZE))
+
+    @staticmethod
+    def _parse_technician(raw_value):
+        """A malformed/missing ?technician= is just "no filter" -- never a 400."""
+        try:
+            return int(raw_value)
+        except (TypeError, ValueError):
+            return None
 
     def _get_live(self, request):
         """
@@ -200,22 +210,64 @@ def _isoformat(value):
     return value.isoformat() if value else None
 
 
+def _first_visit(job):
+    """
+    The job's first active Visit, by local insertion order (JobberVisit
+    has no explicit ordinal field, so this is "whichever visit was
+    synced first") — or None if the job has no active visits.
+
+    Single source of truth for "assigned to" derivation: both
+    _local_first_assignee() (the display name shown in the Assigned To
+    column) and _technician_filtered_job_ids() (the ?technician= filter
+    below) read from this SAME visit, so a filtered result can never
+    disagree with what a job's own row shows.
+    """
+    return job.visits.filter(is_active=True).order_by('id').first()
+
+
 def _local_first_assignee(job):
     """
-    Local equivalent of _first_assignee():the assigned_user_name of this
-    job's first Visit (by local insertion order — JobberVisit has no
-    explicit ordinal field, so this is "whichever visit was synced first,"
-    an analog to live's "whichever visit Jobber returns first," not a
-    byte-for-byte reproduction of it), falling back to 'Unassigned'.
+    Local equivalent of _first_assignee(): the assigned_user_name of this
+    job's first Visit (see _first_visit() — "whichever visit was synced
+    first," an analog to live's "whichever visit Jobber returns first,"
+    not a byte-for-byte reproduction of it), falling back to 'Unassigned'.
     """
-    visit = job.visits.filter(is_active=True).order_by('id').first()
+    visit = _first_visit(job)
     if visit is None:
         return 'Unassigned'
     return visit.assigned_user_name
 
 
+def _technician_filtered_job_ids(tenant_id, technician_id):
+    """
+    Job ids whose FIRST active visit's assigned_user_id matches
+    technician_id — the exact same first-visit derivation
+    _local_first_assignee() already uses for the displayed Assigned To
+    column (see _first_visit()), so ?technician=<id> can never disagree
+    with what a job's own row shows.
+
+    Not expressible as a single ORM filter — "first visit per job" isn't
+    a plain join condition — so this is computed in Python, one query
+    plus a prefetch, no per-job queries. Fine at this project's current
+    real data volume; see the N+1-per-page note in PROJECT_CONTEXT.md
+    for the related (but distinct) duration_seconds cost below, and
+    revisit this too before real scale.
+
+    technician_id belonging to a different tenant simply matches
+    nothing here (every visit/assignee in this queryset is already
+    scoped to tenant_id) — no separate cross-tenant check needed.
+    """
+    jobs = JobberJob.objects.filter(
+        tenant_id=tenant_id, is_active=True,
+    ).prefetch_related('visits__assigned_user')
+    return [
+        job.id for job in jobs
+        if (visit := _first_visit(job)) is not None and visit.assigned_user_id == technician_id
+    ]
+
+
 def _map_local_job(job):
-    """Local-table equivalent of _map_job() — same keys, same field types."""
+    """Local-table equivalent of _map_job() — same keys, same field types, plus duration_seconds."""
     return {
         'id': f"JOB-{job.job_number}",
         'jobber_id': job.jobber_id,
@@ -227,6 +279,16 @@ def _map_local_job(job):
         'status': job.job_status,
         'status_display': job.status_display,
         'value': float(job.total) if job.total is not None else None,
+        # Reuses calculate_job_duration_seconds() exactly as already
+        # proven for the Electricians panel's Avg Job Duration tile --
+        # already at the single-job grain (that function's own average
+        # is built BY CALLING this once per job, not the other way
+        # around). Returns None (never a fabricated 0) for a job with no
+        # real timesheet entries -- same "no data != 0" convention as
+        # everywhere else this function is used. Adds one extra query
+        # per job on this page -- see the N+1 note in PROJECT_CONTEXT.md,
+        # accepted for now at this project's current real data volume.
+        'duration_seconds': calculate_job_duration_seconds(job),
         # ISO string, matching the live field's type — not guaranteed to be
         # byte-identical to Jobber's own raw string (e.g. "Z" vs "+00:00"
         # timezone suffix), but both are valid ISO8601 and parse identically
@@ -236,7 +298,7 @@ def _map_local_job(job):
     }
 
 
-def _local_jobs_response(user, first=DEFAULT_PAGE_SIZE, after=None):
+def _local_jobs_response(user, first=DEFAULT_PAGE_SIZE, after=None, technician=None):
     """
     Local-table equivalent of JobberJobsView.get()'s `data` dict. Calls
     ensure_fresh() first, then reads local tables — never Jobber directly.
@@ -245,6 +307,12 @@ def _local_jobs_response(user, first=DEFAULT_PAGE_SIZE, after=None):
     local, opaque numeric-string offset (matching the field's String type,
     not its original cursor semantics). Fine for comparing outputs now;
     would need real thought before this ever backs paginated production UI.
+
+    technician, if given, is a real JobberUser id — see
+    _technician_filtered_job_ids() for exactly what "matches" means here.
+    Filtering happens before the offset/limit slice below, so pagination
+    and has_next_page stay correct against the FILTERED set, not the
+    full one.
     """
     tenant_id = user.tenant_id
     if not tenant_id:
@@ -257,6 +325,9 @@ def _local_jobs_response(user, first=DEFAULT_PAGE_SIZE, after=None):
     fresh = ensure_fresh(account.tenant, entities=['clients', 'users', 'jobs', 'visits'])
 
     queryset = JobberJob.objects.filter(tenant_id=tenant_id, is_active=True).select_related('client').order_by('id')
+    if technician is not None:
+        queryset = queryset.filter(id__in=_technician_filtered_job_ids(tenant_id, technician))
+
     offset = int(after) if after else 0
     page = list(queryset[offset:offset + first])
     has_next_page = queryset.count() > offset + first
