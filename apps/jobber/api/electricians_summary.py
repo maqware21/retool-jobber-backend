@@ -78,10 +78,9 @@ def calculate_job_duration_by_user(job):
 
     This is a PURE EXTRACTION of what used to be calculate_job_duration_seconds()'s
     own body — the merge math itself is UNCHANGED, not just similar.
-    Verified bit-for-bit identical against real data via
-    verify_top_earner_step3.py (Step 3a): calculate_job_duration_seconds()
-    still returns exactly the same values for jobs 1, 2, 5, 6, 7, 12 as it
-    did before this refactor.
+    Verified bit-for-bit identical against real data: confirmed
+    calculate_job_duration_seconds() still returns exactly the same values
+    for jobs 1, 2, 5, 6, 7, 12 as it did before this refactor.
 
     Per the confirmed decisions (2026-08-16, unchanged):
       - The SAME (job, user) pair's entries are merged into their time-range
@@ -155,9 +154,8 @@ def calculate_job_duration_by_user(job):
 def calculate_job_duration_seconds(job):
     """
     Real, standalone, testable per-job duration calculation — deliberately
-    NOT inline in the endpoint, so it can be called directly (as
-    verify_avg_job_duration_calc.py does) against real JobberJob instances
-    without going through a request/view at all.
+    NOT inline in the endpoint, so it can be called directly against real
+    JobberJob instances without going through a request/view at all.
 
     Now a thin wrapper over calculate_job_duration_by_user() (2026-08-17
     refactor) — that function owns the merge math; this just sums its

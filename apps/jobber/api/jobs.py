@@ -192,9 +192,9 @@ class JobberJobsView(APIView):
 # ── Local-table read path (Phase 2) ──────────────────────────────────────────
 # Built alongside the live-proxy code above, NOT wired into JobberJobsView
 # yet — JobberJobsView.get() still calls client.fetch_jobs()/_map_job()
-# exactly as it does today. This exists so the two paths can be compared
-# side by side (see the accompanying compare_jobs.py script) before anything
-# gets swapped.
+# exactly as it does today. This exists to compare the two paths, which
+# was confirmed to produce matching output against the live-proxy version,
+# before anything gets swapped.
 
 def _isoformat(value):
     return value.isoformat() if value else None

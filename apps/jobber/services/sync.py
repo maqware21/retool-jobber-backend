@@ -180,9 +180,9 @@ def _extract_custom_field(custom_fields, label, value_key):
     spread (see the comment on _USERS_QUERY).
 
     label is matched via .strip() equality, NOT an exact match --
-    confirmed live (verify_user_custom_fields.py, 2026-08-20) that this
-    real account's "Expertise" field has a trailing space in its actual
-    label ("Expertise "). Hardcoding that exact string would only work by
+    confirmed live (2026-08-20) that this real account's "Expertise" field
+    has a trailing space in its actual label ("Expertise "). Hardcoding
+    that exact string would only work by
     accident for this one account and break the moment anyone re-types
     the field name without the trailing space.
 
