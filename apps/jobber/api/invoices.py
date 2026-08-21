@@ -217,7 +217,7 @@ class JobberInvoicesView(APIView):
 
 # ── Local-table read path (Phase 2) ──────────────────────────────────────────
 # Built alongside the live-proxy code above, NOT wired into JobberInvoicesView
-# yet. See the accompanying compare_invoices.py script.
+# yet. Confirmed via a side-by-side comparison against the live-proxy output.
 
 def _isoformat(value):
     return value.isoformat() if value else None

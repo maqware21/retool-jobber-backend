@@ -126,7 +126,8 @@ class JobberEmployeesView(APIView):
 
 # ── Local-table read path (Phase 2) ──────────────────────────────────────────
 # Built alongside the live-proxy code above, NOT wired into
-# JobberEmployeesView yet. See the accompanying compare_employees.py script.
+# JobberEmployeesView yet. Confirmed via a side-by-side comparison against
+# the live-proxy output.
 
 def _rank_local_employees(tenant_id):
     """

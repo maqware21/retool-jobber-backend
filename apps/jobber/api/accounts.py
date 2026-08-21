@@ -194,7 +194,7 @@ class JobberAccountsView(APIView):
 
 # ── Local-table read path (Phase 2) ──────────────────────────────────────────
 # Built alongside the live-proxy code above, NOT wired into JobberAccountsView
-# yet. See the accompanying compare_accounts.py script.
+# yet. Confirmed via a side-by-side comparison against the live-proxy output.
 #
 # Structurally different from _rank_accounts()/_service_type_breakdown() by
 # necessity, not by choice: those two derive type/service-type fields from
