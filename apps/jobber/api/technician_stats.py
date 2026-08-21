@@ -6,8 +6,8 @@ from django.utils import timezone
 from rest_framework import status
 from rest_framework.views import APIView
 
-from apps.goals.models import TechnicianGoal
-from apps.goals.utils import current_month
+from apps.goals.models import TechnicianAnnualGoal, TechnicianGoal
+from apps.goals.utils import current_month, current_year
 from apps.jobber.api.electricians_summary import (
     PERIOD_MONTHS,
     _gather_job_assignees,
@@ -117,14 +117,19 @@ def _local_technician_stats_response(user):
     Local-table source for the Electricians panel's per-technician card +
     drawer fields that are now real: revenue, jobs_completed,
     revenue_per_hour, avg_job_duration_seconds, completion_percentage,
-    team_revenue_share_percentage, and current-month goal progress.
+    team_revenue_share_percentage, current-month goal progress, and
+    (2026-08-21) a SIMPLE real annual goal progress -- goal amount vs.
+    real year-to-date revenue as a plain percentage, deliberately with
+    no "on pace"/projected-year-end field (see the ytd_jobs block below).
 
     Explicitly OUT of scope here (per TL): profit margin (blocked on a
-    wage-rate decision), "on pace"/projected year-end (pending TL), job
-    history (separate endpoint, next round), monthly revenue trend chart
-    (separate round), and all 4 threshold-based alerts (deferred together
-    to a future Alerts module -- each has 2-3 disagreeing mock thresholds
-    needing one reconciled decision, not four separate ones).
+    wage-rate decision), "on pace"/projected year-end for BOTH monthly
+    and annual (pending TL -- needs real multi-month history that
+    doesn't exist yet), job history (separate endpoint, next round),
+    monthly revenue trend chart (separate round), and all 4
+    threshold-based alerts (deferred together to a future Alerts module
+    -- each has 2-3 disagreeing mock thresholds needing one reconciled
+    decision, not four separate ones).
     """
     tenant_id = user.tenant_id
     if not tenant_id:
@@ -162,10 +167,10 @@ def _local_technician_stats_response(user):
     # function the Goals endpoints themselves use to decide "what month is
     # it" -- rather than this file separately deriving its own notion of
     # "today," which could silently disagree with Goals' if the two were
-    # computed differently (current_month() uses date.today(), i.e. the
-    # server process's system clock; this project's TIME_ZONE is UTC, so
-    # they agree as long as the server's OS clock is also UTC -- standard
-    # for this deployment, but worth naming as the assumption it is).
+    # computed differently. current_month() uses timezone.localdate()
+    # (2026-08-21 fix) -- correct relative to settings.TIME_ZONE ('UTC')
+    # regardless of the server's own OS clock timezone, not merely
+    # correct as long as the OS clock happens to also be UTC.
     month_date = current_month()
     current_month_start = timezone.make_aware(datetime.combine(month_date, time.min))
     current_month_jobs = list(JobberJob.objects.filter(
@@ -179,6 +184,29 @@ def _local_technician_stats_response(user):
     goals_by_user_id = {
         goal.user_id: goal.goal_amount
         for goal in TechnicianGoal.fetch(tenant_id=tenant_id, month=month_date)
+    }
+
+    # Year-to-date revenue, for the drawer's real (but deliberately SIMPLE)
+    # Annual target line -- calculate_top_earner() reused a THIRD time,
+    # over a Jan-1-of-this-year-to-now job queryset. Same function, same
+    # "different window, not a new calculation" pattern as current-month
+    # above -- NOT a projection, NOT an "on pace" pace signal: those need
+    # real multi-month history that doesn't exist yet (the same reason the
+    # old mock version's projection was nonsensical once real data hit
+    # it). Just a real goal amount vs. real YTD revenue, as a plain
+    # percentage -- nothing speculative.
+    year_date = current_year()
+    year_start = timezone.make_aware(datetime.combine(year_date, time.min))
+    ytd_jobs = list(JobberJob.objects.filter(
+        tenant_id=tenant_id, is_active=True, job_status='archived', completed_at__gte=year_start,
+    ))
+    ytd_revenue_totals = calculate_top_earner(ytd_jobs)
+
+    # Mirrors goals_by_user_id above exactly, against TechnicianAnnualGoal
+    # instead of TechnicianGoal.
+    annual_goals_by_user_id = {
+        goal.user_id: goal.goal_amount
+        for goal in TechnicianAnnualGoal.fetch(tenant_id=tenant_id, year=year_date)
     }
 
     # Seeds every real, active technician first (same convention already
@@ -219,6 +247,14 @@ def _local_technician_stats_response(user):
             else None
         )
 
+        annual_goal_amount = annual_goals_by_user_id.get(tech.id)
+        ytd_revenue = ytd_revenue_totals.get(tech.id, 0.0)
+        annual_progress_percentage = (
+            round((ytd_revenue / float(annual_goal_amount)) * 100, 1)
+            if annual_goal_amount and float(annual_goal_amount) > 0
+            else None
+        )
+
         technicians.append({
             'user_id': tech.id,
             'name': tech.name,
@@ -243,6 +279,13 @@ def _local_technician_stats_response(user):
                 'goal_amount': float(goal_amount) if goal_amount is not None else None,
                 'current_month_revenue': round(float(current_month_revenue), 2),
                 'progress_percentage': progress_percentage,
+            },
+            # SIMPLE and real, deliberately -- see the ytd_jobs comment
+            # above for why this has no "on pace"/projection field.
+            'annual_goal_progress': {
+                'goal_amount': float(annual_goal_amount) if annual_goal_amount is not None else None,
+                'ytd_revenue': round(float(ytd_revenue), 2),
+                'progress_percentage': annual_progress_percentage,
             },
         })
 
