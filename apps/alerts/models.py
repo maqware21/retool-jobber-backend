@@ -6,9 +6,11 @@ from helpers.models import DateModel
 
 class AlertRule(DateModel):
     """
-    One customer-configured alert rule. A SINGLE generic model covers all
-    rule types (not one model per type) -- every type needs exactly the
-    same 4 real fields (technician, threshold, severity, enabled) and
+    One customer-configured, COMPANY-WIDE alert policy (2026-08-21,
+    confirmed TL correction -- rules are NOT tied to one named
+    technician at creation time; see below). A SINGLE generic model
+    covers all rule types (not one model per type) -- every type needs
+    exactly the same 3 real fields (threshold, severity, enabled) and
     differs only in which comparison evaluate_alert_rules() runs for it,
     not in shape. Unlike Goals' Monthly/Annual split, nothing Alerts-
     related was already shipped when this was designed, so there was no
@@ -18,14 +20,13 @@ class AlertRule(DateModel):
     OUR OWN data, entered directly by the customer -- NOT synced from
     Jobber, never wired into sync_tenant()/ensure_fresh().
 
-    `user` is nullable even though every currently-supported rule_type
-    requires one (confirmed: all 5 are per-technician, none company-wide
-    today) -- kept nullable so a future company-wide rule_type can use
-    user=None without a schema change. Which rule_types require a user
-    is a plain Python set (helpers.constants.ALERT_RULE_TYPES_REQUIRING_USER),
-    validated in AlertRuleSerializer -- not a DB constraint, same
-    "serializer validates, no DB-level check" convention already used
-    for goal_amount >= 0 elsewhere in this project.
+    NO `user` FIELD, on purpose -- a rule is a policy ("monthly goal
+    below 70% = critical"), automatically evaluated against EVERY active
+    technician by evaluate_alert_rules(), not a one-time pick of a
+    single named person at creation time. This field existed briefly in
+    migration 0001 under the original (incorrect) "per-technician rule"
+    design and was removed in 0002 before any real row existed in
+    production -- a clean schema fix, not a data migration.
 
     is_enabled is a SEPARATE field from DateModel's own is_active,
     deliberately -- is_active stays reserved for this project's existing
@@ -39,14 +40,14 @@ class AlertRule(DateModel):
     threshold_value -- this is how a customer reproduces the old mock
     UI's 2-tier critical/warning pattern (e.g. "below 70% = critical,
     below 85% = warning") with zero hardcoded tier logic: they create
-    TWO rules, same rule_type and technician, two different
-    threshold_value/severity pairs. Nothing in evaluate_alert_rules()
-    branches on "which severity fires at which number" -- the customer
-    owns that entirely.
+    TWO rules, same rule_type, two different threshold_value/severity
+    pairs, each evaluated against every technician independently.
+    Nothing in evaluate_alert_rules() branches on "which severity fires
+    at which number" -- the customer owns that entirely.
 
     No uniqueness constraint, on purpose -- unlike Goals' (tenant, month),
-    "at most one rule per (type, technician)" is not a real invariant
-    here; the 2-tier pattern above depends on allowing duplicates.
+    "at most one rule per type" is not a real invariant here; the 2-tier
+    pattern above depends on allowing duplicates.
     """
 
     tenant = models.ForeignKey(
@@ -55,13 +56,6 @@ class AlertRule(DateModel):
         related_name='alert_rules',
     )
     rule_type = models.CharField(max_length=30, choices=ALERT_RULE_TYPES)
-    user = models.ForeignKey(
-        'jobber.JobberUser',
-        on_delete=models.CASCADE,
-        null=True,
-        blank=True,
-        related_name='alert_rules',
-    )
     # Shared by both percentage-based rule types (goal %, completion %,
     # team-avg %) and the one dollar-based type (revenue/hr) -- the unit
     # is implied by rule_type, not by this field, so one column suffices
@@ -76,4 +70,4 @@ class AlertRule(DateModel):
         verbose_name_plural = 'alert rules'
 
     def __str__(self):
-        return f"AlertRule(tenant={self.tenant_id}, rule_type={self.rule_type}, user={self.user_id})"
+        return f"AlertRule(tenant={self.tenant_id}, rule_type={self.rule_type}, threshold={self.threshold_value})"
