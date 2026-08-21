@@ -5,7 +5,6 @@ from rest_framework.views import APIView
 
 from apps.alerts.models import AlertRule
 from apps.alerts.serializers.alert_rule import AlertRuleSerializer
-from apps.jobber.models import JobberUser
 from helpers.api_exception import validator_errors
 from helpers.constants import ALERT_RULE_TYPES
 from helpers.messages import MESSAGES
@@ -18,16 +17,19 @@ logger = logging.getLogger(__name__)
 class AlertRuleListView(APIView):
     """
     GET  /v1/alerts/rules/
-        Every active AlertRule for the customer's tenant, plus the
-        technician roster and the list of real rule_type choices (so the
-        frontend's dropdowns never hardcode a copy that could drift from
-        the backend's own choices).
+        Every active AlertRule for the customer's tenant, plus the list
+        of real rule_type choices (so the frontend's dropdown never
+        hardcodes a copy that could drift from the backend's own
+        choices). No technician roster here (2026-08-21) -- that only
+        ever existed for the old per-rule technician picker, which is
+        gone now that a rule is a company-wide policy, not tied to one
+        named person.
 
     POST /v1/alerts/rules/
-        {"rule_type": "...", "user": <JobberUser id>, "threshold_value":
-        "...", "severity": "critical"|"warning"} -- always creates a new
-        rule (never an upsert -- unlike Goals, duplicates are allowed on
-        purpose, see AlertRule's own docstring for why).
+        {"rule_type": "...", "threshold_value": "...", "severity":
+        "critical"|"warning"} -- always creates a new rule (never an
+        upsert -- unlike Goals, duplicates are allowed on purpose, see
+        AlertRule's own docstring for why).
 
     OUR OWN data, entered directly by the customer -- NOT synced from
     Jobber. Plain CRUD; no sync_tenant()/ensure_fresh() involvement.
@@ -35,17 +37,15 @@ class AlertRuleListView(APIView):
     permission_classes = [CustomerPermission]
 
     def get(self, request):
-        data = {'rules': [], 'technicians': [], 'rule_types': []}
+        data = {'rules': [], 'rule_types': []}
         try:
             tenant_id = request.user.tenant_id
             rules = AlertRule.objects.filter(
                 tenant_id=tenant_id, is_active=True,
-            ).select_related('user').order_by('-created_at')
-            technicians = JobberUser.objects.filter(tenant_id=tenant_id, is_active=True).order_by('name')
+            ).order_by('-created_at')
 
             data = {
                 'rules': AlertRuleSerializer(rules, many=True).data,
-                'technicians': [{'user_id': u.id, 'name': u.name} for u in technicians],
                 'rule_types': [{'value': key, 'label': label} for key, label in ALERT_RULE_TYPES],
             }
             return api_response_parser(
@@ -81,7 +81,7 @@ class AlertRuleListView(APIView):
 class AlertRuleDetailView(APIView):
     """
     PATCH  /v1/alerts/rules/<id>/
-        Partial update -- any of rule_type/user/threshold_value/severity/
+        Partial update -- any of rule_type/threshold_value/severity/
         is_enabled. Used both for the "Save" edit flow and the enable/
         disable toggle (a PATCH with only {"is_enabled": ...}).
 
@@ -95,7 +95,7 @@ class AlertRuleDetailView(APIView):
     def _get_rule(request, pk):
         return AlertRule.objects.filter(
             pk=pk, tenant_id=request.user.tenant_id, is_active=True,
-        ).select_related('user').first()
+        ).first()
 
     def patch(self, request, pk):
         data = {}

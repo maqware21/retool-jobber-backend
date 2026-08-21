@@ -28,6 +28,13 @@ JOBBER_SYNC_STATUS = [
 # text, via GET /v1/alerts/rules/'s rule_types list, so there's one
 # source of truth for that copy, not a duplicated frontend constant.
 #
+# Every rule_type here is a COMPANY-WIDE policy (2026-08-21, confirmed
+# TL correction) -- automatically evaluated against EVERY active
+# technician by evaluate_alert_rules(), not tied to one named person at
+# creation time. (There is no longer an "ALERT_RULE_TYPES_REQUIRING_USER"
+# concept -- that belonged to the earlier, incorrect per-technician-rule
+# design.)
+#
 # Explicitly NOT included yet: callback-rate and drive-time rule types --
 # both genuinely blocked (see PROJECT_CONTEXT.md), not even added as
 # disabled placeholders, since a selectable-but-never-evaluated choice
@@ -39,15 +46,6 @@ ALERT_RULE_TYPES = [
     ('revenue_per_hour', 'Revenue/hr below $X'),
     ('team_avg_revenue_pct', 'Revenue below X% of team average'),
 ]
-
-# Every rule_type currently supported is per-technician (confirmed
-# directly -- none of the 5 above alert on a company-wide metric; #5
-# alerts per-technician even though its comparison baseline is a
-# company-wide average). Used by AlertRuleSerializer to validate that
-# `user` is set for these types, and by evaluate_alert_rules() to skip
-# any rule whose type isn't in this set yet. A future company-wide
-# rule_type simply wouldn't be added here -- no schema change needed.
-ALERT_RULE_TYPES_REQUIRING_USER = {key for key, _ in ALERT_RULE_TYPES}
 
 ALERT_SEVERITY_CHOICES = [
     ('critical', 'critical'),
