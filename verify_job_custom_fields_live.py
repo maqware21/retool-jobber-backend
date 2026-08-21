@@ -28,7 +28,7 @@ query VerifyJobCustomFields($first: Int!, $after: String) {
         ... on CustomFieldNumeric { label valueNumeric }
         ... on CustomFieldTrueFalse { label valueTrueFalse }
         ... on CustomFieldDropdown { label valueDropdown }
-        ... on CustomFieldLink { label valueLink }
+        ... on CustomFieldLink { label valueLink { text url } }
         ... on CustomFieldArea { label valueArea { length width } }
       }
     }

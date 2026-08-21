@@ -112,7 +112,7 @@ def _accumulate_completion_counts(tenant_id, period_start):
     return assigned_counts, archived_counts
 
 
-def _local_technician_stats_response(user):
+def get_technician_stats(tenant):
     """
     Local-table source for the Electricians panel's per-technician card +
     drawer fields that are now real: revenue, jobs_completed,
@@ -122,18 +122,27 @@ def _local_technician_stats_response(user):
     real year-to-date revenue as a plain percentage, deliberately with
     no "on pace"/projected-year-end field (see the ytd_jobs block below).
 
+    Takes a Tenant instance directly (not a Django user object) --
+    renamed and widened from the original _local_technician_stats_response(user)
+    (2026-08-21) specifically because this now has a SECOND real caller:
+    apps.alerts.services.evaluate_alert_rules() needs the exact same
+    numbers the Electricians panel's cards render, not a re-derived copy,
+    and a tenant-taking, unprefixed function is the natural shared shape
+    for that -- cheaper to introduce now, with 2 callers from the start,
+    than later. JobberTechnicianStatsView.get() below passes
+    request.user.tenant.
+
     Explicitly OUT of scope here (per TL): profit margin (blocked on a
     wage-rate decision), "on pace"/projected year-end for BOTH monthly
     and annual (pending TL -- needs real multi-month history that
-    doesn't exist yet), job history (separate endpoint, next round),
-    monthly revenue trend chart (separate round), and all 4
-    threshold-based alerts (deferred together to a future Alerts module
-    -- each has 2-3 disagreeing mock thresholds needing one reconciled
-    decision, not four separate ones).
+    doesn't exist yet), job history (separate endpoint, next round), and
+    monthly revenue trend chart (separate round). The 4 threshold-based
+    alerts previously deferred here now have a real home -- see
+    apps.alerts.
     """
-    tenant_id = user.tenant_id
-    if not tenant_id:
+    if tenant is None:
         return dict(_NOT_CONNECTED_DATA)
+    tenant_id = tenant.id
 
     account = JobberAccount.objects.filter(tenant_id=tenant_id, is_active=True).first()
     if account is None:
@@ -313,7 +322,7 @@ class JobberTechnicianStatsView(APIView):
     def get(self, request):
         data = dict(_NOT_CONNECTED_DATA)
         try:
-            data = _local_technician_stats_response(request.user)
+            data = get_technician_stats(request.user.tenant)
             return api_response_parser(
                 data=data,
                 message=MESSAGES['SUCCESS'],
