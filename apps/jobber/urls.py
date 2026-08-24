@@ -5,6 +5,7 @@ from apps.jobber.api.electricians_summary import JobberElectriciansSummaryView
 from apps.jobber.api.employees import JobberEmployeesView
 from apps.jobber.api.invoices import JobberInvoicesView
 from apps.jobber.api.jobs import JobberJobsView
+from apps.jobber.api.monthly_revenue import JobberMonthlyRevenueView
 from apps.jobber.api.oauth import (
     JobberCallbackView,
     JobberConnectView,
@@ -32,6 +33,7 @@ urlpatterns = [
     path('employees/', JobberEmployeesView.as_view(), name='employees'),
     path('electricians-summary/', JobberElectriciansSummaryView.as_view(), name='electricians-summary'),
     path('technician-stats/', JobberTechnicianStatsView.as_view(), name='technician-stats'),
+    path('monthly-revenue/', JobberMonthlyRevenueView.as_view(), name='monthly-revenue'),
 
     # ── Webhooks (public — authenticated via HMAC-SHA256 signature) ────────────
     # Register this URL in the Jobber Developer Center for the APP_DISCONNECT
