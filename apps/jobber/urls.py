@@ -2,6 +2,7 @@ from django.urls import path
 
 from apps.jobber.api.accounts import JobberAccountsView
 from apps.jobber.api.electricians_summary import JobberElectriciansSummaryView
+from apps.jobber.api.duration_by_type import JobberDurationByTypeView
 from apps.jobber.api.employees import JobberEmployeesView
 from apps.jobber.api.invoices import JobberInvoicesView
 from apps.jobber.api.jobs import JobberJobsView
@@ -34,6 +35,7 @@ urlpatterns = [
     path('electricians-summary/', JobberElectriciansSummaryView.as_view(), name='electricians-summary'),
     path('technician-stats/', JobberTechnicianStatsView.as_view(), name='technician-stats'),
     path('monthly-revenue/', JobberMonthlyRevenueView.as_view(), name='monthly-revenue'),
+    path('duration-by-type/', JobberDurationByTypeView.as_view(), name='duration-by-type'),
 
     # ── Webhooks (public — authenticated via HMAC-SHA256 signature) ────────────
     # Register this URL in the Jobber Developer Center for the APP_DISCONNECT
