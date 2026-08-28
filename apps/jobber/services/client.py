@@ -105,19 +105,34 @@ def _post_token(payload):
 # ── GraphQL ─────────────────────────────────────────────────────────────────
 
 def _log_throttle_status(body, tenant_id):
-    """Log the throttle bucket state returned in every Jobber response."""
-    throttle = (
-        (body.get('extensions') or {})
-        .get('cost', {})
-        .get('throttleStatus', {})
-    )
+    """
+    Log the throttle bucket state AND the cost of the query that just
+    produced it.
+
+    requestedQueryCost/actualQueryCost added (2026-08-28) -- confirmed
+    real gap: these are sibling fields of throttleStatus under
+    extensions.cost (extensions.cost = {requestedQueryCost,
+    actualQueryCost, throttleStatus}, per Jobber's own API rate-limits
+    docs), not previously logged at all. They're the exact missing
+    evidence that would have explained a real, confirmed paradox this
+    project hit -- a response reporting a FULL throttleStatus bucket
+    (currentlyAvailable == maximumAvailable) while ALSO carrying a
+    THROTTLED error -- which is otherwise unexplainable from
+    throttleStatus alone. See verify_jobber_trivial_query.py's docstring
+    for the full incident this fixes visibility into.
+    """
+    cost = (body.get('extensions') or {}).get('cost') or {}
+    throttle = cost.get('throttleStatus') or {}
     if throttle:
         logger.info(
-            "Jobber throttle status tenant=%s: %s/%s pts available (restore %s pts/s)",
+            "Jobber throttle status tenant=%s: %s/%s pts available (restore %s pts/s) "
+            "-- requestedQueryCost=%s actualQueryCost=%s",
             tenant_id,
             throttle.get('currentlyAvailable'),
             throttle.get('maximumAvailable'),
             throttle.get('restoreRate'),
+            cost.get('requestedQueryCost'),
+            cost.get('actualQueryCost'),
         )
 
 
@@ -149,11 +164,20 @@ def execute(account, query, variables=None):
       - Refreshes a stale token up front.
       - Retries once on 401 in case Jobber invalidated the token early.
 
-    Rate-limit handling:
-      - Logs ``throttleStatus`` from every response for visibility.
-      - On a THROTTLED response, waits ``THROTTLE_RETRY_DELAY`` seconds and
-        retries once. Still throttled after that → raises JobberAPIError with
-        a distinct message so callers can tell "throttled" from other failures.
+    Rate-limit handling — Jobber has TWO distinct limiters, handled
+    separately (2026-08-28, confirmed against Jobber's own docs):
+      - GraphQL query-cost leaky bucket: logs ``throttleStatus`` (plus
+        requestedQueryCost/actualQueryCost) from every response for
+        visibility. On a THROTTLED response, waits ``THROTTLE_RETRY_DELAY``
+        seconds and retries once. Still throttled after that → raises
+        JobberAPIError with a distinct message so callers can tell
+        "throttled" from other failures.
+      - DDoS-layer/Rack::Attack request-count limiter (2500 req/5min per
+        app/account): surfaces as a raw HTTP 429, not a body-level error —
+        logged and raised with its own distinct message, no retry (no
+        considered backoff policy for this limiter yet). Previously fell
+        into the generic "not response.ok" failure below, indistinguishable
+        from any other HTTP error.
 
     Error handling:
       - Standard GraphQL errors arrive as a top-level ``errors`` array.
@@ -170,6 +194,32 @@ def execute(account, query, variables=None):
         token_data = refresh_tokens(account.refresh_token)
         account.store_tokens(token_data)
         response = _post_graphql(account.access_token, query, variables)
+
+    # New (2026-08-28) -- a raw HTTP 429 is Jobber's DDoS-layer/Rack::Attack
+    # request-count limiter (2500 req/5min per app/account, confirmed via
+    # Jobber's own API rate-limits docs) — a SEPARATE mechanism from the
+    # GraphQL query-cost throttle handled below (extensions.cost.
+    # throttleStatus / _is_throttled()). Before this, a 429 fell straight
+    # into the generic "not response.ok" branch below and raised the same
+    # message as any other failure (a bad query, a 500, anything) — a real
+    # confirmed gap: this project had to guess after the fact whether a
+    # real failure was this limiter or the cost-bucket one, instead of
+    # being told directly. Logged and raised distinctly now so that
+    # distinction is immediate, not inferred. No retry attempted here —
+    # this project doesn't yet have a considered backoff policy for THIS
+    # limiter specifically (distinct from THROTTLE_RETRY_DELAY below,
+    # which is tuned for the cost bucket's restore rate, not this one).
+    if response.status_code == 429:
+        logger.error(
+            "Jobber DDoS-layer rate limit hit (HTTP 429) for tenant=%s -- the "
+            "Rack::Attack request-count limiter, NOT the GraphQL query-cost "
+            "throttle. No retry attempted.",
+            account.tenant_id,
+        )
+        raise JobberAPIError(
+            "Jobber API rate limit exceeded (HTTP 429 -- request-count limiter, "
+            "distinct from query cost). Reduce request frequency."
+        )
 
     if not response.ok:
         logger.error("Jobber GraphQL %s: %s", response.status_code, response.text)
