@@ -45,11 +45,36 @@ is imported directly, completely unmodified, from electricians_summary.py
 -- against real LIVE data instead of local tables, so the real numbers
 can be sanity-checked now without waiting on that model change.
 
-Scope note: the nested timeSheetEntries/visits connections below are
-fetched as a single page each (100 / 25), matching this script's
-one-real-job scale -- not full-pagination-safe for a job with more
-entries than that. Flag, don't silently truncate, if that cap is ever
-hit for a real test job.
+Scope note: the nested timeSheetEntries/visits connections on the detail
+query below are fetched as a single page each (100 / 25), matching this
+script's one-real-job scale -- not full-pagination-safe for a job with
+more entries than that. Flag, don't silently truncate, if that cap is
+ever hit for a real test job.
+
+FIX (2026-08-28) -- real root cause confirmed with hard evidence from the
+first version's own new requestedQueryCost logging: the original single
+job-search query paginated the FULL account fetching nested visit +
+timesheet-entry detail for EVERY job on EVERY page, just to find the one
+job matching jobNumber == 3 -- a cost that scales with total account
+volume, not with the one job actually needed. Confirmed: requestedCost
+28330 against a maximumAvailable of 10000, actualQueryCost=0 (rejected
+outright before running at all -- not a timing/retry issue, the query
+itself was too expensive as written).
+
+Split into two queries, per the confirmed fix:
+  1. _JOB_SEARCH_QUERY -- id + jobNumber ONLY, paginated the same way,
+     used purely to find which job's real id matches jobNumber == 3.
+     Cheap by construction -- no nested connections at all.
+  2. _JOB_DETAIL_QUERY -- Query.job(id: EncodedId!) (confirmed real,
+     singular root field via introspection), called exactly ONCE with
+     the real id the search step found, pulling the full visit +
+     timesheet-entry detail this verification actually needs. Real cost
+     paid once, for exactly the one job that matters -- not once per job
+     checked along the way. This also resolves the earlier "no confirmed
+     way to construct an EncodedId from the raw dashboard number"
+     concern from the prior verify_callback_visit_invoice.py round --
+     the id here comes directly from Jobber's own search response, never
+     guessed at or derived.
 """
 from datetime import timedelta
 
@@ -62,55 +87,74 @@ from apps.jobber.services.client import FETCH_ALL_MAX_PAGES, FETCH_ALL_PAGE_SIZE
 TENANT_ID = 4
 TARGET_JOB_NUMBER = 3
 
-_JOB_QUERY = """
-query GetJobForCallbackBleed($first: Int!, $after: String) {
+_JOB_SEARCH_QUERY = """
+query FindJobByNumber($first: Int!, $after: String) {
   jobs(first: $first, after: $after) {
     nodes {
       id
       jobNumber
-      jobStatus
-      total
-      visits(first: 25) {
-        nodes {
-          id
-          createdAt
-          invoice { id total }
-        }
-      }
-      timeSheetEntries(first: 100) {
-        nodes {
-          id
-          startAt
-          endAt
-          finalDuration
-          user { id name { full } }
-          visit { id }
-        }
-      }
     }
     pageInfo { hasNextPage endCursor }
   }
 }
 """
 
+_JOB_DETAIL_QUERY = """
+query GetJobDetailById($id: EncodedId!) {
+  job(id: $id) {
+    id
+    jobNumber
+    jobStatus
+    total
+    visits(first: 25) {
+      nodes {
+        id
+        createdAt
+        invoice { id total }
+      }
+    }
+    timeSheetEntries(first: 100) {
+      nodes {
+        id
+        startAt
+        endAt
+        finalDuration
+        user { id name { full } }
+        visit { id }
+      }
+    }
+  }
+}
+"""
 
-def _find_job_by_number(account, job_number):
-    """Same real-jobNumber pagination match already used in
-    verify_callback_visit_invoice.py -- no jobNumber filter exists in
-    JobFilterAttributes (confirmed there), so this paginates and matches
-    client-side."""
+
+def _find_job_id_by_number(account, job_number):
+    """
+    Cheap search only -- id + jobNumber, no nested detail at all. No
+    jobNumber filter exists in JobFilterAttributes (confirmed against the
+    schema), so this still paginates and matches client-side, but each
+    page now costs a small, fixed amount regardless of how much visit/
+    timesheet history any given job carries.
+    """
     cursor = None
     for _page_num in range(FETCH_ALL_MAX_PAGES):
-        data = execute(account, _JOB_QUERY, {'first': FETCH_ALL_PAGE_SIZE, 'after': cursor})
+        data = execute(account, _JOB_SEARCH_QUERY, {'first': FETCH_ALL_PAGE_SIZE, 'after': cursor})
         jobs = (data or {}).get('jobs') or {}
         for node in jobs.get('nodes') or []:
             if node.get('jobNumber') == job_number:
-                return node
+                return node.get('id')
         page_info = jobs.get('pageInfo') or {}
         if not page_info.get('hasNextPage'):
             break
         cursor = page_info.get('endCursor')
     return None
+
+
+def _fetch_job_detail(account, job_id):
+    """One call, one job, by its real id -- pays the full visit/
+    timesheet-entry cost exactly once."""
+    data = execute(account, _JOB_DETAIL_QUERY, {'id': job_id})
+    return (data or {}).get('job')
 
 
 def _entries_to_seconds_by_user(entries):
@@ -152,14 +196,21 @@ print("account:", account)
 if account is None:
     print(f"No active JobberAccount for tenant_id={TENANT_ID} -- cannot query live.")
 else:
+    job_id = None
     job = None
     try:
-        job = _find_job_by_number(account, TARGET_JOB_NUMBER)
+        print(f"\nStep A: cheap search for job #{TARGET_JOB_NUMBER}'s real id (id+jobNumber only)...")
+        job_id = _find_job_id_by_number(account, TARGET_JOB_NUMBER)
+        if job_id is None:
+            print(f"Job #{TARGET_JOB_NUMBER} not found for tenant_id={TENANT_ID}.")
+        else:
+            print(f"Found id={job_id}. Step B: fetching full detail for exactly this one job...")
+            job = _fetch_job_detail(account, job_id)
     except JobberAPIError as exc:
-        print(f"Jobber API error while searching for job #{TARGET_JOB_NUMBER}: {exc}")
+        print(f"Jobber API error while locating/fetching job #{TARGET_JOB_NUMBER}: {exc}")
 
     if job is None:
-        print(f"Job #{TARGET_JOB_NUMBER} not found for tenant_id={TENANT_ID}.")
+        print(f"\nCould not obtain job #{TARGET_JOB_NUMBER}'s detail for tenant_id={TENANT_ID}.")
     else:
         job_total = job.get('total')
         print(f"\n=== Job #{job.get('jobNumber')} (id={job.get('id')}) ===")
