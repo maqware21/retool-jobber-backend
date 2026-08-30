@@ -635,10 +635,21 @@ def detect_and_freeze_callbacks(account, tenant, newly_archived_job_ids):
         callback_hours = sum(callback_by_user.values()) / 3600
 
         # Never a fabricated number — same convention as every other
-        # derived money/duration field in this app. Left null if there's
-        # no real original-hours denominator or no real Job.total to divide.
+        # derived money/duration field in this app (the same "empty dict ->
+        # None, never 0" rule calculate_job_duration_seconds() already
+        # applies to itself). Left null if there's no real original-hours
+        # denominator, no real Job.total to divide, OR — FIX (2026-08-30,
+        # proven real on job_number=3) — if callback_by_user is an EMPTY
+        # dict: that means the flagged callback visit has ZERO real
+        # timesheet entries logged against it at all, a genuinely unknown
+        # cost, not a real 0-hour callback. Gating on `callback_by_user`
+        # itself (dict truthiness), not just `callback_hours > 0`, is what
+        # catches this — callback_hours computed from an empty dict is
+        # already 0.0, which is indistinguishable from a real zero by value
+        # alone; the previous version multiplied by that 0.0 and stored a
+        # confident $0.00 instead of leaving this null.
         callback_bled_amount = None
-        if original_hours > 0 and job.total is not None:
+        if callback_by_user and original_hours > 0 and job.total is not None:
             job_rate = job.total / _to_decimal(original_hours)
             callback_bled_amount = job_rate * _to_decimal(callback_hours)
 

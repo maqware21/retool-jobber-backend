@@ -18,18 +18,21 @@ RECOMPUTES the same numbers via calculate_job_duration_by_user() (with
 its new created_before/created_at_or_after params) to prove
 callback_bled_amount is real and correctly derived, not just present.
 
-Checks job_number in (3, 5, 6) across ALL tenants (not hardcoded to one
-tenant_id) -- deliberately, since it's not certain in advance which
-tenant/account any of these three real job numbers now belongs to for
-this check; each result prints its own tenant_id so nothing is silently
-assumed.
+FIX (2026-08-30): scoped to tenant_id=4 -- the first real run surfaced
+unrelated, coincidentally-numbered jobs under tenant_id=1 (an inactive
+account) sharing the same job_number values, which was pure noise, not a
+correctness issue. tenant_id=4 is this investigation's real connected
+test account throughout.
 """
+from decimal import Decimal
+
 from apps.jobber.api.electricians_summary import calculate_job_duration_by_user
 from apps.jobber.models import JobberJob, JobberVisit
 
+TENANT_ID = 4
 TARGET_JOB_NUMBERS = (3, 5, 6)
 
-candidates = list(JobberJob.objects.filter(job_number__in=TARGET_JOB_NUMBERS, is_active=True))
+candidates = list(JobberJob.objects.filter(tenant_id=TENANT_ID, job_number__in=TARGET_JOB_NUMBERS, is_active=True))
 print(f"Found {len(candidates)} real JobberJob row(s) for job_number in {TARGET_JOB_NUMBERS}:")
 for job in candidates:
     print(f"  tenant_id={job.tenant_id} job_number={job.job_number} jobber_id={job.jobber_id} "
@@ -56,29 +59,53 @@ for job in ready:
     print(f"Visits: {len(visits)} total, {len(callback_visits)} flagged is_callback=True: "
           f"{[v.jobber_id for v in callback_visits]}")
 
-    # --- Independent recomputation, same pattern as every prior verification ---
-    original_by_user = calculate_job_duration_by_user(job, created_before=job.first_archived_at)
-    callback_by_user = calculate_job_duration_by_user(job, created_at_or_after=job.first_archived_at)
-    original_hours = sum(original_by_user.values()) / 3600
-    callback_hours = sum(callback_by_user.values()) / 3600
-
-    print(f"\nOriginal hours (entries created before first_archived_at): {original_hours:.4f}h  {original_by_user}")
-    print(f"Callback hours (entries created at/after first_archived_at): {callback_hours:.4f}h  {callback_by_user}")
-
-    recomputed_bled = None
-    if original_hours > 0 and job.total is not None:
-        from decimal import Decimal
-        job_rate = job.total / Decimal(str(original_hours))
-        recomputed_bled = job_rate * Decimal(str(callback_hours))
-        print(f"Job-specific rate (recomputed): {job.total} / {original_hours:.4f}h = ${job_rate:.2f}/hr")
-        print(f"Recomputed Callback Bleed: {callback_hours:.4f}h x ${job_rate:.2f}/hr = ${recomputed_bled:.2f}")
+    # FIX (2026-08-30): no visit flagged is_callback=True means no callback
+    # was ever detected on this job at all -- there is nothing to attribute
+    # a Bleed amount to, so the only correct expectation is stored=None,
+    # checked directly, with NO recompute attempted. The previous version
+    # ran the created_before/created_at_or_after split regardless and
+    # treated whatever it got back as a real number to compare against --
+    # on job_number=6 (0 visits ever flagged) that produced a spurious
+    # "recomputed $0.00" against a correctly-null stored value, a false
+    # MISMATCH caused by this script's own logic, not production code.
+    if not callback_visits:
+        print("\nNo visit flagged is_callback=True -- no callback was ever detected on this job. No recompute attempted.")
+        status = "MATCH" if job.callback_bled_amount is None else "MISMATCH"
+        print(f"Stored callback_bled_amount={job.callback_bled_amount!r}, expected None -> {status}")
     else:
-        print("Cannot recompute a rate -- zero original hours or missing Job.total. Real inputs reported as-is.")
+        # --- Independent recomputation, same pattern as every prior verification ---
+        original_by_user = calculate_job_duration_by_user(job, created_before=job.first_archived_at)
+        callback_by_user = calculate_job_duration_by_user(job, created_at_or_after=job.first_archived_at)
+        original_hours = sum(original_by_user.values()) / 3600
+        callback_hours = sum(callback_by_user.values()) / 3600
 
-    if job.callback_bled_amount is None and recomputed_bled is None:
-        print("MATCH (both null -- no real callback amount to compute, consistent with real inputs).")
-    elif job.callback_bled_amount is None or recomputed_bled is None:
-        print(f"MISMATCH -- stored={job.callback_bled_amount!r} recomputed={recomputed_bled!r}")
-    else:
-        status = "MATCH" if round(float(job.callback_bled_amount), 2) == round(float(recomputed_bled), 2) else "MISMATCH"
-        print(f"Stored={job.callback_bled_amount} vs recomputed={recomputed_bled:.2f} -> {status}")
+        print(f"\nOriginal hours (entries created before first_archived_at): {original_hours:.4f}h  {original_by_user}")
+        print(f"Callback hours (entries created at/after first_archived_at): {callback_hours:.4f}h  {callback_by_user}")
+
+        # FIX (2026-08-30): mirrors detect_and_freeze_callbacks()'s own
+        # "no data != 0" fix -- callback_by_user being an EMPTY dict means
+        # the flagged callback visit has zero real timesheet entries
+        # logged against it at all (genuinely unknown cost), not a real
+        # 0-hour callback. Gate the recompute on `callback_by_user` itself
+        # (dict truthiness), not just on callback_hours > 0, so an empty
+        # set correctly produces None here too, not a confident $0.00.
+        recomputed_bled = None
+        if callback_by_user and original_hours > 0 and job.total is not None:
+            job_rate = job.total / Decimal(str(original_hours))
+            recomputed_bled = job_rate * Decimal(str(callback_hours))
+            print(f"Job-specific rate (recomputed): {job.total} / {original_hours:.4f}h = ${job_rate:.2f}/hr")
+            print(f"Recomputed Callback Bleed: {callback_hours:.4f}h x ${job_rate:.2f}/hr = ${recomputed_bled:.2f}")
+        else:
+            print(
+                "Cannot recompute a real amount -- zero original hours, missing Job.total, or the "
+                "callback visit itself has zero real timesheet entries (empty set, not a real 0). "
+                "Expecting null, same 'no data != 0' rule as production."
+            )
+
+        if job.callback_bled_amount is None and recomputed_bled is None:
+            print("MATCH (both null -- no real callback amount to compute, consistent with real inputs).")
+        elif job.callback_bled_amount is None or recomputed_bled is None:
+            print(f"MISMATCH -- stored={job.callback_bled_amount!r} recomputed={recomputed_bled!r}")
+        else:
+            status = "MATCH" if round(float(job.callback_bled_amount), 2) == round(float(recomputed_bled), 2) else "MISMATCH"
+            print(f"Stored={job.callback_bled_amount} vs recomputed={recomputed_bled:.2f} -> {status}")
