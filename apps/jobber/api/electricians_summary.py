@@ -65,8 +65,25 @@ def _merge_intervals(intervals):
     return sum((end - start).total_seconds() for start, end in merged)
 
 
-def calculate_job_duration_by_user(job):
+def calculate_job_duration_by_user(job, created_before=None, created_at_or_after=None):
     """
+    created_before / created_at_or_after (2026-08-30, approved
+    callback_hours_design.md): optional cutoff datetimes, compared against
+    each entry's own real JobberTimeSheetEntry.jobber_created_at, for
+    splitting a job's real entries at its frozen first_archived_at moment
+    (the Callback Bleed original-vs-callback split — see
+    sync.py's detect_and_freeze_callbacks()). NOT visit-based —
+    TimeSheetEntry.visit is confirmed unreliable for this (null even for a
+    normal, non-callback, manually-added entry — see
+    verify_job1_manual_entry_visit.py's real finding). At most one of the
+    two should be passed at a time; both default to None, which preserves
+    the exact current behavior (every real entry, unfiltered) for every
+    existing caller unchanged. An entry whose jobber_created_at is None
+    (not yet backfilled by a re-sync, or genuinely missing) is excluded
+    from BOTH sides of a split rather than guessed into one — same "no
+    data != a guessed classification" principle already used everywhere
+    else in this project.
+
     Same merge logic calculate_job_duration_seconds() below is built on —
     grouped by user, each user's own overlapping timesheet-entry intervals
     merged via _merge_intervals() before summing — extracted out
@@ -111,6 +128,10 @@ def calculate_job_duration_by_user(job):
     directly against real ORM objects in tests/verification scripts.
     """
     entries = list(job.timesheet_entries.filter(is_active=True))
+    if created_before is not None:
+        entries = [e for e in entries if e.jobber_created_at is not None and e.jobber_created_at < created_before]
+    elif created_at_or_after is not None:
+        entries = [e for e in entries if e.jobber_created_at is not None and e.jobber_created_at >= created_at_or_after]
     if not entries:
         return {}
 
