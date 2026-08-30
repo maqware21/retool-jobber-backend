@@ -418,6 +418,7 @@ query GetJobsForSync($first: Int!, $after: String) {
           id
           startAt
           endAt
+          createdAt
           finalDuration
           user { id }
         }
@@ -427,6 +428,46 @@ query GetJobsForSync($first: Int!, $after: String) {
   }
 }
 """
+
+# Callback-detection-only (2026-08-30, approved callback_hours_design.md) —
+# called at most ONCE per job, exactly when that job's first_archived_at is
+# first set (see sync.py's detect_and_freeze_callbacks()). Deliberately NOT
+# folded into _SYNC_JOBS_QUERY above — that query runs for EVERY job on
+# EVERY sync pass, but this one only ever needs to run for the handful of
+# jobs that just transitioned to archived. Keeping it separate avoids
+# paying this cost on every job, every pass — the same "don't widen a
+# shared query for something only one narrow caller needs" reasoning
+# _SYNC_JOBS_QUERY itself already exists for. Uses Query.job(id: EncodedId!)
+# — the same cheap single-job lookup verify_callback_bleed.py's fix
+# confirmed real and inexpensive.
+_CALLBACK_DETECTION_QUERY = """
+query GetJobVisitsForCallbackDetection($id: EncodedId!) {
+  job(id: $id) {
+    id
+    visits(first: 25) {
+      nodes {
+        id
+        createdAt
+        invoice { id }
+      }
+    }
+  }
+}
+"""
+
+
+def fetch_job_visits_for_callback_detection(account, job_id):
+    """
+    Real visits (id, createdAt, invoice) for exactly one job, by its real
+    jobber_id — used at most once per job by sync.py's
+    detect_and_freeze_callbacks(). Returns the raw node list (possibly
+    empty if the job/visits aren't found — never raises for that case,
+    only for a genuine JobberAPIError from execute()).
+    """
+    data = execute(account, _CALLBACK_DETECTION_QUERY, {'id': job_id})
+    job_node = (data or {}).get('job') or {}
+    return (job_node.get('visits') or {}).get('nodes') or []
+
 
 # Safety cap per collection for fetch_all_pages(): 20 pages x 25 records =
 # 500 records. Endpoints that need a complete picture (rankings, rosters —

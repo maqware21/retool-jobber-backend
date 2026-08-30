@@ -306,7 +306,34 @@ def sync_jobs(account, tenant, deadline, clients_complete):
     if complete:
         JobberJob.objects.filter(tenant=tenant, is_active=True).exclude(jobber_id__in=seen_ids).update(is_active=False)
 
-    return {'count': count, 'complete': complete, 'nodes': nodes}
+    # Capture rule (2026-08-30, approved callback_hours_design.md) — freeze
+    # first_archived_at the FIRST sync pass that observes a job as archived;
+    # never overwritten again, including across a later reopen + re-archive.
+    # This is "first SYNC-OBSERVED archival," not Jobber's true archival
+    # instant — there's no webhook in this design (Phase 2 is pull-only), so
+    # a job that cycles active->archived->reopened->archived FASTER than the
+    # sync interval could have its second archival mistaken for its first. A
+    # real, accepted limitation, the same class of tradeoff as the
+    # deactivation sweep's own completeness gating above — not fixable here
+    # without webhooks. Also self-heals for a job that was ALREADY archived
+    # before this feature shipped: it simply gets first_archived_at set at
+    # whatever sync first runs post-deployment, folding its entire prior
+    # history into "original" — acceptable since this feature is about
+    # catching reopens going forward, not auditing history retroactively
+    # (see callback_hours_design.md).
+    #
+    # Runs unconditionally, NOT gated on `complete` — even a partial pull
+    # should still freeze the archival moment for whatever jobs it did see
+    # this pass; there's no reason to withhold that just because some other
+    # job elsewhere in the account wasn't reached this round.
+    newly_archived_ids = list(
+        JobberJob.objects.filter(tenant=tenant, job_status='archived', first_archived_at__isnull=True)
+        .values_list('id', flat=True)
+    )
+    if newly_archived_ids:
+        JobberJob.objects.filter(id__in=newly_archived_ids).update(first_archived_at=timezone.now())
+
+    return {'count': count, 'complete': complete, 'nodes': nodes, 'newly_archived_job_ids': newly_archived_ids}
 
 
 def sync_visits(account, tenant, job_nodes, complete):
@@ -489,6 +516,7 @@ def sync_timesheet_entries(account, tenant, job_nodes, complete):
                     'final_duration_seconds': entry_node.get('finalDuration') or 0,
                     'started_at': _to_datetime(entry_node.get('startAt')),
                     'ended_at': _to_datetime(entry_node.get('endAt')),
+                    'jobber_created_at': _to_datetime(entry_node.get('createdAt')),
                     'synced_at': timezone.now(),
                     'is_active': True,
                 },
@@ -499,6 +527,128 @@ def sync_timesheet_entries(account, tenant, job_nodes, complete):
         JobberTimeSheetEntry.objects.filter(tenant=tenant, is_active=True).exclude(jobber_id__in=seen_ids).update(is_active=False)
 
     return {'count': count, 'complete': complete}
+
+
+def detect_and_freeze_callbacks(account, tenant, newly_archived_job_ids):
+    """
+    Approved design (2026-08-30, callback_hours_design.md). For jobs whose
+    first_archived_at was JUST set this sync pass (see sync_jobs()'s capture
+    rule above), determine ONCE whether the job's real createdAt-latest
+    visit is a genuine callback (its own `invoice` is null) and freeze that
+    finding locally. is_callback is set exactly once, tied to
+    first_archived_at's own one-time null->set transition — never
+    re-evaluated afterward, matching the approved design's literal wording
+    ("once first_archived_at is set... once, never re-evaluated").
+
+    NOT visit-based exclusion of timesheet hours — TimeSheetEntry.visit is
+    confirmed unreliable for that (verify_job1_manual_entry_visit.py found
+    it null even for a normal, non-callback, manually-added entry). The
+    hours split below goes through calculate_job_duration_by_user()'s new
+    created_before/created_at_or_after params instead, keyed on this job's
+    own frozen first_archived_at.
+
+    One targeted live call per newly-archived job
+    (client.fetch_job_visits_for_callback_detection() — Query.job(id:),
+    visits only) — NOT a full account scan, avoiding the exact real cost
+    mistake already found and fixed in verify_callback_bleed.py earlier in
+    this same investigation (a full-account job search rejected outright at
+    28330/10000 query-cost points).
+
+    Two named, accepted limitations, not silently engineered around:
+      - The DECISION below (which visit is createdAt-latest, does it have
+        an invoice) is fully independent of local sync state — it comes
+        from client.fetch_job_visits_for_callback_detection()'s own live
+        call, not from job_nodes/sync_visits(). The real dependency is
+        narrower, on the WRITE that follows: local_visit = JobberVisit.
+        objects.filter(jobber_id=latest_visit_id).first() below needs a
+        LOCAL row for that exact visit to already exist, so is_callback
+        has something to be saved onto. That row only ever comes from
+        sync_visits() (derived from THIS pass's job_nodes, gated on
+        'visits' in wanted) or an earlier pass that already synced it.
+        Given sync_tenant()'s call order (sync_visits() runs BEFORE this
+        function, when both are requested), including 'visits' alongside
+        'jobs'/'timesheet_entries' in THIS pass guarantees the new
+        callback visit's row already exists by the time this runs. If
+        'visits' is excluded from this pass AND the visit is brand new
+        (never synced by any earlier pass either — the normal case for a
+        genuine callback, since it's freshly created), the lookup misses,
+        this job is skipped, and — because first_archived_at is already
+        frozen — it is NEVER retried, since that transition is the only
+        trigger this function responds to. Every real caller today
+        requests jobs/visits/timesheet_entries together (e.g.
+        duration_by_type.py's ensure_fresh() call), so this hasn't been
+        observed live — flagged as a known risk of the design as
+        specified, not a silent gap.
+      - By design, this only detects a callback across the FIRST reopen-
+        and-rearchive cycle after a job's original archival. A job reopened
+        a SECOND time after that won't get a fresh detection pass, since
+        first_archived_at (the only trigger) is a one-time, never-reset
+        value. Extending to N reopen cycles wasn't asked for this round.
+    """
+    # Deferred import — electricians_summary.py already imports
+    # ensure_fresh from THIS module at its own top level; importing
+    # calculate_job_duration_by_user back at sync.py's module level would
+    # be a genuine circular import. Same deferred-import pattern already
+    # used for _client_tags_display/_humanize_status/etc. elsewhere here.
+    from apps.jobber.api.electricians_summary import calculate_job_duration_by_user
+
+    if not newly_archived_job_ids:
+        return {'checked': 0, 'flagged': 0}
+
+    jobs = list(JobberJob.objects.filter(tenant=tenant, id__in=newly_archived_job_ids))
+    flagged = 0
+    for job in jobs:
+        try:
+            visits_raw = client.fetch_job_visits_for_callback_detection(account, job.jobber_id)
+        except client.JobberAPIError:
+            logger.exception(
+                "detect_and_freeze_callbacks: live visit lookup failed for job=%s tenant=%s — "
+                "is_callback/callback_bled_amount left unset; first_archived_at is already "
+                "frozen so this job will NOT be retried automatically.",
+                job.jobber_id, tenant.id,
+            )
+            continue
+
+        if not visits_raw:
+            continue
+
+        latest_visit_raw = max(visits_raw, key=lambda v: v.get('createdAt') or '')
+        latest_visit_id = latest_visit_raw.get('id')
+        has_invoice = latest_visit_raw.get('invoice') is not None
+
+        if has_invoice:
+            # Not a callback under this definition — nothing to freeze.
+            continue
+
+        local_visit = JobberVisit.objects.filter(tenant=tenant, jobber_id=latest_visit_id).first()
+        if local_visit is None:
+            logger.warning(
+                "detect_and_freeze_callbacks: job=%s's real latest visit=%s has no local "
+                "JobberVisit row yet — skipping; will NOT be retried (see docstring).",
+                job.jobber_id, latest_visit_id,
+            )
+            continue
+
+        original_by_user = calculate_job_duration_by_user(job, created_before=job.first_archived_at)
+        callback_by_user = calculate_job_duration_by_user(job, created_at_or_after=job.first_archived_at)
+        original_hours = sum(original_by_user.values()) / 3600
+        callback_hours = sum(callback_by_user.values()) / 3600
+
+        # Never a fabricated number — same convention as every other
+        # derived money/duration field in this app. Left null if there's
+        # no real original-hours denominator or no real Job.total to divide.
+        callback_bled_amount = None
+        if original_hours > 0 and job.total is not None:
+            job_rate = job.total / _to_decimal(original_hours)
+            callback_bled_amount = job_rate * _to_decimal(callback_hours)
+
+        local_visit.is_callback = True
+        local_visit.save(update_fields=['is_callback'])
+        job.callback_bled_amount = callback_bled_amount
+        job.save(update_fields=['callback_bled_amount'])
+        flagged += 1
+
+    return {'checked': len(jobs), 'flagged': flagged}
 
 
 def sync_invoices(account, tenant, deadline, clients_complete, jobs_complete):
@@ -651,6 +801,7 @@ def sync_tenant(account, entities=None):
     deadline = timezone.now() + SYNC_WALL_CLOCK_CEILING
     counts = {}
     job_nodes = []
+    newly_archived_job_ids = []
     # Dependency-completeness inputs for the deactivation-safety gating in
     # sync_jobs()/sync_invoices() (see their docstrings). Default True when
     # the upstream entity isn't part of THIS run's `wanted` set at all —
@@ -671,12 +822,19 @@ def sync_tenant(account, entities=None):
         if 'jobs' in wanted or 'visits' in wanted or 'timesheet_entries' in wanted:
             job_result = sync_jobs(account, tenant, deadline, clients_complete)
             job_nodes = job_result.pop('nodes')
+            newly_archived_job_ids = job_result.pop('newly_archived_job_ids')
             jobs_complete = job_result['complete']
             counts['jobs'] = job_result
         if 'visits' in wanted:
             counts['visits'] = sync_visits(account, tenant, job_nodes, jobs_complete)
         if 'timesheet_entries' in wanted:
             counts['timesheet_entries'] = sync_timesheet_entries(account, tenant, job_nodes, jobs_complete)
+            # Needs THIS pass's freshly-synced jobber_created_at values to
+            # compute an accurate hours split — see detect_and_freeze_
+            # callbacks()'s own docstring for why this is gated here and
+            # not on 'jobs' alone.
+            if newly_archived_job_ids:
+                detect_and_freeze_callbacks(account, tenant, newly_archived_job_ids)
         if 'invoices' in wanted:
             counts['invoices'] = sync_invoices(account, tenant, deadline, clients_complete, jobs_complete)
     except client.JobberAPIError as exc:

@@ -229,6 +229,26 @@ class JobberJob(DateModel):
     # sync.py's sync_jobs() and electricians_summary.py for how a null
     # value here is handled (excluded, not defaulted to another date).
     completed_at = models.DateTimeField(null=True, blank=True)
+    # New (2026-08-30, approved callback_hours_design.md) — the frozen
+    # boundary between "original" and "callback" work on this job. Set
+    # EXACTLY ONCE, the first sync pass that observes job_status=='archived'
+    # for this row, and never overwritten again — including across a later
+    # reopen + re-archive. This is "first SYNC-OBSERVED archival," not
+    # Jobber's true archival instant (no webhook in this design; see
+    # sync.py's sync_jobs() for the exact capture rule and its named
+    # limitations).
+    first_archived_at = models.DateTimeField(null=True, blank=True)
+    # New (2026-08-30) — the frozen Callback Bleed dollar result for this
+    # job: callback hours (entries with jobber_created_at >= first_archived_at)
+    # x this job's own rate (total / original hours, entries with
+    # jobber_created_at < first_archived_at). Null whenever it can't be
+    # computed for real (no original hours, or no callback visit found) —
+    # never a fabricated 0, same convention as every other derived money/
+    # duration field in this app. Same DecimalField(12, 2) convention as
+    # total/labour_cost above. Computed once by sync.py's
+    # detect_and_freeze_callbacks(), at the same moment is_callback is set
+    # on the relevant JobberVisit — see that function's docstring.
+    callback_bled_amount = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
     synced_at = models.DateTimeField()
 
     class Meta:
@@ -307,6 +327,19 @@ class JobberVisit(DateModel):
         blank=True,
     )
     jobber_id = models.CharField(max_length=255, db_index=True)
+    # New (2026-08-30, approved callback_hours_design.md) — frozen EXACTLY
+    # ONCE, never re-evaluated: True only when this visit was this job's
+    # createdAt-latest visit AT THE MOMENT its job's first_archived_at was
+    # first set, AND that visit's own real `invoice` field was null at that
+    # moment (see sync.py's detect_and_freeze_callbacks()). Deliberately
+    # NOT derived from TimeSheetEntry.visit or Visit.invoice live on every
+    # read — both are confirmed real but this specific frozen-snapshot
+    # meaning ("was this THE callback, as of first archival") can't be
+    # recomputed later without re-deriving the whole detection, and a job
+    # reopened again after this is a known, accepted gap (see that
+    # function's docstring), not silently handled by treating this as
+    # always-live.
+    is_callback = models.BooleanField(default=False)
     synced_at = models.DateTimeField()
 
     class Meta:
@@ -436,6 +469,18 @@ class JobberTimeSheetEntry(DateModel):
     # endAt IS genuinely nullable in the schema — an entry with a currently
     # running timer has no endAt yet.
     ended_at = models.DateTimeField(null=True, blank=True)
+    # New (2026-08-30, approved callback_hours_design.md) — from Jobber's
+    # own TimeSheetEntry.createdAt (ISO8601DateTime!, confirmed non-null in
+    # the schema). Named jobber_created_at, not created_at — DateModel
+    # already owns created_at for THIS ROW's own local creation time; this
+    # is Jobber's entry-creation timestamp, a genuinely different fact.
+    # Same naming precedent as JobberJob.jobber_created_at. This is the
+    # field the original-vs-callback split is computed against
+    # (calculate_job_duration_by_user()'s created_before/
+    # created_at_or_after params) — NOT TimeSheetEntry.visit, confirmed
+    # unreliable for this (null even for a normal, non-callback
+    # manually-added entry — see verify_job1_manual_entry_visit.py).
+    jobber_created_at = models.DateTimeField(null=True, blank=True)
     synced_at = models.DateTimeField()
 
     class Meta:
