@@ -498,6 +498,7 @@ query GetJobVisitsForCallbackDetection($id: EncodedId!) {
       nodes {
         id
         createdAt
+        completedAt
         invoice { id }
       }
     }
@@ -508,11 +509,15 @@ query GetJobVisitsForCallbackDetection($id: EncodedId!) {
 
 def fetch_job_visits_for_callback_detection(account, job_id):
     """
-    Real visits (id, createdAt, invoice) for exactly one job, by its real
-    jobber_id — used at most once per job by sync.py's
-    detect_and_freeze_callbacks(). Returns the raw node list (possibly
-    empty if the job/visits aren't found — never raises for that case,
-    only for a genuine JobberAPIError from execute()).
+    Real visits (id, createdAt, completedAt, invoice) for exactly one job,
+    by its real jobber_id — used at most once per job by sync.py's
+    detect_and_freeze_callbacks(). completedAt added (2026-08-30, PART A of
+    the approved callback window addition) — needed to measure the
+    CALLBACK_WINDOW_DAYS interval from the job's last COMPLETED visit
+    before the reopen, not from createdAt or first_archived_at. Returns
+    the raw node list (possibly empty if the job/visits aren't found —
+    never raises for that case, only for a genuine JobberAPIError from
+    execute()).
     """
     data = execute(account, _CALLBACK_DETECTION_QUERY, {'id': job_id})
     job_node = (data or {}).get('job') or {}

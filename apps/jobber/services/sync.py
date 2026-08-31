@@ -52,6 +52,20 @@ ALL_ENTITIES = ('clients', 'users', 'jobs', 'visits', 'invoices', 'timesheet_ent
 # codebase), not yet measured against real usage.
 STALENESS_THRESHOLD = timedelta(minutes=20)
 
+# Callback-detection window (2026-08-30, per PART A of the approved
+# addition to callback_hours_design.md) — the single, named home of the
+# "how many days late still counts as a callback" rule. Referenced ONLY
+# from detect_and_freeze_callbacks() below, nowhere else — confirmed no
+# other constant/hardcoded day-count for this exists anywhere in the
+# project (see callback_frontend_audit.md's Step 2 findings, which is
+# exactly what prompted adding this named constant instead of a bare
+# literal). Measured from the job's LAST COMPLETED visit before the
+# reopen, NOT from first_archived_at — archival can lag the actual work
+# by days on its own, so anchoring to first_archived_at would measure the
+# wrong interval. See detect_and_freeze_callbacks()'s own docstring for
+# the exact mechanics.
+CALLBACK_WINDOW_DAYS = 14
+
 ENTITY_MODELS = {
     'clients': JobberClient,
     'users': JobberUser,
@@ -531,14 +545,56 @@ def sync_timesheet_entries(account, tenant, job_nodes, complete):
 
 def detect_and_freeze_callbacks(account, tenant, newly_archived_job_ids):
     """
-    Approved design (2026-08-30, callback_hours_design.md). For jobs whose
-    first_archived_at was JUST set this sync pass (see sync_jobs()'s capture
-    rule above), determine ONCE whether the job's real createdAt-latest
-    visit is a genuine callback (its own `invoice` is null) and freeze that
-    finding locally. is_callback is set exactly once, tied to
-    first_archived_at's own one-time null->set transition — never
-    re-evaluated afterward, matching the approved design's literal wording
-    ("once first_archived_at is set... once, never re-evaluated").
+    Approved design (2026-08-30, callback_hours_design.md, PART A addition
+    same day). For jobs whose first_archived_at was JUST set this sync
+    pass (see sync_jobs()'s capture rule above), determine ONCE whether
+    the job's real createdAt-latest visit is a genuine callback — its own
+    `invoice` is null, AND it happened within CALLBACK_WINDOW_DAYS of the
+    job's last completed visit before it — and freeze that finding
+    locally. is_callback is set exactly once, tied to first_archived_at's
+    own one-time null->set transition — never re-evaluated afterward,
+    matching the approved design's literal wording ("once first_archived_at
+    is set... once, never re-evaluated").
+
+    PART A (2026-08-30) — the day-window check. Confirmed genuinely absent
+    anywhere in this project before this (see callback_frontend_audit.md's
+    Step 2: no 14-day or any other day-count constant existed anywhere,
+    despite the original SRS suggesting one). CALLBACK_WINDOW_DAYS (module
+    constant above) is the single, named home of this rule — referenced
+    ONLY here. Measured from the job's LAST COMPLETED visit's own real
+    completedAt, NOT from first_archived_at — archival can lag the actual
+    work by days on its own, so anchoring to first_archived_at would
+    measure the wrong interval (how late the JOB was archived, not how
+    late the SECOND VISIT happened relative to the first one finishing).
+    If no other visit has a real completedAt before the reopen at all, this
+    does NOT assume the window is satisfied — no data is never treated as
+    "must be recent," same "no data != assumed" principle used everywhere
+    else in this app. If the reopen falls outside the window, is_callback
+    is simply never set — per the freeze-once property below, this is a
+    forward-only change: it does not retroactively re-evaluate anything
+    already frozen under the pre-window rule.
+
+    THIS FUNCTION IS THE SINGLE, SOLE PLACE the "what counts as a callback"
+    definition lives — no other view, serializer, or frontend logic should
+    ever duplicate or re-derive it (confirmed 2026-08-30: is_callback/
+    callback_bled_amount are only ever written here; backfill_callback_bled_
+    amount.py recomputes callback_bled_amount using this exact same formula,
+    it does not encode a second definition).
+
+    DELIBERATE, KNOWN PROPERTY (2026-08-30, not a hidden limitation) — since
+    every result here is frozen at write time and never re-evaluated: a
+    FUTURE CHANGE to this function's detection rule (e.g. adding a day
+    window between first_archived_at and the callback visit's own
+    createdAt, or changing the invoice-null criterion itself) affects ONLY
+    callbacks detected AFTER that code change ships. It does NOT
+    retroactively recompute or reinterpret any job/visit already frozen
+    under the old rule — those keep their old is_callback/
+    callback_bled_amount values forever, silently, unless someone
+    explicitly writes and runs a one-off backfill against the new rule
+    (the same pattern backfill_callback_bled_amount.py already established
+    for a different kind of correction). Any change to this function
+    should call this out explicitly in its own commit/PR description, not
+    assume it applies uniformly to historical data.
 
     NOT visit-based exclusion of timesheet hours — TimeSheetEntry.visit is
     confirmed unreliable for that (verify_job1_manual_entry_visit.py found
@@ -618,6 +674,48 @@ def detect_and_freeze_callbacks(account, tenant, newly_archived_job_ids):
 
         if has_invoice:
             # Not a callback under this definition — nothing to freeze.
+            continue
+
+        # PART A (2026-08-30, approved) — CALLBACK_WINDOW_DAYS check. The
+        # reopen must have happened within CALLBACK_WINDOW_DAYS of the
+        # job's LAST COMPLETED visit BEFORE it — not from first_archived_at,
+        # which can lag the actual work by days on its own and would
+        # measure the wrong interval entirely. "Last completed visit
+        # before the reopen" = the visit (other than the candidate itself)
+        # with the latest real completedAt that is still chronologically
+        # before the reopen visit's own createdAt.
+        reopen_at = _to_datetime(latest_visit_raw.get('createdAt'))
+        completed_before_reopen = [
+            v for v in visits_raw
+            if v.get('id') != latest_visit_id
+            and v.get('completedAt')
+            and reopen_at is not None
+            and _to_datetime(v['completedAt']) < reopen_at
+        ]
+        if not completed_before_reopen:
+            # No other visit has a real completedAt before the reopen — we
+            # genuinely can't confirm this satisfies the window, so we do
+            # NOT assume compliance (same "no data != assumed" principle
+            # used everywhere else in this app — a null here must not be
+            # silently treated as "within window").
+            logger.info(
+                "detect_and_freeze_callbacks: job=%s has no other visit with a real completedAt "
+                "before the reopen — cannot confirm the %s-day callback window, not flagging "
+                "is_callback.",
+                job.jobber_id, CALLBACK_WINDOW_DAYS,
+            )
+            continue
+
+        last_completed_visit = max(completed_before_reopen, key=lambda v: v['completedAt'])
+        last_completed_at = _to_datetime(last_completed_visit['completedAt'])
+        gap = reopen_at - last_completed_at
+        if gap > timedelta(days=CALLBACK_WINDOW_DAYS):
+            logger.info(
+                "detect_and_freeze_callbacks: job=%s's reopen visit=%s happened %s after the "
+                "last completed visit — outside the %s-day callback window, not flagging "
+                "is_callback.",
+                job.jobber_id, latest_visit_id, gap, CALLBACK_WINDOW_DAYS,
+            )
             continue
 
         local_visit = JobberVisit.objects.filter(tenant=tenant, jobber_id=latest_visit_id).first()
