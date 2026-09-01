@@ -13,6 +13,7 @@ from apps.jobber.api.electricians_summary import (
     _gather_job_assignees,
     calculate_job_duration_by_user,
     calculate_top_earner,
+    split_job_revenue_among_assignees,
 )
 from apps.jobber.models import JobberAccount, JobberJob, JobberUser
 from apps.jobber.services.sync import ensure_fresh
@@ -71,6 +72,92 @@ def _accumulate_technician_job_stats(archived_jobs):
             entry['total_seconds'] += seconds
             if seconds > 0:
                 entry['tracked_job_count'] += 1
+    return stats
+
+
+def _accumulate_technician_callback_stats(archived_jobs):
+    """
+    Per-technician callback counts and dollar attribution across
+    `archived_jobs` — the SAME archived + completed_at-windowed population
+    _accumulate_technician_job_stats() above uses (confirmed 2026-08-31,
+    Part B verification: Job.completed_at tracks the LATEST closure, not
+    the original one — a job's real completedAt landed within 4 seconds of
+    its real callback visit's own completedAt, over an hour after the
+    original visit's completion — so a job that was reopened recently
+    stays inside this rolling window even if its original work is older).
+
+    Built entirely from already-proven primitives, nothing re-derived:
+      - JobberVisit.is_callback — detect_and_freeze_callbacks()'s own
+        frozen finding (see that function's docstring — this is the
+        SOLE place the "what counts as a callback" definition lives).
+      - JobberVisit.assigned_users — the SAME multi-assignee field Top
+        Earner already uses (assigned_users, not the single-assignee
+        assigned_user) — confirmed convention (2026-08-31), not
+        re-decided here.
+      - calculate_job_duration_by_user(job, created_at_or_after=
+        job.first_archived_at) — unchanged, called with the SAME
+        callback-only split detect_and_freeze_callbacks() itself uses.
+      - split_job_revenue_among_assignees() — unchanged, reused directly
+        for the dollar split, same as calculate_job_revenue_shares()
+        above uses it for whole-job revenue.
+
+    Returns {user_id: {'callback_visits_done': int,
+    'callback_dollars_lost': float, 'has_unknown_callback_cost': bool}}.
+
+    callback_visits_done: FULL credit to every real assignee of a
+    callback visit — the same "no-split" rule jobs_completed itself uses
+    (confirmed convention, 2026-08-31), not a proportional count.
+
+    callback_dollars_lost: only sums a callback's dollar SHARE when
+    job.callback_bled_amount is a real (non-null) number. A null
+    callback_bled_amount means "unknown cost" — Job #3's own real,
+    confirmed case (a genuine callback with zero logged hours on the
+    callback visit) — and must NEVER be silently coalesced into a clean
+    $0 total. Split proportionally via split_job_revenue_among_assignees(),
+    weighted by the CALLBACK-VISIT-ONLY hours (not the whole job's hours,
+    since this dollar figure is specifically about the callback's own
+    cost, not the original work).
+
+    has_unknown_callback_cost: True for any technician with at least one
+    REAL callback (is_callback=True, correctly attributed to them via
+    assigned_users) whose job.callback_bled_amount is null. A separate,
+    explicit flag — never dropped, never merged into the dollar total —
+    so a technician's $0 in the response is never ambiguous between
+    "confirmed zero lost" and "we don't actually know."
+    """
+    stats = {}
+    for job in archived_jobs:
+        callback_visits = list(job.visits.filter(is_callback=True, is_active=True))
+        if not callback_visits:
+            continue
+
+        # Same split boundary detect_and_freeze_callbacks() itself uses —
+        # computed once per job, reused for every callback visit on it
+        # (there's at most one under the current one-shot detection design,
+        # but this doesn't assume that).
+        callback_hours_by_user = calculate_job_duration_by_user(job, created_at_or_after=job.first_archived_at)
+        has_known_amount = job.callback_bled_amount is not None
+
+        for visit in callback_visits:
+            assignees = list(visit.assigned_users.all())
+            if not assignees:
+                continue
+
+            dollar_shares = {}
+            if has_known_amount:
+                hours_by_user = {u.id: callback_hours_by_user.get(u.id, 0) for u in assignees}
+                dollar_shares = split_job_revenue_among_assignees(float(job.callback_bled_amount), hours_by_user)
+
+            for user in assignees:
+                entry = stats.setdefault(
+                    user.id,
+                    {'callback_visits_done': 0, 'callback_dollars_lost': 0.0, 'has_unknown_callback_cost': False},
+                )
+                entry['callback_visits_done'] += 1
+                if has_known_amount:
+                    entry['callback_dollars_lost'] += dollar_shares.get(user.id, 0.0)
+                else:
+                    entry['has_unknown_callback_cost'] = True
     return stats
 
 
@@ -165,6 +252,7 @@ def get_technician_stats(tenant):
     team_revenue_total = sum(revenue_totals.values())
 
     job_stats = _accumulate_technician_job_stats(archived_jobs)
+    callback_stats = _accumulate_technician_callback_stats(archived_jobs)
     assigned_counts, archived_counts = _accumulate_completion_counts(tenant_id, period_start)
 
     # Current-month revenue, for goal progress -- calculate_top_earner()
@@ -233,6 +321,23 @@ def get_technician_stats(tenant):
         total_seconds = stats['total_seconds'] if stats else 0
         tracked_job_count = stats['tracked_job_count'] if stats else 0
 
+        # PENDING CONFIRMATION status lifted (2026-08-31, approved) -- see
+        # _accumulate_technician_callback_stats()'s own docstring for the
+        # full reasoning (assigned_users attribution, full-credit count vs.
+        # proportional-dollar split, the has_unknown_callback_cost flag).
+        cb_stats = callback_stats.get(tech.id)
+        callback_visits_done = cb_stats['callback_visits_done'] if cb_stats else 0
+        callback_dollars_lost = cb_stats['callback_dollars_lost'] if cb_stats else 0.0
+        has_unknown_callback_cost = cb_stats['has_unknown_callback_cost'] if cb_stats else False
+        # None (not 0) when jobs_completed is 0 -- "no data" (this
+        # technician completed nothing this window, the ratio is
+        # undefined), distinct from a real, confirmed 0% when they
+        # completed jobs but had zero callbacks. Same "no data != 0"
+        # convention as every other ratio in this function.
+        callback_rate = (
+            round((callback_visits_done / jobs_completed) * 100, 1) if jobs_completed > 0 else None
+        )
+
         revenue_per_hour = (revenue / (total_seconds / 3600)) if total_seconds > 0 else None
         avg_job_duration_seconds = (
             round(total_seconds / tracked_job_count) if tracked_job_count > 0 else None
@@ -284,6 +389,21 @@ def get_technician_stats(tenant):
             'avg_job_duration_seconds': avg_job_duration_seconds,
             'completion_percentage': completion_percentage,
             'team_revenue_share_percentage': team_revenue_share_percentage,
+            # New (2026-08-31, approved) -- backend-only this round, no
+            # frontend wiring yet. callback_visits_done: full credit to
+            # every real assignee (assigned_users), same convention as
+            # jobs_completed. callback_rate: null only when jobs_completed
+            # is 0 (no data), a real 0.0 otherwise. callback_dollars_lost
+            # sums ONLY callbacks with a real, known callback_bled_amount
+            # -- has_unknown_callback_cost is the separate, explicit signal
+            # for "at least one of this technician's real callbacks has an
+            # unknown cost," so a 0 here is never ambiguous between
+            # "confirmed zero lost" and "we don't actually know." See
+            # _accumulate_technician_callback_stats()'s own docstring.
+            'callback_visits_done': callback_visits_done,
+            'callback_rate': callback_rate,
+            'callback_dollars_lost': round(callback_dollars_lost, 2),
+            'has_unknown_callback_cost': has_unknown_callback_cost,
             'goal_progress': {
                 'goal_amount': float(goal_amount) if goal_amount is not None else None,
                 'current_month_revenue': round(float(current_month_revenue), 2),
