@@ -218,8 +218,9 @@ def split_job_revenue_among_assignees(job_revenue, hours_by_user):
     what) before calling this.
 
     Per Jobber's own confirmed attribution rule (Team Productivity Report +
-    support bot) — 3 discrete cases, plus one gap this project is filling
-    in with its own interpretation, flagged explicitly below:
+    support bot) — 4 discrete cases, ALL confirmed (see case 4 below,
+    updated 2026-09-01 — previously flagged here as this project's own
+    unconfirmed interpretation; that gap is now closed):
 
       1. Everyone assigned tracked time -> proportional split by hours.
       2. No one tracked time -> EQUAL split among all assigned (per TL
@@ -229,16 +230,17 @@ def split_job_revenue_among_assignees(job_revenue, hours_by_user):
          independently-confirmed rules for the same underlying "no time
          data" situation).
       3. Exactly one person tracked time -> 100% to that one person.
-      4. [GAP — not covered by Jobber's stated 3 rules. OUR INTERPRETATION,
-         NOT INDEPENDENTLY CONFIRMED for this exact sub-case]: some but not
+      4. CONFIRMED (2026-09-01, Jobber's own support bot, a real worked
+         example — not this project's own interpretation): some but not
          all assigned people tracked time (2+ people tracked, but fewer
          than everyone assigned) -> proportional split among only those who
-         tracked, excluding the 0-hour assignees from the pool entirely —
-         the natural extension of rule 1's "proportional by hours"
-         principle with non-trackers simply removed from the split, rather
-         than a new rule invented from nothing. Revisit against Jobber's
-         docs/support bot specifically for this sub-case before treating it
-         as settled.
+         tracked, excluding the 0-hour assignees from the pool entirely.
+         The worked example given: 3 technicians on one job, tracking
+         3hrs/1hr/0hrs respectively -> revenue split 75%/25%/0% — exactly
+         the proportional-among-trackers-only math this function already
+         implements (3/(3+1)=75%, 1/(3+1)=25%, the 0hr assignee excluded
+         entirely). No code change was needed here; this confirms the
+         existing logic was already correct, not a fix.
 
     Returns {user_id: revenue_share} — a plain dict, same currency unit as
     job_revenue (no rounding applied here; that's a display concern for
