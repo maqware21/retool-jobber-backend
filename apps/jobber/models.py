@@ -481,6 +481,17 @@ class JobberTimeSheetEntry(DateModel):
     # unreliable for this (null even for a normal, non-callback
     # manually-added entry — see verify_job1_manual_entry_visit.py).
     jobber_created_at = models.DateTimeField(null=True, blank=True)
+    # New (2026-09-03, approved labor_cost_profit_margin_proposal.md) —
+    # from Jobber's own TimeSheetEntry.labourRate (confirmed real via
+    # verify_labour_rate_field.py; a DIFFERENT field from the already-
+    # confirmed-broken JobberJob.labour_cost/jobCosting.labourCost above).
+    # Reads 0.00 in this account today only because no rate has been
+    # entered in Jobber yet, not because the field is broken — treated as
+    # "not entered," never a real $0/hr rate, same "0 = not set"
+    # convention already used for TechnicianGoal.goal_amount. Same
+    # DecimalField(12, 2) money-field convention as every other stored
+    # dollar figure in this app.
+    labour_rate = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
     synced_at = models.DateTimeField()
 
     class Meta:

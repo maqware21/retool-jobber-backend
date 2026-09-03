@@ -1,5 +1,6 @@
 import logging
 from datetime import timedelta
+from decimal import Decimal
 
 from dateutil.relativedelta import relativedelta
 from django.db.models import Sum
@@ -200,6 +201,68 @@ def calculate_job_duration_seconds(job):
     if not per_user:
         return None
     return int(round(sum(per_user.values())))
+
+
+def _technician_labour_rate(job, user_id):
+    """
+    This technician's real, non-zero hourly labour rate on `job`, from
+    their own real JobberTimeSheetEntry.labour_rate values — or None if
+    no such real rate exists.
+
+    0 (and null) are both treated as "not entered," never a real $0/hr
+    rate — same "0 = not set" convention TechnicianGoal.goal_amount
+    already uses (see labor_cost_profit_margin_proposal.md). Confirmed
+    real as of 2026-09-03: this account's own entries all read 0.00
+    today, purely because no rate has ever been entered in Jobber, not
+    because the field itself is broken (a DIFFERENT, already-confirmed-
+    broken situation from jobCosting.labourCost).
+
+    If this technician's real entries on this job carry more than one
+    DISTINCT real rate (a rate change over time, in principle possible in
+    Jobber — not yet observed in real data, since this account has no
+    non-zero rates at all yet), this returns None rather than guessing
+    which one is "the" rate — logged, not silently picked. Revisit this
+    exact case once real, varying rate data actually exists to check
+    against (see the proposal's own named open question #2).
+    """
+    entries = job.timesheet_entries.filter(is_active=True, user_id=user_id)
+    rates = {e.labour_rate for e in entries if e.labour_rate}
+    if not rates:
+        return None
+    if len(rates) > 1:
+        logger.warning(
+            "_technician_labour_rate: job=%s user=%s has %d distinct real "
+            "labour_rate values (%s) -- ambiguous, not guessing, treating "
+            "as no real rate data for this job.",
+            job.jobber_id, user_id, len(rates), rates,
+        )
+        return None
+    return rates.pop()
+
+
+def calculate_technician_labor_cost(job, user_id, hours_by_user):
+    """
+    Real labor cost for one technician on one job, or None if there's no
+    real cost to compute (no tracked seconds at all, or no real non-zero
+    labour_rate for this technician on this job — see
+    _technician_labour_rate() above).
+
+    hours_by_user: the SAME dict calculate_job_duration_by_user(job)
+    already returns (merged, real seconds) — reused verbatim, not
+    re-derived. This deliberately reuses the merged hours, not raw
+    per-entry durations: the same overlap-merge fix that prevents Job 2's
+    confirmed double-counted DURATION bug from recurring would otherwise
+    also double-count that technician's labor COST, which is the exact
+    kind of silent-copy-paste mistake reuse is meant to prevent here.
+    """
+    seconds = hours_by_user.get(user_id)
+    if not seconds:
+        return None
+    rate = _technician_labour_rate(job, user_id)
+    if rate is None:
+        return None
+    hours = Decimal(str(seconds / 3600))
+    return hours * rate
 
 
 def split_job_revenue_among_assignees(job_revenue, hours_by_user):

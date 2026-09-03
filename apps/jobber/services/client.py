@@ -436,6 +436,10 @@ query GetClients($first: Int!, $after: String) {
 # as Visits, confirmed against the schema: Query.timeSheetEntries exists but
 # has no job filter at all, so this is the only path; see
 # JobberTimeSheetEntry's model docstring and sync.py's sync_timesheet_entries()).
+# labourRate added 2026-09-03 (approved labor_cost_profit_margin_proposal.md)
+# for JobberTimeSheetEntry.labour_rate — a REAL, native per-entry Jobber
+# wage rate, confirmed via verify_labour_rate_field.py; a DIFFERENT field
+# from jobCosting.labourCost above (already confirmed broken/always 0).
 _SYNC_JOBS_QUERY = """
 query GetJobsForSync($first: Int!, $after: String) {
   jobs(first: $first, after: $after) {
@@ -470,6 +474,7 @@ query GetJobsForSync($first: Int!, $after: String) {
           endAt
           createdAt
           finalDuration
+          labourRate
           user { id }
         }
       }

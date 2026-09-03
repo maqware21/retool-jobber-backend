@@ -531,6 +531,13 @@ def sync_timesheet_entries(account, tenant, job_nodes, complete):
                     'started_at': _to_datetime(entry_node.get('startAt')),
                     'ended_at': _to_datetime(entry_node.get('endAt')),
                     'jobber_created_at': _to_datetime(entry_node.get('createdAt')),
+                    # New (2026-09-03, approved labor_cost_profit_margin_
+                    # proposal.md) -- real, native per-entry Jobber wage
+                    # rate. _to_decimal(None) is None, preserved as-is (not
+                    # coalesced to 0 here) -- the "0 = not entered"
+                    # interpretation is a read-time decision, made where
+                    # labor cost is computed, not baked into the sync.
+                    'labour_rate': _to_decimal(entry_node.get('labourRate')),
                     'synced_at': timezone.now(),
                     'is_active': True,
                 },

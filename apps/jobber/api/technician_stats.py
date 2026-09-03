@@ -1,5 +1,6 @@
 import logging
 from datetime import datetime, time
+from decimal import Decimal
 
 from dateutil.relativedelta import relativedelta
 from django.utils import timezone
@@ -12,6 +13,7 @@ from apps.jobber.api.electricians_summary import (
     PERIOD_MONTHS,
     _gather_job_assignees,
     calculate_job_duration_by_user,
+    calculate_technician_labor_cost,
     calculate_top_earner,
     split_job_revenue_among_assignees,
 )
@@ -161,6 +163,45 @@ def _accumulate_technician_callback_stats(archived_jobs):
     return stats
 
 
+def _accumulate_technician_labor_cost(archived_jobs):
+    """
+    Real labor cost per technician across `archived_jobs` -- the SAME
+    population every other per-technician stat here uses. Built entirely
+    from calculate_technician_labor_cost() (unchanged, reused directly);
+    nothing re-derived.
+
+    Returns {user_id: Decimal total labor cost} -- ONLY for technicians
+    with at least one real, non-zero labour_rate found on at least one
+    job in the window. A technician with no real rate data anywhere is
+    simply ABSENT from this dict, never present with a fabricated $0 --
+    the caller (get_technician_stats()) uses this dict's own presence/
+    absence to decide whether to show a real profit_margin_percentage or
+    "no data" (None), same "absent != a real 0" convention used
+    throughout this app.
+
+    Known simplification, not silently hidden: unlike callback_dollars_
+    lost's has_unknown_callback_cost flag, a technician with SOME
+    real-rate jobs and SOME no-rate jobs in the same window gets a
+    margin computed only from the known-rate subset, with no separate
+    "this is partial" signal -- not built here, since the approved
+    proposal didn't ask for one; worth adding later if this ever becomes
+    a real, observed case (this account currently has no non-zero rates
+    at all yet, so it hasn't been).
+    """
+    costs = {}
+    for job in archived_jobs:
+        assignees = _gather_job_assignees(job)
+        if not assignees:
+            continue
+        hours_by_user = calculate_job_duration_by_user(job)
+        for user_id in assignees:
+            cost = calculate_technician_labor_cost(job, user_id, hours_by_user)
+            if cost is None:
+                continue
+            costs[user_id] = costs.get(user_id, Decimal('0')) + cost
+    return costs
+
+
 def _accumulate_completion_counts(tenant_id, period_start):
     """
     Completion % needs a DIFFERENT population than revenue/jobs_completed/
@@ -253,6 +294,12 @@ def get_technician_stats(tenant):
 
     job_stats = _accumulate_technician_job_stats(archived_jobs)
     callback_stats = _accumulate_technician_callback_stats(archived_jobs)
+    # Approved 2026-09-03 (labor_cost_profit_margin_proposal.md) -- revenue
+    # population for the margin below is `revenue_totals` above (Top
+    # Earner's Job.total-attributed share), explicitly NOT the separate
+    # Total Revenue tile's Paid-invoices-only figure, per the approved
+    # resolution (consistency with Jobber's own native profit panel).
+    labor_costs = _accumulate_technician_labor_cost(archived_jobs)
     assigned_counts, archived_counts = _accumulate_completion_counts(tenant_id, period_start)
 
     # Current-month revenue, for goal progress -- calculate_top_earner()
@@ -343,6 +390,20 @@ def get_technician_stats(tenant):
             round(total_seconds / tracked_job_count) if tracked_job_count > 0 else None
         )
 
+        # New (2026-09-03, approved labor_cost_profit_margin_proposal.md).
+        # labor_cost is ABSENT (not a real 0) from labor_costs for a
+        # technician with no real, non-zero labour_rate anywhere in the
+        # window -- None here, never a fabricated 100% margin. revenue is
+        # the SAME Top-Earner-attributed figure used for revenue_per_hour
+        # above, per the approved resolution -- not Total Revenue's
+        # separate Paid-invoices-only population.
+        labor_cost = labor_costs.get(tech.id)
+        profit_margin_percentage = (
+            round(((revenue - float(labor_cost)) / revenue) * 100, 1)
+            if labor_cost is not None and revenue > 0
+            else None
+        )
+
         assigned = assigned_counts.get(tech.id, 0)
         archived_count = archived_counts.get(tech.id, 0)
         completion_percentage = (
@@ -401,6 +462,11 @@ def get_technician_stats(tenant):
             # a real, silent mismatch, not just a naming nitpick.
             'completion_jobs_assigned': assigned,
             'completion_jobs_archived': archived_count,
+            # New (2026-09-03, approved labor_cost_profit_margin_proposal.md)
+            # -- null (not 0%) when this technician has no real, non-zero
+            # labour_rate data anywhere in the window. See
+            # _accumulate_technician_labor_cost()'s own docstring.
+            'profit_margin_percentage': profit_margin_percentage,
             'team_revenue_share_percentage': team_revenue_share_percentage,
             # New (2026-08-31, approved) -- backend-only this round, no
             # frontend wiring yet. callback_visits_done: full credit to
