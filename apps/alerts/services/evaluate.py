@@ -9,6 +9,26 @@ from apps.jobber.api.technician_stats import get_technician_stats
 # /v1/alerts/triggered/, so neither has to re-sort it itself.
 _SEVERITY_SORT_RANK = {'critical': 0, 'warning': 1}
 
+# Every rule_type's real trigger direction (2026-09-03, added alongside
+# callback_rate_above_pct). Every rule before this one was a "falls
+# BELOW threshold = bad" check -- the comparison itself used to be
+# hardcoded as `actual < threshold` with no concept of direction at all,
+# because every existing rule happened to share that direction. A high
+# callback rate is bad, not a low one, so it can't reuse that same
+# comparison unmodified -- this dict is what makes the comparison
+# direction-aware instead of adding a second, parallel evaluation path.
+# Every rule_type in helpers.constants.ALERT_RULE_TYPES MUST have an
+# entry here, or it silently falls through unevaluated (see the
+# 'no evaluator branch yet' comment in _actual_value below).
+_RULE_TYPE_DIRECTION = {
+    'monthly_goal_pct': 'below',
+    'annual_goal_pct': 'below',
+    'completion_rate_pct': 'below',
+    'revenue_per_hour': 'below',
+    'team_avg_revenue_pct': 'below',
+    'callback_rate_above_pct': 'above',
+}
+
 
 def _actual_value(rule_type, tech, team_avg_revenue):
     """
@@ -35,6 +55,14 @@ def _actual_value(rule_type, tech, team_avg_revenue):
         if team_avg_revenue <= 0:
             return None
         return round((tech['revenue'] / team_avg_revenue) * 100, 1)
+    if rule_type == 'callback_rate_above_pct':
+        # Reuses tech['callback_rate'] exactly as get_technician_stats()
+        # already computes it -- real, already-proven number, nothing
+        # re-derived here. Genuinely null (not 0) when this technician
+        # completed zero jobs this window (the rate is undefined) --
+        # already "no data", correctly skipped by the None check below,
+        # same as every other branch here.
+        return tech['callback_rate']
     # A future rule_type with no evaluator branch yet -- skip, don't crash.
     return None
 
@@ -108,7 +136,16 @@ def evaluate_alert_rules(tenant):
             if actual is None:
                 continue  # no data this window for this technician -- not a trigger, not an error
 
-            if actual < float(rule.threshold_value):
+            # Direction-aware (2026-09-03) -- see _RULE_TYPE_DIRECTION's
+            # own comment. Defaults to 'below' (the original, only
+            # behavior before this) for any rule_type that somehow lacks
+            # an entry there, rather than crashing on a real but
+            # unanticipated gap.
+            threshold = float(rule.threshold_value)
+            direction = _RULE_TYPE_DIRECTION.get(rule.rule_type, 'below')
+            is_triggered = actual < threshold if direction == 'below' else actual > threshold
+
+            if is_triggered:
                 triggered.append({
                     'rule_id': rule.id,
                     'rule_type': rule.rule_type,
@@ -116,7 +153,7 @@ def evaluate_alert_rules(tenant):
                     'severity': rule.severity,
                     'user_id': tech['user_id'],
                     'user_name': tech['name'],
-                    'threshold_value': float(rule.threshold_value),
+                    'threshold_value': threshold,
                     'actual_value': actual,
                 })
 

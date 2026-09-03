@@ -35,16 +35,25 @@ JOBBER_SYNC_STATUS = [
 # concept -- that belonged to the earlier, incorrect per-technician-rule
 # design.)
 #
-# Explicitly NOT included yet: callback-rate and drive-time rule types --
-# both genuinely blocked (see PROJECT_CONTEXT.md), not even added as
-# disabled placeholders, since a selectable-but-never-evaluated choice
-# would silently never fire.
+# Explicitly NOT included yet: drive-time rule type -- still genuinely
+# blocked (no real data source at all, see PROJECT_CONTEXT.md), not even
+# added as a disabled placeholder, since a selectable-but-never-evaluated
+# choice would silently never fire.
+#
+# callback_rate_above_pct (2026-09-03, approved) -- the first rule type
+# whose real trigger direction is "above" the threshold, not "below" it
+# like every other rule here (a high callback rate is bad; a low value
+# everywhere else is bad). See evaluate.py's _RULE_TYPE_DIRECTION for the
+# comparison this requires -- do not add a new rule_type here without
+# also adding its direction there, or it will silently evaluate with the
+# wrong comparison operator.
 ALERT_RULE_TYPES = [
     ('monthly_goal_pct', 'Monthly goal below X%'),
     ('annual_goal_pct', 'Annual goal below X%'),
     ('completion_rate_pct', 'Completion rate below X%'),
     ('revenue_per_hour', 'Revenue/hr below $X'),
     ('team_avg_revenue_pct', 'Revenue below X% of team average'),
+    ('callback_rate_above_pct', 'Callback rate above X%'),
 ]
 
 ALERT_SEVERITY_CHOICES = [
