@@ -388,6 +388,19 @@ def get_technician_stats(tenant):
             'revenue_per_hour': round(revenue_per_hour, 2) if revenue_per_hour is not None else None,
             'avg_job_duration_seconds': avg_job_duration_seconds,
             'completion_percentage': completion_percentage,
+            # New (2026-09-03) -- the raw counts completion_percentage
+            # itself is computed from, exposed alongside it so the drawer
+            # can show "X of Y jobs" instead of just the ratio. Reuses
+            # `assigned`/`archived_count` from _accumulate_completion_counts()
+            # above directly -- not re-derived. Prefixed `completion_` on
+            # purpose: this is a GENUINELY DIFFERENT population from
+            # `jobs_completed` above (all jobs assigned in the window by
+            # jobber_created_at, regardless of status, vs. jobs_completed's
+            # archived + completed_at-windowed population) -- pairing these
+            # with jobs_completed instead of completion_percentage would be
+            # a real, silent mismatch, not just a naming nitpick.
+            'completion_jobs_assigned': assigned,
+            'completion_jobs_archived': archived_count,
             'team_revenue_share_percentage': team_revenue_share_percentage,
             # New (2026-08-31, approved) -- backend-only this round, no
             # frontend wiring yet. callback_visits_done: full credit to
