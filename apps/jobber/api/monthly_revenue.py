@@ -29,6 +29,47 @@ _NOT_CONNECTED_DATA = {
 }
 
 
+def _revenue_by_technician_for_month(tenant_id, month_start):
+    """
+    Real per-technician revenue for exactly ONE calendar month --
+    extracted (2026-09-04, approved last_month_goal_alert_proposal.md)
+    from _local_monthly_revenue_response()'s own per-month loop body
+    below, so the "last month's goal" alert rule (evaluate.py) can reuse
+    this exact calculation for one isolated month without running the
+    whole MONTHS_BACK-month loop just to get one month's numbers. The
+    chart below now calls this function once per month instead of
+    inlining the range/filter/calculate_top_earner steps directly --
+    same output, byte-for-byte, confirmed unchanged against real data
+    after this extraction (see last_month_goal_alert_proposal.md's build
+    report).
+
+    Same Job.total-attributed calculate_top_earner() population every
+    other revenue-driven feature in this project uses (Top Earner,
+    Profit Margin, current/annual goal progress) -- NOT paid-invoice-
+    based.
+
+    month_start must already be the 1st of the target month (a date, not
+    a datetime) -- same convention as TeamGoal/TechnicianGoal.month and
+    this module's own month_starts list below.
+
+    Returns {user_id: revenue} exactly as calculate_top_earner() returns
+    it (Decimal/float, unrounded) -- a job-less month or a technician
+    with zero jobs that month is simply absent from the dict; callers
+    decide what "absent" means for their own purposes (this module's
+    chart below treats it as a real, displayable 0; evaluate.py's
+    last_month_goal_pct branch does the same -- zero real revenue is a
+    computable fact, not "no data").
+    """
+    range_start = timezone.make_aware(datetime.combine(month_start, time.min))
+    range_end = timezone.make_aware(datetime.combine(month_start + relativedelta(months=1), time.min))
+
+    month_jobs = JobberJob.objects.filter(
+        tenant_id=tenant_id, is_active=True, job_status='archived',
+        completed_at__gte=range_start, completed_at__lt=range_end,
+    )
+    return calculate_top_earner(month_jobs)
+
+
 def _local_monthly_revenue_response(tenant):
     """
     Real per-technician revenue for each of the last MONTHS_BACK calendar
@@ -96,18 +137,7 @@ def _local_monthly_revenue_response(tenant):
         month_label = month_start.strftime('%Y-%m')
         months.append(month_label)
 
-        range_start = timezone.make_aware(datetime.combine(month_start, time.min))
-        range_end = timezone.make_aware(datetime.combine(month_start + relativedelta(months=1), time.min))
-
-        # Same archived + completed_at-windowed population every other
-        # Top-Earner-derived number in this project uses, just narrowed
-        # to one calendar month at a time instead of the usual 6-month
-        # rolling window.
-        month_jobs = JobberJob.objects.filter(
-            tenant_id=tenant_id, is_active=True, job_status='archived',
-            completed_at__gte=range_start, completed_at__lt=range_end,
-        )
-        revenue_totals = calculate_top_earner(month_jobs)
+        revenue_totals = _revenue_by_technician_for_month(tenant_id, month_start)
 
         for user in users:
             rows.append({
