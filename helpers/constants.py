@@ -47,6 +47,13 @@ JOBBER_SYNC_STATUS = [
 # comparison this requires -- do not add a new rule_type here without
 # also adding its direction there, or it will silently evaluate with the
 # wrong comparison operator.
+#
+# last_month_goal_pct (2026-09-04, approved) -- a SEPARATE rule type from
+# monthly_goal_pct, not a replacement or variant of it. monthly_goal_pct
+# evaluates the CURRENT calendar month's progress against a goal that's
+# still ongoing; this evaluates the PRIOR calendar month's FINAL result --
+# a "missed it" check, not a "how's it going" check. Direction is 'below'
+# (see evaluate.py's _RULE_TYPE_DIRECTION) -- same as monthly_goal_pct.
 ALERT_RULE_TYPES = [
     ('monthly_goal_pct', 'Monthly goal below X%'),
     ('annual_goal_pct', 'Annual goal below X%'),
@@ -54,6 +61,7 @@ ALERT_RULE_TYPES = [
     ('revenue_per_hour', 'Revenue/hr below $X'),
     ('team_avg_revenue_pct', 'Revenue below X% of team average'),
     ('callback_rate_above_pct', 'Callback rate above X%'),
+    ('last_month_goal_pct', "Last month's goal below X%"),
 ]
 
 ALERT_SEVERITY_CHOICES = [

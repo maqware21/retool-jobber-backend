@@ -1,4 +1,9 @@
+from dateutil.relativedelta import relativedelta
+
 from apps.alerts.models import AlertRule
+from apps.goals.models import TechnicianGoal
+from apps.goals.utils import current_month
+from apps.jobber.api.monthly_revenue import _revenue_by_technician_for_month
 from apps.jobber.api.technician_stats import get_technician_stats
 
 # Sort rank for the one required ordering rule (2026-08-21, confirmed
@@ -27,10 +32,11 @@ _RULE_TYPE_DIRECTION = {
     'revenue_per_hour': 'below',
     'team_avg_revenue_pct': 'below',
     'callback_rate_above_pct': 'above',
+    'last_month_goal_pct': 'below',
 }
 
 
-def _actual_value(rule_type, tech, team_avg_revenue):
+def _actual_value(rule_type, tech, team_avg_revenue, last_month_data=None):
     """
     The real, already-computed number to compare rule.threshold_value
     against, or None if there's no data this window (never a fabricated
@@ -42,6 +48,20 @@ def _actual_value(rule_type, tech, team_avg_revenue):
     team_avg_revenue is passed in, not recomputed per rule/technician --
     it's the same value for every TEAM_AVG_REVENUE_PCT check this call
     runs.
+
+    last_month_data (2026-09-04, approved last_month_goal_alert_
+    proposal.md) -- optional, defaults to None, so every existing call
+    for every rule_type other than last_month_goal_pct behaves exactly
+    as before this parameter was added (unused by any other branch,
+    never even read unless rule_type == 'last_month_goal_pct'). Unlike
+    every other branch here, this ISN'T a field get_technician_stats()
+    itself computes -- it's a per-tenant {user_id: percentage_or_None}
+    dict evaluate_alert_rules() computes ONCE, lazily, only when a
+    last_month_goal_pct rule actually exists for this tenant (see that
+    function) -- deliberately NOT added to get_technician_stats()'s own
+    output, so every OTHER caller of that function (plain dashboard
+    loads included) never pays for this rule type's extra goal/revenue
+    lookups when nothing uses it.
     """
     if rule_type == 'monthly_goal_pct':
         return tech['goal_progress']['progress_percentage']
@@ -63,6 +83,14 @@ def _actual_value(rule_type, tech, team_avg_revenue):
         # already "no data", correctly skipped by the None check below,
         # same as every other branch here.
         return tech['callback_rate']
+    if rule_type == 'last_month_goal_pct':
+        # A technician absent from last_month_data has no real
+        # TechnicianGoal row for last month at all (see the
+        # once-per-tenant computation below) -- correctly excluded, not
+        # a fabricated pass or fail. .get() returning None either way
+        # (missing key or an explicit None value) is exactly the "no
+        # data" signal evaluate_alert_rules()'s own None check expects.
+        return (last_month_data or {}).get(tech['user_id'])
     # A future rule_type with no evaluator branch yet -- skip, don't crash.
     return None
 
@@ -129,10 +157,47 @@ def evaluate_alert_rules(tenant):
     # zero-activity ones" convention.
     team_avg_revenue = team_revenue_total / len(technicians)
 
+    # Lazy, once-per-tenant (2026-09-04, approved last_month_goal_alert_
+    # proposal.md) -- computed AT MOST ONCE per call, before the rule
+    # loop below, and ONLY when at least one last_month_goal_pct rule
+    # actually exists for this tenant. Two rules of this same type with
+    # different thresholds (the standard critical/warning 2-tier
+    # pattern -- see AlertRule's own docstring) both read from this one
+    # already-computed dict inside the loop below, rather than each
+    # recomputing it -- same "bulk once, not per row" shape already used
+    # by sync.py's callback-detection trigger fix.
+    last_month_data = None
+    if any(rule.rule_type == 'last_month_goal_pct' for rule in rules):
+        last_month = current_month() - relativedelta(months=1)
+        last_month_revenue = _revenue_by_technician_for_month(tenant.id, last_month)
+        # TechnicianGoal.fetch(month=) without user_id= returns a
+        # queryset (the whole roster's goals for that one month) --
+        # reused exactly as its own docstring says, not hand-rolled.
+        last_month_goals = {
+            g.user_id: g.goal_amount
+            for g in TechnicianGoal.fetch(tenant_id=tenant.id, month=last_month)
+        }
+        last_month_data = {}
+        for tech in technicians:
+            goal_amount = last_month_goals.get(tech['user_id'])
+            # No real goal row for this technician for last month at all
+            # -- or a real row with goal_amount 0 ("not set", same
+            # convention as every other goal_amount read in this
+            # project) -- correctly absent from the dict, never a
+            # fabricated pass or fail. A technician with a real goal but
+            # genuinely zero completed-job revenue last month is a
+            # different, REAL case (see _revenue_by_technician_for_month's
+            # own docstring) -- .get(user_id, 0.0) below deliberately
+            # defaults to a real 0, not "no data".
+            if not goal_amount or float(goal_amount) <= 0:
+                continue
+            revenue = float(last_month_revenue.get(tech['user_id'], 0.0))
+            last_month_data[tech['user_id']] = round((revenue / float(goal_amount)) * 100, 1)
+
     triggered = []
     for rule in rules:
         for tech in technicians:
-            actual = _actual_value(rule.rule_type, tech, team_avg_revenue)
+            actual = _actual_value(rule.rule_type, tech, team_avg_revenue, last_month_data)
             if actual is None:
                 continue  # no data this window for this technician -- not a trigger, not an error
 
