@@ -260,13 +260,26 @@ def get_technician_stats(tenant):
     than later. JobberTechnicianStatsView.get() below passes
     request.user.tenant.
 
-    Explicitly OUT of scope here (per TL): profit margin (blocked on a
-    wage-rate decision), "on pace"/projected year-end for BOTH monthly
-    and annual (pending TL -- needs real multi-month history that
-    doesn't exist yet), job history (separate endpoint, next round), and
-    monthly revenue trend chart (separate round). The 4 threshold-based
-    alerts previously deferred here now have a real home -- see
-    apps.alerts.
+    Explicitly OUT of scope here (per TL): "on pace"/projected year-end
+    for BOTH monthly and annual (pending TL -- needs real multi-month
+    history that doesn't exist yet), job history (separate endpoint,
+    next round), and monthly revenue trend chart (separate round). The
+    4 threshold-based alerts previously deferred here now have a real
+    home -- see apps.alerts.
+
+    profit_margin_percentage was ORIGINALLY built (2026-09-03, labor_
+    cost_profit_margin_proposal.md) against Jobber's own real per-entry
+    labour_rate. SUPERSEDED (2026-09-06, direct TL decision, no design
+    proposal): most real customers won't have that field filled in --
+    the same onboarding-burden concern that already ruled out Custom
+    Fields elsewhere in this project -- so the margin below no longer
+    reads labor_costs/_accumulate_technician_labor_cost() at all. That
+    function (and the underlying labour_rate model field/sync
+    widening/calculate_technician_labor_cost()) is left completely in
+    place, untouched, working code -- just no longer wired into THIS
+    number. See _accumulate_technician_callback_stats()'s own docstring
+    and the profit_margin_percentage block below for the real, current
+    formula.
     """
     if tenant is None:
         return dict(_NOT_CONNECTED_DATA)
@@ -294,12 +307,15 @@ def get_technician_stats(tenant):
 
     job_stats = _accumulate_technician_job_stats(archived_jobs)
     callback_stats = _accumulate_technician_callback_stats(archived_jobs)
-    # Approved 2026-09-03 (labor_cost_profit_margin_proposal.md) -- revenue
-    # population for the margin below is `revenue_totals` above (Top
-    # Earner's Job.total-attributed share), explicitly NOT the separate
-    # Total Revenue tile's Paid-invoices-only figure, per the approved
-    # resolution (consistency with Jobber's own native profit panel).
-    labor_costs = _accumulate_technician_labor_cost(archived_jobs)
+    # NOT called here (2026-09-06, superseded direct TL decision -- see
+    # this function's own docstring): _accumulate_technician_labor_cost()
+    # still exists, unchanged, and still works -- it's just no longer
+    # part of profit_margin_percentage's real formula below, so computing
+    # it here would be a real, wasted per-job cost for a value nobody
+    # reads. Revenue population for the margin below is still
+    # `revenue_totals` above (Top Earner's Job.total-attributed share),
+    # explicitly NOT the separate Total Revenue tile's Paid-invoices-only
+    # figure -- that part of the original resolution is unchanged.
     assigned_counts, archived_counts = _accumulate_completion_counts(tenant_id, period_start)
 
     # Current-month revenue, for goal progress -- calculate_top_earner()
@@ -390,17 +406,31 @@ def get_technician_stats(tenant):
             round(total_seconds / tracked_job_count) if tracked_job_count > 0 else None
         )
 
-        # New (2026-09-03, approved labor_cost_profit_margin_proposal.md).
-        # labor_cost is ABSENT (not a real 0) from labor_costs for a
-        # technician with no real, non-zero labour_rate anywhere in the
-        # window -- None here, never a fabricated 100% margin. revenue is
-        # the SAME Top-Earner-attributed figure used for revenue_per_hour
-        # above, per the approved resolution -- not Total Revenue's
-        # separate Paid-invoices-only population.
-        labor_cost = labor_costs.get(tech.id)
+        # SUPERSEDED FORMULA (2026-09-06, direct TL decision -- see this
+        # function's own docstring for why labour_rate was dropped).
+        # profit_margin_percentage is now (revenue - callback_dollars_
+        # lost) / revenue x 100 -- reusing revenue_totals and
+        # _accumulate_technician_callback_stats()'s own output directly,
+        # no new calculation. This is deliberately NOT a full accounting
+        # margin (no materials/other costs) -- it specifically measures
+        # how much of this technician's revenue was eaten by real
+        # callbacks (see TechnicianCard's own tooltip for the same
+        # clarification shown to the customer).
+        #
+        # None (never a divide-by-zero or a fabricated 0%) when revenue
+        # is 0 -- same "no data != 0" convention as every other ratio
+        # here. Zero real callbacks this window -> callback_dollars_lost
+        # is a real 0.0 and has_unknown_callback_cost is False -> a
+        # clean, confident 100%, not marked as partial. A real callback
+        # with has_unknown_callback_cost=True still computes a real
+        # number from whatever KNOWN cost exists (callback_dollars_lost
+        # already excludes unknown-cost callbacks entirely -- see that
+        # function's own docstring) -- has_unknown_callback_cost itself
+        # is what TechnicianCard reuses to mark this SAME number as a
+        # minimum, not a new backend flag.
         profit_margin_percentage = (
-            round(((revenue - float(labor_cost)) / revenue) * 100, 1)
-            if labor_cost is not None and revenue > 0
+            round(((revenue - callback_dollars_lost) / revenue) * 100, 1)
+            if revenue > 0
             else None
         )
 
@@ -462,10 +492,11 @@ def get_technician_stats(tenant):
             # a real, silent mismatch, not just a naming nitpick.
             'completion_jobs_assigned': assigned,
             'completion_jobs_archived': archived_count,
-            # New (2026-09-03, approved labor_cost_profit_margin_proposal.md)
-            # -- null (not 0%) when this technician has no real, non-zero
-            # labour_rate data anywhere in the window. See
-            # _accumulate_technician_labor_cost()'s own docstring.
+            # (revenue - callback_dollars_lost) / revenue x 100 (2026-09-06,
+            # superseded direct TL decision -- see the computation above for
+            # the full reasoning). null (not 0%) only when revenue itself is
+            # 0 this window -- never a divide-by-zero or a fabricated
+            # number.
             'profit_margin_percentage': profit_margin_percentage,
             'team_revenue_share_percentage': team_revenue_share_percentage,
             # New (2026-08-31, approved) -- backend-only this round, no
