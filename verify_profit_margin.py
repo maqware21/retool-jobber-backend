@@ -1,4 +1,11 @@
 """
+SUPERSEDED (2026-09-06, direct TL decision) -- profit_margin_percentage
+no longer uses labour_rate/labor cost at all (see technician_stats.py's
+own current docstring); this script's recomputation below tests a
+formula the endpoint no longer runs. Kept as the historical record of
+the original labour_rate-based verification. See
+verify_profit_margin_callback_formula.py for the current, real check.
+
 Real verification (2026-09-03) for the new profit_margin_percentage in
 get_technician_stats() -- approved labor_cost_profit_margin_proposal.md.
 Run via `python manage.py shell < verify_profit_margin.py`.
