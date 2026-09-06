@@ -29,6 +29,10 @@ _NOT_CONNECTED_DATA = {
     'jobs_completed': None,
     'avg_job_duration_seconds': None,
     'top_earner': None,
+    # New (2026-09-06, Revenue Health Phase 1) -- see
+    # _local_electricians_summary_response()'s own comment for the
+    # confirmed-deliberate population choice.
+    'avg_job_value': None,
     'period_months': PERIOD_MONTHS,
     'last_synced_at': None,
 }
@@ -485,7 +489,10 @@ def _local_electricians_summary_response(user):
     Local-table source for the Electricians panel's KPI tiles — ALL 4 mock
     tiles (Total Revenue, Jobs Completed, Avg Job Duration, Top Earner)
     are now real, replaced in place with no visual distinction from the
-    original mock version, per TL decision.
+    original mock version, per TL decision. avg_job_value (2026-09-06,
+    Revenue Health Phase 1) is a 5th field added for that page's own "Avg
+    Job Value" KPI card, reusing this SAME endpoint/queryset rather than a
+    new one.
 
     Calls ensure_fresh(require_complete=True) first — same reasoning
     already established for Accounts/Employees: a Sum/count/average
@@ -587,6 +594,20 @@ def _local_electricians_summary_response(user):
         # dict unexpectedly (it also guards this itself, belt-and-braces).
         top_earner = None
 
+    # New (2026-09-06, Revenue Health Phase 1, confirmed reuse -- no new
+    # query, no new entity). Same archived-jobs population as jobs_
+    # completed/avg_job_duration_seconds/top_earner above -- the fourth
+    # consumer of this exact queryset, not a new one. Deliberately job.total
+    # averaged directly, NOT total_revenue / jobs_completed -- those are 2
+    # DIFFERENT populations (Paid invoices vs. every archived job regardless
+    # of invoice status), and dividing across them would produce a
+    # population-inconsistent number, same class of mismatch already
+    # confirmed between Top Earner and Total Revenue. None (not 0) when
+    # there are no archived jobs in the window at all -- never a fabricated
+    # $0 average.
+    job_totals = [job.total for job in archived_jobs]
+    avg_job_value = (float(sum(job_totals)) / len(job_totals)) if job_totals else None
+
     data = {
         'connected': True,
         # Genuinely zero (no Paid invoices in the period) is a real,
@@ -597,6 +618,7 @@ def _local_electricians_summary_response(user):
         'jobs_completed': jobs_completed,
         'avg_job_duration_seconds': avg_job_duration_seconds,
         'top_earner': top_earner,
+        'avg_job_value': round(avg_job_value, 2) if avg_job_value is not None else None,
         'period_months': PERIOD_MONTHS,
         'last_synced_at': fresh['last_synced_at'].isoformat() if fresh['last_synced_at'] else None,
     }
