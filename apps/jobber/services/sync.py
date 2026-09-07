@@ -270,8 +270,16 @@ def sync_jobs(account, tenant, deadline, clients_complete):
     # _client_tags_display import above, jobs.py side of the cycle this time.
     from apps.jobber.api.jobs import _format_address, _humanize_status, _job_service_type
 
+    # first=client.SYNC_JOBS_PAGE_SIZE (2026-09-07, URGENT fix) -- NOT the
+    # shared FETCH_ALL_PAGE_SIZE default every other synced entity still
+    # uses. See that constant's own comment in client.py for the real,
+    # confirmed diagnostic behind this: _SYNC_JOBS_QUERY's per-job nested
+    # cost (visits/timeSheetEntries/jobCosting/lineItems) now exceeds
+    # Jobber's query-cost ceiling at the shared page size, for this entity
+    # only -- Clients/Users/Invoices are not implicated and stay untouched.
     nodes, own_complete = client.fetch_all_pages_bounded(
         client.fetch_jobs_for_sync, account, 'fetch_jobs_for_sync', deadline,
+        first=client.SYNC_JOBS_PAGE_SIZE,
     )
 
     # New (2026-09-04, approved callback_detection_trigger_fix_proposal.md)
