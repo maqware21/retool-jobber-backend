@@ -211,6 +211,25 @@ class JobberJob(DateModel):
     # gets the same float-to-Decimal treatment as total.
     labour_duration_seconds = models.IntegerField(null=True, blank=True)
     labour_cost = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    # From Jobber's jobCosting { lineItemCost } -- added 2026-09-07,
+    # approved revenue_composition_expense_profit_proposal.md, for Revenue
+    # Health's Composition chart. A DIFFERENT, confirmed-real field from
+    # labour_cost above (already confirmed broken/always 0) -- this is the
+    # sum of each line item's real Unit Cost x quantity, confirmed genuine
+    # and non-circular via a live test job with a deliberately different
+    # cost vs price (Unit Cost 200 x qty 2 = 400, Unit Price 500 x qty 2 =
+    # 1000 -- live API returned lineItemCost=400.0, an exact match to
+    # Jobber's own dashboard). Same float-to-Decimal treatment as total/
+    # labour_cost. Null only if Jobber itself returns null (not expected in
+    # practice -- every real job checked so far returns a real number, 0.0
+    # for a job with no line items or no cost entered -- but stored
+    # defensively nullable, same convention as every other synced money
+    # field here). This account's own real historical jobs happen to show
+    # lineItemCost == total on every one (cost=price, zero measured
+    # profit) -- a real property of this account's data, not a limitation
+    # of the field itself; see PROJECT_CONTEXT.md's 2026-09-07 update for
+    # the full finding and the 3 named, unconfirmed reasons why.
+    line_item_cost = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
     # From Jobber's own completedAt field (ISO8601DateTime, nullable in the
     # schema). Confirmed via live cross-check (2026-08-16, 3 real archived
     # jobs): this tracks when the INVOICING loop closes (invoice

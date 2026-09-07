@@ -440,6 +440,13 @@ query GetClients($first: Int!, $after: String) {
 # for JobberTimeSheetEntry.labour_rate — a REAL, native per-entry Jobber
 # wage rate, confirmed via verify_labour_rate_field.py; a DIFFERENT field
 # from jobCosting.labourCost above (already confirmed broken/always 0).
+# lineItemCost added 2026-09-07 (approved revenue_composition_expense_
+# profit_proposal.md) for JobberJob.line_item_cost — one more scalar
+# field on the jobCosting object already being fetched here for every
+# job, not a new query or a new per-job cost category. Confirmed
+# genuine and non-circular (see PROJECT_CONTEXT.md's 2026-09-07 update);
+# a DIFFERENT field from jobCosting.expenseCost, which stays confirmed
+# dead (0.0 on every job checked) and is deliberately NOT requested here.
 _SYNC_JOBS_QUERY = """
 query GetJobsForSync($first: Int!, $after: String) {
   jobs(first: $first, after: $after) {
@@ -460,7 +467,7 @@ query GetJobsForSync($first: Int!, $after: String) {
           linkedProductOrService { name }
         }
       }
-      jobCosting { labourCost labourDuration }
+      jobCosting { labourCost labourDuration lineItemCost }
       visits(first: 10) {
         nodes {
           id
