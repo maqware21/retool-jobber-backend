@@ -333,6 +333,7 @@ def sync_jobs(account, tenant, deadline, clients_complete):
                 'address': _format_address(node.get('property')),
                 'labour_duration_seconds': costing.get('labourDuration'),
                 'labour_cost': _to_decimal(costing.get('labourCost')),
+                'line_item_cost': _to_decimal(costing.get('lineItemCost')),
                 'synced_at': timezone.now(),
                 'is_active': True,
             },

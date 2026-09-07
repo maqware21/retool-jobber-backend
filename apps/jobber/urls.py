@@ -13,6 +13,7 @@ from apps.jobber.api.oauth import (
     JobberDisconnectView,
     JobberStatusView,
 )
+from apps.jobber.api.revenue_composition import JobberRevenueCompositionView
 from apps.jobber.api.technician_stats import JobberTechnicianStatsView
 from apps.jobber.api.webhook import JobberWebhookView
 
@@ -35,6 +36,7 @@ urlpatterns = [
     path('electricians-summary/', JobberElectriciansSummaryView.as_view(), name='electricians-summary'),
     path('technician-stats/', JobberTechnicianStatsView.as_view(), name='technician-stats'),
     path('monthly-revenue/', JobberMonthlyRevenueView.as_view(), name='monthly-revenue'),
+    path('revenue-composition/', JobberRevenueCompositionView.as_view(), name='revenue-composition'),
     path('duration-by-type/', JobberDurationByTypeView.as_view(), name='duration-by-type'),
 
     # ── Webhooks (public — authenticated via HMAC-SHA256 signature) ────────────
