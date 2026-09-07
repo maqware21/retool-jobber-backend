@@ -543,6 +543,39 @@ def fetch_job_visits_for_callback_detection(account, job_id):
 FETCH_ALL_PAGE_SIZE = 25
 FETCH_ALL_MAX_PAGES = 20
 
+# URGENT fix (2026-09-07) -- confirmed via diagnose_sync_jobs_query_cost.py
+# against the real connected account: a real request at FETCH_ALL_PAGE_SIZE
+# (25) for fetch_jobs_for_sync() now costs requestedQueryCost=10380,
+# rejected outright against Jobber's 10000 ceiling (actualQueryCost=0) --
+# real jobs have accumulated increasing nested visits/timeSheetEntries
+# over many testing rounds, and _SYNC_JOBS_QUERY's per-job cost (lineItems,
+# jobCosting, visits+assignedUsers, timeSheetEntries, all nested) is now too
+# high at this page size. This broke ALL of this account's synced data,
+# not just one entity -- sync_tenant() calls sync_jobs() unconditionally
+# whenever 'jobs'/'visits'/'timesheet_entries' are requested, and a
+# JobberAPIError here aborts the whole sync pass.
+#
+# CONFIRMED (not assumed) before choosing where to fix this: grepped every
+# real call site of fetch_all_pages()/fetch_all_pages_bounded() in this
+# project -- Clients, Users, and Invoices (both the sync engine's own
+# fetch_clients/fetch_users/fetch_invoices AND the live-proxy Accounts/
+# Employees endpoints' fetch_jobs/fetch_invoices/fetch_users) all rely on
+# FETCH_ALL_PAGE_SIZE's shared default, none pass an explicit override.
+# Real diagnostic results at OTHER sizes (same account, same real request):
+# first=15 -> requestedQueryCost=6230 (succeeded), first=10 -> 4155
+# (succeeded), first=5 -> 2080 (succeeded). Lowering the SHARED constant
+# would touch Clients/Users/Invoices too, none of which are implicated in
+# this failure -- only Jobs' own query has grown expensive. Fix: a
+# SEPARATE, smaller page size passed explicitly at fetch_jobs_for_sync()'s
+# own call site in sync_jobs() only -- every other entity's real,
+# still-safe page size is completely untouched, still defaulting to
+# FETCH_ALL_PAGE_SIZE. 10 chosen (not 15) for real headroom under the
+# 10000 ceiling as this account's real jobs keep accumulating more nested
+# visits/timesheet entries over time, without going small enough (5) to
+# meaningfully multiply the real total request count for no added safety
+# margin that matters at this account's current scale.
+SYNC_JOBS_PAGE_SIZE = 10
+
 
 def fetch_all_pages(fetch_fn, account, label, first=FETCH_ALL_PAGE_SIZE, max_pages=FETCH_ALL_MAX_PAGES):
     """
