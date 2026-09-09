@@ -8,7 +8,7 @@ from django.utils import timezone
 from rest_framework import status
 from rest_framework.views import APIView
 
-from apps.jobber.models import JobberAccount, JobberInvoice, JobberJob, JobberUser
+from apps.jobber.models import JobberAccount, JobberInvoice, JobberJob, JobberTimeSheetEntry, JobberUser
 from apps.jobber.services.sync import ensure_fresh
 from helpers.api_exception import validator_errors
 from helpers.messages import MESSAGES
@@ -38,6 +38,7 @@ _NOT_CONNECTED_DATA = {
     # real 0 -- see _local_electricians_summary_response()'s own comment
     # for why a real, connected 0 is a different, valid answer.
     'new_customers': None,
+    'labor_cost': None,
     'period_months': PERIOD_MONTHS,
     'last_synced_at': None,
 }
@@ -646,6 +647,54 @@ def _local_electricians_summary_response(user):
         if row['first_job_at'] is not None and row['first_job_at'] >= period_start
     )
 
+    # Labor Cost (2026-09-09, approved labor_cost_kpi_proposal.md) -- a
+    # plain PER-ENTRY sum (hours x that entry's own real labour_rate),
+    # over the SAME archived_jobs/completed_at-windowed population as
+    # Jobs Completed/Avg Job Duration/Avg Job Value above (job__in=
+    # archived_jobs, not a re-derived filter, so this can never silently
+    # drift from that population). Only real entries with a non-null,
+    # non-zero labour_rate are included -- "0 = not entered," same
+    # convention as everywhere else this field is read.
+    #
+    # Deliberately NOT the existing (currently unused)
+    # calculate_technician_labor_cost()/_accumulate_technician_labor_cost()
+    # pair from the earlier, superseded per-technician Profit Margin work
+    # -- those require ONE unambiguous rate per (job, technician) pair,
+    # bailing to None for the whole pair if a technician's entries on one
+    # job ever show 2+ DIFFERENT real rates. That would wrongly exclude a
+    # real, legitimate case here: a technician whose rate changed mid-job
+    # (a raise) has each entry already carrying its own correct rate --
+    # a plain per-entry sum handles this correctly where the old
+    # merged-per-user approach would silently drop that job/technician's
+    # cost entirely.
+    #
+    # KNOWN, UNDECIDED EDGE CASE (not resolved here, per explicit
+    # instruction) -- this project has already confirmed real overlapping
+    # timesheet entries exist for at least one technician on one job (the
+    # "Job 2" case, a stop/restart mistake, handled via interval-merging
+    # for DURATION purposes elsewhere in this file). A plain per-entry sum
+    # here would count BOTH overlapping entries' cost, potentially
+    # double-counting pay for the same overlapping wall-clock time.
+    # Whether that's correct (a real payroll mistake genuinely costs the
+    # business twice, if both entries were actually paid) or should be
+    # deduplicated the same way duration is, is a real, open question --
+    # deliberately NOT resolved here, since merging would reintroduce the
+    # exact rate-change-exclusion problem named above. Revisit if/when
+    # this is ever actually observed affecting a real labor_cost figure.
+    labor_cost_entries = JobberTimeSheetEntry.objects.filter(
+        tenant_id=tenant_id, is_active=True, job__in=archived_jobs,
+    ).exclude(labour_rate__isnull=True).exclude(labour_rate=0)
+    # Explicit guard, NOT a bare sum() -- sum() of an empty generator is
+    # 0, which would be a FABRICATED $0 labor cost, indistinguishable
+    # from a real, confirmed-zero one. None here means "no usable rate
+    # data exists yet," per TL's own framing -- never silently coalesced
+    # to 0.
+    labor_cost = (
+        sum(Decimal(str(e.final_duration_seconds / 3600)) * e.labour_rate for e in labor_cost_entries)
+        if labor_cost_entries.exists()
+        else None
+    )
+
     data = {
         'connected': True,
         # Genuinely zero (no Paid invoices in the period) is a real,
@@ -661,6 +710,12 @@ def _local_electricians_summary_response(user):
         # is a real, honest count, never null -- same "no data != a
         # missing field" convention as jobs_completed above.
         'new_customers': new_customers,
+        # None (never a fabricated 0) when zero real entries anywhere in
+        # the window have a usable rate -- see labor_cost_entries' own
+        # comment above for the explicit guard. Otherwise a Decimal cast
+        # to float, same convention as every other stored money figure
+        # here.
+        'labor_cost': float(labor_cost) if labor_cost is not None else None,
         'period_months': PERIOD_MONTHS,
         'last_synced_at': fresh['last_synced_at'].isoformat() if fresh['last_synced_at'] else None,
     }
