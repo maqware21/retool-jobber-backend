@@ -3,7 +3,7 @@ from datetime import timedelta
 from decimal import Decimal
 
 from dateutil.relativedelta import relativedelta
-from django.db.models import Sum
+from django.db.models import Min, Sum
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.views import APIView
@@ -33,6 +33,11 @@ _NOT_CONNECTED_DATA = {
     # _local_electricians_summary_response()'s own comment for the
     # confirmed-deliberate population choice.
     'avg_job_value': None,
+    # New (2026-09-09, approved new_customers_metric_proposal.md) -- None
+    # here specifically because the whole account isn't connected, NOT a
+    # real 0 -- see _local_electricians_summary_response()'s own comment
+    # for why a real, connected 0 is a different, valid answer.
+    'new_customers': None,
     'period_months': PERIOD_MONTHS,
     'last_synced_at': None,
 }
@@ -608,6 +613,39 @@ def _local_electricians_summary_response(user):
     job_totals = [job.total for job in archived_jobs]
     avg_job_value = (float(sum(job_totals)) / len(job_totals)) if job_totals else None
 
+    # New Customers (2026-09-09, approved new_customers_metric_proposal.md,
+    # Option b -- a client's earliest-ever real job, NOT Client.createdAt,
+    # per that proposal's own reasoning: createdAt is a CRM record-
+    # creation timestamp, not a "we gained new business" one). ALL job
+    # statuses -- deliberately NOT archived_jobs above -- a brand-new
+    # client's very first job might still be Upcoming/Active, not yet
+    # archived; restricting to archived-only would systematically
+    # UNDERCOUNT genuinely new clients whose first job hasn't completed
+    # yet. Uses the client's FULL, unwindowed job history (Min() across
+    # EVERY real job they've ever had, not just this period's) -- "new"
+    # is a property of the client's real, earliest event, which requires
+    # looking past this window, not just within it.
+    #
+    # Sync-completeness note: this reuses the SAME ensure_fresh(
+    # require_complete=True) call above ('jobs' is already requested for
+    # every other field on this endpoint) -- no new entity, no new gating
+    # needed. A real, named caveat from the approved proposal still
+    # applies: if this client's OWN earliest jobs were never fully synced
+    # (e.g. a historical max_pages cap), Min(jobber_created_at) could be
+    # wrong (too recent) for that one client -- not solvable by gating on
+    # 'jobs' completeness alone, since that only guarantees THIS pass's
+    # pull reached hasNextPage: false, not that every historical page
+    # ever has been pulled. Flagged, not silently assumed away.
+    first_job_dates = (
+        JobberJob.objects.filter(tenant_id=tenant_id, is_active=True)
+        .values('client_id')
+        .annotate(first_job_at=Min('jobber_created_at'))
+    )
+    new_customers = sum(
+        1 for row in first_job_dates
+        if row['first_job_at'] is not None and row['first_job_at'] >= period_start
+    )
+
     data = {
         'connected': True,
         # Genuinely zero (no Paid invoices in the period) is a real,
@@ -619,6 +657,10 @@ def _local_electricians_summary_response(user):
         'avg_job_duration_seconds': avg_job_duration_seconds,
         'top_earner': top_earner,
         'avg_job_value': round(avg_job_value, 2) if avg_job_value is not None else None,
+        # Genuinely 0 (no client's earliest-ever job fell in this window)
+        # is a real, honest count, never null -- same "no data != a
+        # missing field" convention as jobs_completed above.
+        'new_customers': new_customers,
         'period_months': PERIOD_MONTHS,
         'last_synced_at': fresh['last_synced_at'].isoformat() if fresh['last_synced_at'] else None,
     }
