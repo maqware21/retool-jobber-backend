@@ -39,6 +39,12 @@ _NOT_CONNECTED_DATA = {
     # for why a real, connected 0 is a different, valid answer.
     'new_customers': None,
     'labor_cost': None,
+    # New (2026-09-09) -- None here specifically because the whole
+    # account isn't connected, NOT a real $0 owed -- see
+    # _local_electricians_summary_response()'s own comment for why a
+    # real, connected $0 (every invoice fully paid) is a different,
+    # valid answer.
+    'outstanding': None,
     'period_months': PERIOD_MONTHS,
     'last_synced_at': None,
 }
@@ -695,6 +701,44 @@ def _local_electricians_summary_response(user):
         else None
     )
 
+    # Outstanding (2026-09-09) -- real remaining balance across genuinely
+    # unpaid invoices. Draft excluded, same "a draft hasn't been sent
+    # yet, so it isn't real money" reasoning already established for the
+    # Invoices panel's own Total Billed/Pending buckets (_compute_summary()
+    # in invoices.py).
+    #
+    # DELIBERATELY DIFFERENT from that panel's own "Pending" bucket in 2
+    # real ways, flagged rather than silently mirrored:
+    #  1. Field: balance, NOT amount. Total and balance are genuinely
+    #     distinct (a partially paid invoice has balance < amount, per
+    #     invoices.py's own comment) -- "Outstanding" means money still
+    #     actually owed, which is balance, not the invoice's original
+    #     face value.
+    #  2. Scope: balance__gt=0 directly, not tied to the single 'Pending'
+    #     status label -- this also naturally includes 'Overdue' invoices
+    #     (still real, unpaid money) and is robust to a 'Paid'-labeled
+    #     invoice that somehow still carries a residual balance (a real,
+    #     unconfirmed edge case, not assumed away): balance__gt=0 catches
+    #     real unpaid money regardless of what its status label happens
+    #     to say, rather than trusting the label alone.
+    #
+    # Deliberately NOT windowed by period_start/PERIOD_MONTHS, unlike
+    # total_revenue above -- "Outstanding" is a POINT-IN-TIME snapshot of
+    # money currently owed (a balance-sheet concept), not a per-period
+    # flow (an income-statement concept). An invoice issued 8 months ago
+    # that's still unpaid is still real, currently outstanding money;
+    # excluding it for being "outside the window" would UNDERSTATE real
+    # money owed, not just report it differently.
+    #
+    # Sum() returns None for an empty/no-match queryset -- coalesced to a
+    # real 0.0 here, same as total_revenue above: every real invoice
+    # fully paid (or none exist at all) is a genuine, honest $0 owed, not
+    # "no data" -- never confused with the whole account being
+    # disconnected (that's the separate _NOT_CONNECTED_DATA path).
+    outstanding = JobberInvoice.objects.filter(
+        tenant_id=tenant_id, is_active=True,
+    ).exclude(status_display='Draft').filter(balance__gt=0).aggregate(total=Sum('balance'))['total']
+
     data = {
         'connected': True,
         # Genuinely zero (no Paid invoices in the period) is a real,
@@ -716,6 +760,10 @@ def _local_electricians_summary_response(user):
         # to float, same convention as every other stored money figure
         # here.
         'labor_cost': float(labor_cost) if labor_cost is not None else None,
+        # Genuinely 0.0 (every real invoice fully paid, or none exist)
+        # is a real, honest answer, never null -- see outstanding's own
+        # comment above.
+        'outstanding': float(outstanding) if outstanding is not None else 0.0,
         'period_months': PERIOD_MONTHS,
         'last_synced_at': fresh['last_synced_at'].isoformat() if fresh['last_synced_at'] else None,
     }
