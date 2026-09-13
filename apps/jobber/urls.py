@@ -12,6 +12,7 @@ from apps.jobber.api.oauth import (
     JobberConnectView,
     JobberDisconnectView,
     JobberStatusView,
+    JobberSyncNowView,
 )
 from apps.jobber.api.revenue_composition import JobberRevenueCompositionView
 from apps.jobber.api.technician_stats import JobberTechnicianStatsView
@@ -27,6 +28,7 @@ urlpatterns = [
     # ── Connection management ───────────────────────────────────────────────────
     path('status/', JobberStatusView.as_view(), name='status'),
     path('disconnect/', JobberDisconnectView.as_view(), name='disconnect'),
+    path('sync-now/', JobberSyncNowView.as_view(), name='sync-now'),
 
     # ── Data (live proxy — no local caching) ────────────────────────────────────
     path('jobs/', JobberJobsView.as_view(), name='jobs'),

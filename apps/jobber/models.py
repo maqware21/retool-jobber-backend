@@ -624,6 +624,16 @@ class JobberSyncRun(models.Model):
     jobs_synced = models.IntegerField(default=0)
     visits_synced = models.IntegerField(default=0)
     invoices_synced = models.IntegerField(default=0)
+    # New (2026-09-15, approved manual_sync_and_faster_staleness_
+    # proposal.md) -- closes a real, previously-deliberate gap: these 2
+    # entities were always synced (see sync_jobs()'s docstring for
+    # timesheet_entries, sync_expenses() for expenses) but never had
+    # their own persisted count column, unlike the 5 above. Needed now
+    # so the new manual "Sync Now" endpoint's real response message can
+    # honestly report a real expense/timesheet-entry count instead of
+    # silently omitting 2 of the 7 real entities this app now syncs.
+    timesheet_entries_synced = models.IntegerField(default=0)
+    expenses_synced = models.IntegerField(default=0)
 
     class Meta:
         db_table = 'jobber_sync_runs'

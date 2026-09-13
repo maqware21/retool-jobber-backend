@@ -20,6 +20,7 @@ from apps.jobber.models import (
 )
 from apps.jobber.services import client
 from apps.jobber.services import state as state_service
+from apps.jobber.services.sync import sync_tenant
 from apps.tenants.models import Tenant
 from apps.users.models import User
 from helpers.api_exception import validator_errors
@@ -275,3 +276,96 @@ class JobberDisconnectView(APIView):
         except Exception as ve:
             success, msg, st = validator_errors(ve)
             return api_response_parser(data=data, message=msg, status=st, success=success)
+
+
+# Real, honest per-outcome message (2026-09-15, approved manual_sync_and_
+# faster_staleness_proposal.md) -- NOT a single generic string. The
+# customer-facing frontend still builds its own real message from the
+# per-entity counts below; this is the response envelope's own top-level
+# `message`, which needed to stop implying success for a real 'partial'/
+# 'failed' sync outcome too.
+_SYNC_NOW_STATUS_MESSAGES = {
+    JOBBER_SYNC_STATUS[1][0]: 'Sync completed successfully.',  # 'success'
+    JOBBER_SYNC_STATUS[2][0]: 'Sync completed partially — some data may be stale.',  # 'partial'
+    JOBBER_SYNC_STATUS[3][0]: 'Sync failed.',  # 'failed'
+}
+
+
+class JobberSyncNowView(APIView):
+    """
+    POST /v1/jobber/sync-now/
+    Manually triggers a real, synchronous sync_tenant() call for the
+    customer's tenant — reuses the exact same sync engine every
+    automatic, staleness-triggered sync already uses (ensure_fresh()),
+    no new sync logic. entities=None (the default) means a full sync of
+    ALL_ENTITIES, same as "sync everything."
+
+    Blocks for the real duration of the sync — bounded by the existing
+    SYNC_WALL_CLOCK_CEILING, the same ceiling every other synchronous
+    sync trigger in this codebase already relies on — and returns the
+    REAL JobberSyncRun result, never a canned success message regardless
+    of outcome.
+
+    Concurrency: sync_tenant() itself calls _claim_run() internally,
+    tenant-scoped via select_for_update() — the exact same lock every
+    automatic staleness-triggered sync already goes through. A
+    double-click, or this firing at the same moment as an automatic
+    sync, both resolve correctly with zero changes needed here: whichever
+    call's transaction commits first does the real work; the other
+    genuinely gets back the same current row rather than double-syncing
+    (see manual_sync_and_faster_staleness_proposal.md's own trace).
+
+    HTTP-level success=True/200 even for a real 'partial'/'failed' SYNC
+    outcome — this endpoint call itself did what was asked (ran a real
+    sync and is truthfully reporting it); that's a domain-level result,
+    not an API-level error, same distinction already drawn elsewhere in
+    this codebase (e.g. a `sync_warning` on other endpoints doesn't flip
+    their own success/status either). Only a genuinely disconnected
+    tenant or an unexpected exception gets a non-200/success=False,
+    mirroring JobberDisconnectView's own precedent exactly.
+    """
+    permission_classes = [CustomerPermission]
+
+    def post(self, request):
+        data = {}
+        try:
+            account = self._account_for(request.user)
+            if account is None:
+                return api_response_parser(
+                    data=data,
+                    message=MESSAGES['JOBBER_NOT_CONNECTED'],
+                    status=status.HTTP_404_NOT_FOUND,
+                    success=False,
+                )
+
+            run = sync_tenant(account)
+
+            data = {
+                'status': run.status,
+                'started_at': run.started_at.isoformat() if run.started_at else None,
+                'finished_at': run.finished_at.isoformat() if run.finished_at else None,
+                'error_message': run.error_message,
+                'clients_synced': run.clients_synced,
+                'users_synced': run.users_synced,
+                'jobs_synced': run.jobs_synced,
+                'visits_synced': run.visits_synced,
+                'invoices_synced': run.invoices_synced,
+                'timesheet_entries_synced': run.timesheet_entries_synced,
+                'expenses_synced': run.expenses_synced,
+            }
+            message = _SYNC_NOW_STATUS_MESSAGES.get(run.status, 'Sync finished.')
+            return api_response_parser(
+                data=data,
+                message=message,
+                status=status.HTTP_200_OK,
+                success=True,
+            )
+        except Exception as ve:
+            success, msg, st = validator_errors(ve)
+            return api_response_parser(data=data, message=msg, status=st, success=success)
+
+    @staticmethod
+    def _account_for(user):
+        if not user.tenant_id:
+            return None
+        return JobberAccount.objects.filter(tenant_id=user.tenant_id, is_active=True).first()
