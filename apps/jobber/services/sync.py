@@ -48,10 +48,15 @@ SYNC_WALL_CLOCK_CEILING = timedelta(seconds=25)
 
 ALL_ENTITIES = ('clients', 'users', 'jobs', 'visits', 'invoices', 'timesheet_entries', 'expenses')
 
-# ensure_fresh()'s staleness threshold — the design doc's proposed default
-# (20 minutes, inside the 15-30 min window already flagged elsewhere in this
-# codebase), not yet measured against real usage.
-STALENESS_THRESHOLD = timedelta(minutes=20)
+# ensure_fresh()'s staleness threshold. Originally the design doc's
+# proposed default (20 minutes, inside the 15-30 min window already
+# flagged elsewhere in this codebase). Lowered to 10 minutes (2026-09-15,
+# approved manual_sync_and_faster_staleness_proposal.md) alongside the
+# new manual "Sync Now" trigger — a shorter automatic window plus an
+# on-demand manual one together mean a customer waits less, either way,
+# for fresher local data. Single source of this constant — confirmed via
+# grep, no duplicated copy anywhere else in the codebase.
+STALENESS_THRESHOLD = timedelta(minutes=10)
 
 # Callback-detection window (2026-08-30, per PART A of the approved
 # addition to callback_hours_design.md) — the single, named home of the
@@ -1014,13 +1019,6 @@ def sync_expenses(account, tenant, deadline):
 
 
 def _finish_run(run, wanted, counts, had_failure, error_message):
-    # NOTE: JobberSyncRun has no timesheet_entries_synced column (not added
-    # this round — Part A's scope was the new entity + sync logic only, see
-    # PROJECT_CONTEXT.md), and — same precedent, 2026-09-14 — no
-    # expenses_synced column either. any_progress/all_complete below still
-    # work correctly for both (they iterate `wanted`/`counts` generically,
-    # no field-name dependency) — only the per-entity count persisted onto
-    # the JobberSyncRun row is skipped for these two entities.
     any_progress = any(counts.get(e, {}).get('count', 0) > 0 for e in wanted)
     all_complete = bool(wanted) and all(counts.get(e, {}).get('complete') for e in wanted)
 
@@ -1044,6 +1042,12 @@ def _finish_run(run, wanted, counts, had_failure, error_message):
     run.jobs_synced = counts.get('jobs', {}).get('count', run.jobs_synced)
     run.visits_synced = counts.get('visits', {}).get('count', run.visits_synced)
     run.invoices_synced = counts.get('invoices', {}).get('count', run.invoices_synced)
+    # New (2026-09-15, approved manual_sync_and_faster_staleness_
+    # proposal.md) -- closes the real gap named in the prior version of
+    # this comment: these 2 entities were always synced but never
+    # persisted their own count. Same pattern as the 5 above.
+    run.timesheet_entries_synced = counts.get('timesheet_entries', {}).get('count', run.timesheet_entries_synced)
+    run.expenses_synced = counts.get('expenses', {}).get('count', run.expenses_synced)
     run.save()
 
 
