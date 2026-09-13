@@ -424,6 +424,40 @@ query GetClients($first: Int!, $after: String) {
 """
 
 
+# New for the sync engine (2026-09-14, approved cost_breakdown_dynamic_
+# categories_proposal.md) — Query.expenses is a real, standalone,
+# root-level connection (confirmed live via introspection AND a real
+# fetch — see verify_query_expenses_shape_and_cost.py's own output,
+# requestedQueryCost=205/actualQueryCost=13 for this account's one real
+# expense), unlike Visits/TimeSheetEntries, which have no such
+# standalone query and must be derived from nested Job data. Only the
+# fields CONFIRMED to exist on Expense are requested here (title,
+# description, date, total, linkedJob{id}) — accounting codes/
+# categories are NOT requested because they were exhaustively confirmed
+# ABSENT from the real schema (no such field or type exists anywhere;
+# see PROJECT_CONTEXT.md's dated entry) — this is not an oversight.
+# `filter`/`searchTerm` args exist on Query.expenses (confirmed via
+# introspection) but are deliberately NOT used here — their real input
+# shape (ExpenseFilterAttributes) was never introspected, and local
+# filtering by the already-confirmed `incurred_at` field after syncing
+# is both simpler and avoids one more live-schema guess.
+_EXPENSES_QUERY = """
+query GetExpenses($first: Int!, $after: String) {
+  expenses(first: $first, after: $after) {
+    nodes {
+      id
+      title
+      description
+      date
+      total
+      linkedJob { id }
+    }
+    pageInfo { hasNextPage endCursor }
+  }
+}
+"""
+
+
 # Sync-only — see the comment on _JOBS_QUERY above for why this isn't just
 # _JOBS_QUERY widened in place. Adds jobCosting (for JobberJob.labour_cost /
 # labour_duration_seconds), each visit's own id (for JobberVisit.jobber_id
@@ -739,6 +773,21 @@ def fetch_users(account, first=25, after=None):
     """
     data = execute(account, _USERS_QUERY, {'first': first, 'after': after})
     return (data or {}).get('users') or {
+        'nodes': [],
+        'pageInfo': {'hasNextPage': False, 'endCursor': None},
+    }
+
+
+def fetch_expenses(account, first=25, after=None):
+    """
+    Return the raw ``expenses`` connection for ``account``:
+    ``{'nodes': [...], 'pageInfo': {'hasNextPage': ..., 'endCursor': ...}}``.
+
+    Sync-only (2026-09-14) — not called by any live-proxy view. Raises
+    JobberAPIError on failure like every other call through ``execute()``.
+    """
+    data = execute(account, _EXPENSES_QUERY, {'first': first, 'after': after})
+    return (data or {}).get('expenses') or {
         'nodes': [],
         'pageInfo': {'hasNextPage': False, 'endCursor': None},
     }
