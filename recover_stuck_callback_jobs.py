@@ -40,7 +40,7 @@ account scan.
 from apps.jobber.models import JobberAccount, JobberJob, JobberVisit
 from apps.jobber.services.sync import detect_and_freeze_callbacks
 
-TENANT_ID = 4
+TENANT_ID = 5
 
 account = JobberAccount.objects.filter(tenant_id=TENANT_ID, is_active=True).first()
 if account is None:
