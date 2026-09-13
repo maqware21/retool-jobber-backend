@@ -1,10 +1,14 @@
 import logging
+from datetime import datetime, time
 
+from django.db.models import Sum
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.views import APIView
 
-from apps.jobber.models import JobberAccount, JobberInvoice, JobberJob
+from apps.goals.utils import current_year
+from apps.jobber.api.electricians_summary import labor_cost_for_jobs
+from apps.jobber.models import JobberAccount, JobberExpense, JobberInvoice, JobberJob
 from apps.jobber.services import client
 from apps.jobber.services.sync import ensure_fresh
 from helpers.api_exception import validator_errors
@@ -129,6 +133,7 @@ class JobberAccountsView(APIView):
             'connected': False,
             'accounts': [],
             'service_type_breakdown': [],
+            'cost_breakdown': None,
             'computed_at': None,
         }
         try:
@@ -247,6 +252,53 @@ def _local_service_type_breakdown(tenant_id):
     return [{'name': name, 'count': count} for name, count in ranked]
 
 
+def _cost_breakdown(tenant_id):
+    """
+    Real Cost Breakdown (2026-09-14, approved cost_breakdown_dynamic_
+    categories_proposal.md) — replaces the old fully-mock 6-fixed-bucket
+    chart entirely. Jobber's own "Accounting Codes" were CONFIRMED
+    PERMANENTLY ABSENT from the real GraphQL schema (exhaustively
+    verified across all 738 real schema types — see PROJECT_CONTEXT.md's
+    own dated entry) — there is no real category field anywhere to group
+    expenses by, so this is 2 real, honest company-wide stats instead of
+    a category breakdown: Labor and Total Expenses, both YTD.
+
+    Labor (YTD): reuses labor_cost_for_jobs() (electricians_summary.py)
+    UNCHANGED — the exact same per-entry-sum formula Revenue Health's own
+    Labor Cost KPI uses, just re-scoped to a YTD job population instead
+    of that KPI's rolling PERIOD_MONTHS window. None (never a fabricated
+    0) when zero real entries anywhere in the YTD window have a usable
+    rate — matches this account's own current real state (no non-zero
+    labour_rate entered yet, confirmed in an earlier round).
+
+    Total Expenses (YTD): Sum(total) across every real, locally-synced
+    JobberExpense row whose real `incurred_at` falls in the YTD window.
+    Genuinely 0.0 (not null) when zero expenses exist yet this year —
+    a real, honest answer, distinct from the whole account being
+    disconnected (handled separately in _local_accounts_response()).
+
+    Same archived + completed_at-windowed population every other
+    Job.total-attributed figure in this project uses, for Labor's job
+    population — NOT the Paid-invoices population Total Billed uses.
+    """
+    year_date = current_year()
+    year_start = timezone.make_aware(datetime.combine(year_date, time.min))
+
+    ytd_jobs = JobberJob.objects.filter(
+        tenant_id=tenant_id, is_active=True, job_status='archived', completed_at__gte=year_start,
+    )
+    labor_ytd = labor_cost_for_jobs(tenant_id, ytd_jobs)
+
+    expenses_total = JobberExpense.objects.filter(
+        tenant_id=tenant_id, is_active=True, incurred_at__gte=year_start,
+    ).aggregate(total=Sum('total'))['total']
+
+    return {
+        'labor_ytd': float(labor_ytd) if labor_ytd is not None else None,
+        'total_expenses_ytd': float(expenses_total) if expenses_total is not None else 0.0,
+    }
+
+
 def _local_accounts_response(user):
     """
     Local-table equivalent of JobberAccountsView.get()'s `data` dict. Calls
@@ -256,18 +308,23 @@ def _local_accounts_response(user):
     """
     tenant_id = user.tenant_id
     if not tenant_id:
-        return {'connected': False, 'accounts': [], 'service_type_breakdown': [], 'computed_at': None}
+        return {'connected': False, 'accounts': [], 'service_type_breakdown': [], 'cost_breakdown': None, 'computed_at': None}
 
     account = JobberAccount.objects.filter(tenant_id=tenant_id, is_active=True).first()
     if account is None:
-        return {'connected': False, 'accounts': [], 'service_type_breakdown': [], 'computed_at': None}
+        return {'connected': False, 'accounts': [], 'service_type_breakdown': [], 'cost_breakdown': None, 'computed_at': None}
 
-    fresh = ensure_fresh(account.tenant, entities=['clients', 'jobs', 'invoices'], require_complete=True)
+    # 'expenses' added (2026-09-14) alongside the existing 'clients'/'jobs'/
+    # 'invoices' this view already requests — same require_complete=True
+    # reasoning: a Total Expenses total computed over a partially-synced
+    # entity set is a WRONG number, not just a stale one.
+    fresh = ensure_fresh(account.tenant, entities=['clients', 'jobs', 'invoices', 'expenses'], require_complete=True)
 
     data = {
         'connected': True,
         'accounts': _rank_local_accounts(tenant_id),
         'service_type_breakdown': _local_service_type_breakdown(tenant_id),
+        'cost_breakdown': _cost_breakdown(tenant_id),
         'computed_at': timezone.now().isoformat(),
         'last_synced_at': fresh['last_synced_at'].isoformat() if fresh['last_synced_at'] else None,
     }

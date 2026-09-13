@@ -27,6 +27,7 @@ from django.utils.dateparse import parse_datetime
 from apps.jobber.models import (
     JobberAccount,
     JobberClient,
+    JobberExpense,
     JobberInvoice,
     JobberJob,
     JobberSyncRun,
@@ -45,7 +46,7 @@ logger = logging.getLogger(__name__)
 # fetch_all_pages_bounded(), not mid-page.
 SYNC_WALL_CLOCK_CEILING = timedelta(seconds=25)
 
-ALL_ENTITIES = ('clients', 'users', 'jobs', 'visits', 'invoices', 'timesheet_entries')
+ALL_ENTITIES = ('clients', 'users', 'jobs', 'visits', 'invoices', 'timesheet_entries', 'expenses')
 
 # ensure_fresh()'s staleness threshold — the design doc's proposed default
 # (20 minutes, inside the 15-30 min window already flagged elsewhere in this
@@ -73,6 +74,7 @@ ENTITY_MODELS = {
     'visits': JobberVisit,
     'invoices': JobberInvoice,
     'timesheet_entries': JobberTimeSheetEntry,
+    'expenses': JobberExpense,
 }
 
 
@@ -950,13 +952,75 @@ def sync_invoices(account, tenant, deadline, clients_complete, jobs_complete):
     return {'count': count, 'complete': complete}
 
 
+def sync_expenses(account, tenant, deadline):
+    """
+    Pull every Expense via its own real, standalone Query.expenses
+    connection (2026-09-14, approved cost_breakdown_dynamic_categories_
+    proposal.md) — unlike Visits/TimeSheetEntries, Expense doesn't need
+    to be derived from nested Job data; it has a real root-level query
+    (confirmed live — see verify_query_expenses_shape_and_cost.py).
+
+    Completeness is `own_complete` ONLY — no Clients/Jobs dependency
+    gating, unlike sync_invoices(). This is a real, deliberate
+    difference, not an oversight: sync_invoices() gates on jobs_complete
+    because an incomplete Jobs pull could under-link its `jobs` M2M
+    (a real correctness problem for that field). Expense.job is a
+    single, OPTIONAL FK that this project's only real consumer (Total
+    Expenses YTD, see accounts.py) never reads at all — a missing local
+    Job row at sync time just means `job` stays null this pass and
+    self-heals on a later sync, exactly the same as a genuinely job-less
+    expense already looks. Neither case affects whether THIS pass
+    correctly captured every real, currently-active expense, which is
+    the only thing the deactivation sweep's safety actually depends on.
+
+    incurred_at comes from Jobber's own `date` field ("When the expense
+    was incurred"), NOT createdAt ("When the expense was created") —
+    see JobberExpense.incurred_at's own model comment for the full
+    reasoning (same distinction already established for
+    Job.completed_at vs. Job.jobber_created_at).
+    """
+    nodes, own_complete = client.fetch_all_pages_bounded(client.fetch_expenses, account, 'fetch_expenses', deadline)
+    seen_ids = set()
+    count = 0
+    for node in nodes:
+        jobber_id = node.get('id')
+        if not jobber_id:
+            continue
+
+        linked_job_id = (node.get('linkedJob') or {}).get('id')
+        expense_job = JobberJob.objects.filter(tenant=tenant, jobber_id=linked_job_id).first() if linked_job_id else None
+
+        seen_ids.add(jobber_id)
+        JobberExpense.objects.update_or_create(
+            tenant=tenant,
+            jobber_id=jobber_id,
+            defaults={
+                'job': expense_job,
+                'title': node.get('title') or '',
+                'description': node.get('description'),
+                'incurred_at': _to_datetime(node.get('date')),
+                'total': _to_decimal(node.get('total')) or Decimal('0'),
+                'synced_at': timezone.now(),
+                'is_active': True,
+            },
+        )
+        count += 1
+
+    complete = own_complete
+    if complete:
+        JobberExpense.objects.filter(tenant=tenant, is_active=True).exclude(jobber_id__in=seen_ids).update(is_active=False)
+
+    return {'count': count, 'complete': complete}
+
+
 def _finish_run(run, wanted, counts, had_failure, error_message):
     # NOTE: JobberSyncRun has no timesheet_entries_synced column (not added
     # this round — Part A's scope was the new entity + sync logic only, see
-    # PROJECT_CONTEXT.md). any_progress/all_complete below still work
-    # correctly for 'timesheet_entries' (they iterate `wanted`/`counts`
-    # generically, no field-name dependency) — only the per-entity count
-    # persisted onto the JobberSyncRun row is skipped for this one entity.
+    # PROJECT_CONTEXT.md), and — same precedent, 2026-09-14 — no
+    # expenses_synced column either. any_progress/all_complete below still
+    # work correctly for both (they iterate `wanted`/`counts` generically,
+    # no field-name dependency) — only the per-entity count persisted onto
+    # the JobberSyncRun row is skipped for these two entities.
     any_progress = any(counts.get(e, {}).get('count', 0) > 0 for e in wanted)
     all_complete = bool(wanted) and all(counts.get(e, {}).get('complete') for e in wanted)
 
@@ -1042,6 +1106,8 @@ def sync_tenant(account, entities=None):
                 detect_and_freeze_callbacks(account, tenant, just_transitioned_to_archived_job_ids)
         if 'invoices' in wanted:
             counts['invoices'] = sync_invoices(account, tenant, deadline, clients_complete, jobs_complete)
+        if 'expenses' in wanted:
+            counts['expenses'] = sync_expenses(account, tenant, deadline)
     except client.JobberAPIError as exc:
         had_failure = True
         error_message = str(exc)

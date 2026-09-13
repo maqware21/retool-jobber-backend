@@ -525,6 +525,70 @@ class JobberTimeSheetEntry(DateModel):
         return f"JobberTimeSheetEntry(tenant={self.tenant_id}, jobber_id={self.jobber_id})"
 
 
+class JobberExpense(DateModel):
+    """
+    Local mirror of one Jobber Expense, populated and refreshed by the
+    sync engine. New (2026-09-14, approved cost_breakdown_dynamic_
+    categories_proposal.md) -- built for the Accounts panel's real
+    "Total Expenses (YTD)" stat, after Jobber's own "Accounting Codes"
+    were CONFIRMED PERMANENTLY ABSENT from the real GraphQL schema
+    (exhaustively verified across all 738 real schema types -- see
+    PROJECT_CONTEXT.md's own dated entry). Category-based Cost
+    Breakdown is dead; this model exists purely to support a real,
+    company-wide expense TOTAL, not a per-category breakdown -- there
+    is no category field anywhere to store.
+
+    Unlike JobberVisit/JobberTimeSheetEntry, Expense DOES have its own
+    real, standalone, root-level Query.expenses connection (confirmed
+    live, cheap -- see verify_query_expenses_shape_and_cost.py's real
+    output) -- pulled directly, not derived from nested Job data.
+    """
+
+    tenant = models.ForeignKey(
+        'tenants.Tenant',
+        on_delete=models.CASCADE,
+        related_name='jobber_expenses',
+    )
+    # Nullable -- Jobber's own real Expense type allows a genuinely
+    # job-less expense (a general business expense, confirmed via its
+    # own real, introspected field list -- linkedJob is its own
+    # optional field). Also null if the linked job simply isn't
+    # locally synced yet (self-heals on a later sync) -- neither case
+    # matters for this model's real consumer (Total Expenses YTD, which
+    # never reads this FK) -- kept for a possible future per-job cost
+    # drill-down only.
+    job = models.ForeignKey(
+        JobberJob,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='expenses',
+    )
+    jobber_id = models.CharField(max_length=255, db_index=True)
+    title = models.CharField(max_length=255)
+    description = models.TextField(null=True, blank=True)
+    # From Jobber's own `date` field ("When the expense was incurred")
+    # -- NOT createdAt ("When the expense was created"). Same real-
+    # world-time-incurred vs. record-created-time distinction already
+    # established for Job.completed_at vs. Job.jobber_created_at
+    # elsewhere in this project. This is the field Total Expenses'
+    # YTD window filters on.
+    incurred_at = models.DateTimeField(null=True, blank=True)
+    total = models.DecimalField(max_digits=12, decimal_places=2)
+    synced_at = models.DateTimeField()
+
+    class Meta:
+        db_table = 'jobber_expenses'
+        verbose_name = 'jobber expense'
+        verbose_name_plural = 'jobber expenses'
+        constraints = [
+            models.UniqueConstraint(fields=['tenant', 'jobber_id'], name='unique_jobber_expense_tenant_jobber_id'),
+        ]
+
+    def __str__(self):
+        return f"JobberExpense(tenant={self.tenant_id}, jobber_id={self.jobber_id})"
+
+
 class JobberSyncRun(models.Model):
     """
     One row per sync attempt for a tenant (not one mutable row per tenant —
