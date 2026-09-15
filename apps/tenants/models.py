@@ -7,8 +7,8 @@ from django.db import models
 
 class Tenant(DateModel, SafeDeleteModel):
     """
-    One row per VoltPro customer organisation.
-    business_name is populated when the customer connects their Jobber account (Week 2).
+    One row per customer organisation.
+    business_name is populated when the customer connects their Jobber account.
     """
     _safedelete_policy = SOFT_DELETE_CASCADE
 

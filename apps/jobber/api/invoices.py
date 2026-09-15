@@ -102,8 +102,6 @@ def _compute_summary(invoices):
     Draft invoices are excluded from total_billed (and its count) — a
     draft hasn't been sent yet, so it isn't "billed." Drafts still appear
     in the invoice list itself; this only changes the summary card math.
-    Resolves the previously-open "does Draft count toward Total Billed"
-    question per TL decision.
     """
     def bucket(label):
         return [inv for inv in invoices if inv['status_display'] == label]
@@ -129,13 +127,12 @@ class JobberInvoicesView(APIView):
     """
     GET /v1/jobber/invoices/?first=&after=
 
-    Phase 2 cutover: now reads from local tables via
-    _local_invoices_response() (ensure_fresh() + local tables), not Jobber
-    directly. The original live-proxy body is preserved, unused, in
-    _get_live() below for a fast rollback if needed — revert by having
-    get() call self._get_live(request) instead of _local_invoices_response().
-    Jobs is also cut over; Accounts/Employees are unchanged — still
-    live-proxy, per the current rollout.
+    Reads from local tables via _local_invoices_response() (ensure_fresh()
+    + local tables), not Jobber directly. The original live-proxy body is
+    preserved, unused, in _get_live() below for a fast rollback if needed —
+    revert by having get() call self._get_live(request) instead of
+    _local_invoices_response(). Jobs and Accounts are also cut over to
+    local reads the same way; Employees is still live-proxy.
     """
     permission_classes = [CustomerPermission]
 
@@ -173,9 +170,9 @@ class JobberInvoicesView(APIView):
     def _get_live(self, request):
         """
         DEAD CODE — deliberately kept, not called from anywhere. This is the
-        exact live-proxy body get() used before the Phase 2 cutover above.
-        Rollback: make get() call self._get_live(request) again instead of
-        _local_invoices_response().
+        exact live-proxy body get() used before the cutover to local reads
+        above. Rollback: make get() call self._get_live(request) again
+        instead of _local_invoices_response().
         """
         data = {'connected': False, 'invoices': [], 'summary': None, 'page_info': None}
         try:
@@ -215,9 +212,10 @@ class JobberInvoicesView(APIView):
             return api_response_parser(data=data, message=msg, status=st, success=success)
 
 
-# ── Local-table read path (Phase 2) ──────────────────────────────────────────
-# Built alongside the live-proxy code above, NOT wired into JobberInvoicesView
-# yet. Confirmed via a side-by-side comparison against the live-proxy output.
+# ── Local-table read path ─────────────────────────────────────────────────
+# JobberInvoicesView.get() above calls _local_invoices_response() below,
+# not the live-proxy functions — confirmed via a side-by-side comparison
+# against the live-proxy output before the cutover.
 
 def _isoformat(value):
     return value.isoformat() if value else None
@@ -254,14 +252,10 @@ def _local_invoices_response(user, first=DEFAULT_PAGE_SIZE, after=None):
     ensure_fresh() first, then reads local tables — never Jobber directly.
 
     Same OFFSET-based local pagination caveat as jobs.py's
-    _local_jobs_response(). The summary is deliberately still computed over
-    just this page (matching _compute_summary()'s existing page-only
-    limitation exactly) rather than upgraded to a full-account aggregate —
-    that upgrade is real and available once local tables are the source of
-    truth, but doing it here would make the live and local outputs diverge
-    in a way that looks like a bug during this round's side-by-side
-    comparison, when it would actually just be an intentional improvement
-    saved for the cutover step.
+    _local_jobs_response(). The summary is still computed over just this
+    page (matching _compute_summary()'s existing page-only limitation
+    exactly), not a full-account aggregate — a real, available upgrade now
+    that local tables are the source of truth, just not yet done.
     """
     tenant_id = user.tenant_id
     if not tenant_id:

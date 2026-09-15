@@ -7,10 +7,9 @@ from rest_framework.exceptions import ValidationError
 def parse_month(value):
     """
     Accepts a month as 'YYYY-MM' (the format both goals endpoints take on
-    input, per TL decision -- simpler and less error-prone for whatever
-    frontend eventually calls this than requiring a full 'YYYY-MM-01'
-    date) and returns a date for the 1st of that month, which is what
-    TeamGoal.month / TechnicianGoal.month actually store.
+    input -- simpler and less error-prone for callers than requiring a
+    full 'YYYY-MM-01' date) and returns a date for the 1st of that month,
+    which is what TeamGoal.month / TechnicianGoal.month actually store.
 
     Raises a DRF ValidationError (not Django's) on any other shape, so it
     flows through the same validator_errors() handling as every other
@@ -28,12 +27,10 @@ def current_month():
     The 1st of the current calendar month, as a date.
 
     Uses timezone.localdate() (Django's own now(), converted to
-    settings.TIME_ZONE = 'UTC'), NOT datetime.date.today() (2026-08-21
-    fix, found while reviewing current_year() below for the same
-    concern). date.today() reads the server PROCESS's system clock in
-    whatever timezone the OS itself is configured for -- correct only as
-    long as that happens to also be UTC, an assumption that was
-    previously true-but-unverified rather than actually guaranteed.
+    settings.TIME_ZONE = 'UTC'), NOT datetime.date.today(). date.today()
+    reads the server PROCESS's system clock in whatever timezone the OS
+    itself is configured for -- correct only as long as that happens to
+    also be UTC, an assumption that isn't actually guaranteed.
     timezone.localdate() removes that dependency entirely: it's always
     correct relative to Django's own configured timezone, regardless of
     the underlying OS clock's own timezone setting.

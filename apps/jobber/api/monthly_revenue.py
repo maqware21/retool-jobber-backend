@@ -18,8 +18,8 @@ from helpers.utils import api_response_parser
 logger = logging.getLogger(__name__)
 
 # How many calendar months this chart covers, INCLUDING the current
-# (partial) month -- e.g. computed on 2026-08-24, this returns the 6
-# discrete calendar-month buckets 2026-03 through 2026-08.
+# (partial) month -- e.g. computed in August, this returns the 6 discrete
+# calendar-month buckets March through August.
 MONTHS_BACK = 6
 
 _NOT_CONNECTED_DATA = {
@@ -31,17 +31,14 @@ _NOT_CONNECTED_DATA = {
 
 def _revenue_by_technician_for_month(tenant_id, month_start):
     """
-    Real per-technician revenue for exactly ONE calendar month --
-    extracted (2026-09-04, approved last_month_goal_alert_proposal.md)
-    from _local_monthly_revenue_response()'s own per-month loop body
-    below, so the "last month's goal" alert rule (evaluate.py) can reuse
-    this exact calculation for one isolated month without running the
-    whole MONTHS_BACK-month loop just to get one month's numbers. The
-    chart below now calls this function once per month instead of
-    inlining the range/filter/calculate_top_earner steps directly --
-    same output, byte-for-byte, confirmed unchanged against real data
-    after this extraction (see last_month_goal_alert_proposal.md's build
-    report).
+    Real per-technician revenue for exactly ONE calendar month -- a
+    standalone function (not inlined in the chart's per-month loop below)
+    so the "last month's goal" alert rule (evaluate.py) can reuse this
+    exact calculation for one isolated month without running the whole
+    MONTHS_BACK-month loop just to get one month's numbers. The chart
+    below calls this once per month instead of inlining the
+    range/filter/calculate_top_earner steps directly -- same output either
+    way.
 
     Same Job.total-attributed calculate_top_earner() population every
     other revenue-driven feature in this project uses (Top Earner,
@@ -94,18 +91,17 @@ def _local_monthly_revenue_response(tenant):
     caller without saying so.
 
     Month boundaries are calendar-month-aligned (1st of each month, via
-    current_month() + relativedelta) -- CONFIRMED DIRECTLY (2026-08-24),
-    not assumed, that this does NOT land on the same boundary as
-    DEFAULT_RANGE, the frontend's rolling window for the Job Log table on
-    this same page: on 2026-08-24, DEFAULT_RANGE spans 2026-02-24 to
-    2026-08-24 as one continuous window (today, minus 6 calendar months,
-    same day-of-month), while this endpoint's buckets are the 6 DISCRETE
-    calendar months 2026-03 through 2026-08 -- e.g. late February is
-    inside DEFAULT_RANGE's window but not inside any month bucket this
-    endpoint returns. This is an accepted, structural difference, not a
-    bug to reconcile: a bar/line chart needs discrete whole-month
-    buckets; a job list needs a continuous cutoff. See
-    PROJECT_CONTEXT.md and monthly_revenue_chart_proposal.md.
+    current_month() + relativedelta) -- confirmed directly, not assumed,
+    that this does NOT land on the same boundary as DEFAULT_RANGE, the
+    frontend's rolling window for the Job Log table on this same page:
+    DEFAULT_RANGE is a continuous "today minus 6 calendar months, same
+    day-of-month" window, while this endpoint's buckets are 6 DISCRETE
+    calendar months -- e.g. a day in the tail end of the oldest partial
+    month can fall inside DEFAULT_RANGE's window but outside every month
+    bucket this endpoint returns. This is an accepted, structural
+    difference, not a bug to reconcile: a bar/line chart needs discrete
+    whole-month buckets; a job list needs a continuous cutoff. See
+    PROJECT_CONTEXT.md.
     """
     if tenant is None:
         return dict(_NOT_CONNECTED_DATA)
@@ -164,11 +160,10 @@ class JobberMonthlyRevenueView(APIView):
     Real per-technician revenue for the last 6 calendar months, backing
     the Electricians panel's "Monthly Revenue by Technician" chart.
     Reads local tables only via ensure_fresh() -- never calls Jobber
-    directly. A dedicated endpoint, not a field on electricians-summary
-    -- see monthly_revenue_chart_proposal.md for why (a meaningfully
-    larger/differently-shaped response than that endpoint's other
-    near-scalar fields; bundling it in would force every KPI-tile
-    consumer to pay for computing it too).
+    directly. A dedicated endpoint, not a field on electricians-summary --
+    a meaningfully larger/differently-shaped response than that endpoint's
+    other near-scalar fields; bundling it in would force every KPI-tile
+    consumer to pay for computing it too.
     """
     permission_classes = [CustomerPermission]
 

@@ -107,12 +107,12 @@ class JobberJobsView(APIView):
     """
     GET /v1/jobber/jobs/?first=&after=
 
-    Phase 2 cutover: now reads from local tables via _local_jobs_response()
-    (ensure_fresh() + local tables), not Jobber directly. The original
-    live-proxy body is preserved, unused, in _get_live() below for a fast
-    rollback if needed — revert by having get() call self._get_live(request)
-    instead of _local_jobs_response(). Invoices/Accounts/Employees are
-    unchanged — still live-proxy, per the current comparison-only rollout.
+    Reads from local tables via _local_jobs_response() (ensure_fresh() +
+    local tables), not Jobber directly. The original live-proxy body is
+    preserved, unused, in _get_live() below for a fast rollback if needed —
+    revert by having get() call self._get_live(request) instead of
+    _local_jobs_response(). Invoices and Accounts are also cut over to local
+    reads the same way; Employees is still live-proxy.
     """
     permission_classes = [CustomerPermission]
 
@@ -159,9 +159,9 @@ class JobberJobsView(APIView):
     def _get_live(self, request):
         """
         DEAD CODE — deliberately kept, not called from anywhere. This is the
-        exact live-proxy body get() used before the Phase 2 cutover above.
-        Rollback: make get() call self._get_live(request) again instead of
-        _local_jobs_response().
+        exact live-proxy body get() used before the cutover to local reads
+        above. Rollback: make get() call self._get_live(request) again
+        instead of _local_jobs_response().
         """
         data = {'connected': False, 'jobs': [], 'page_info': None}
         try:
@@ -199,12 +199,10 @@ class JobberJobsView(APIView):
             return api_response_parser(data=data, message=msg, status=st, success=success)
 
 
-# ── Local-table read path (Phase 2) ──────────────────────────────────────────
-# Built alongside the live-proxy code above, NOT wired into JobberJobsView
-# yet — JobberJobsView.get() still calls client.fetch_jobs()/_map_job()
-# exactly as it does today. This exists to compare the two paths, which
-# was confirmed to produce matching output against the live-proxy version,
-# before anything gets swapped.
+# ── Local-table read path ─────────────────────────────────────────────────
+# JobberJobsView.get() above calls _local_jobs_response() below, not
+# client.fetch_jobs()/_map_job() — confirmed to produce matching output
+# against the live-proxy version before the cutover.
 
 def _isoformat(value):
     return value.isoformat() if value else None

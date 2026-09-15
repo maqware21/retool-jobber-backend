@@ -14,9 +14,8 @@ from helpers.utils import api_response_parser
 
 logger = logging.getLogger(__name__)
 
-# Confirmed rule (2026-08-25, matches verify_service_type_distribution.py
-# exactly) -- a service_type only qualifies for this chart when it has
-# real data to compare: at least this many jobs, spanning at least this
+# A service_type only qualifies for this chart when it has real data to
+# compare: at least this many jobs, spanning at least this
 # many distinct technicians. Computed fresh on every call, never a
 # hardcoded list of "today's" qualifying types -- as real job history
 # accumulates, types move in and out of qualifying on their own.
@@ -41,25 +40,19 @@ def _local_duration_by_type_response(tenant):
     matches DurationDotPlotRow's own real prop shape directly
     ({jobType, entries: [{name, hours}]}), unlike Monthly Revenue's flat
     rows (which fed a Recharts pivot table, a genuinely different
-    consumer with a genuinely different natural shape). See
-    duration_by_type_proposal.md for the full reasoning.
+    consumer with a genuinely different natural shape).
 
     Population: ALL active jobs, UNWINDOWED -- deliberately NOT the same
     6-month rolling window every other real metric on this page uses.
-    Confirmed decision (2026-08-25): this is the EXACT SAME population
-    verify_service_type_distribution.py already queried and got the
-    real "2 types qualify" result against; using a different (windowed)
-    population here would silently disagree with that already-verified
-    finding. Also a substantive reason beyond consistency: this
-    computation is inherently data-scarcity-sensitive, and narrowing it
-    to a rolling window would only shrink an already-thin dataset
+    This computation is inherently data-scarcity-sensitive, and narrowing
+    it to a rolling window would only shrink an already-thin dataset
     further, working against the one thing this feature needs (enough
     real jobs to compare).
 
     Duration source: calculate_job_duration_by_user(job) -- the PER-USER
     breakdown, NOT calculate_job_duration_seconds(job) (the job-TOTAL).
-    Confirmed decision (2026-08-25): for a job with a single assignee
-    these are identical, but for a qualifying-type job with MULTIPLE
+    For a job with a single assignee these are identical, but for a
+    qualifying-type job with MULTIPLE
     assignees, crediting the job's full total to every assignee would
     double-count a shared job's duration into more than one person's
     per-type average. calculate_job_duration_by_user() is the same
@@ -170,7 +163,9 @@ class JobberDurationByTypeView(APIView):
     backs the Electricians panel's "Avg Job Duration by Type &
     Technician" chart. Reads local tables only via ensure_fresh() --
     never calls Jobber directly. A dedicated endpoint, not a field on
-    electricians-summary -- see duration_by_type_proposal.md for why.
+    electricians-summary -- a differently-shaped, unwindowed-population
+    response that every other KPI-tile consumer of that endpoint doesn't
+    need to pay for computing.
     """
     permission_classes = [CustomerPermission]
 

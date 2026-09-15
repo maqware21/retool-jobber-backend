@@ -34,54 +34,42 @@ _NOT_CONNECTED_DATA = {
 def _company_revenue_expenses_for_month(tenant_id, month_start):
     """
     Real, company-wide revenue and expenses for exactly ONE calendar
-    month -- approved (2026-09-07) revenue_composition_expense_profit_
-    proposal.md. NO per-technician split at all (this is a company-wide
-    chart, not attributed to anyone) -- a plain Sum() over the same
-    archived + completed_at-windowed population every other revenue-
-    driven feature in this project uses (Top Earner, Profit Margin,
-    Avg Job Value, Monthly Revenue by Technician), NOT the separate
-    Total Revenue tile's Paid-invoices-only population. Deliberately a
-    SEPARATE query from _revenue_by_technician_for_month() (monthly_
-    revenue.py) rather than reusing/refactoring it -- that function's own
-    per-technician attribution machinery (calculate_top_earner()) isn't
-    needed here at all, and this avoids any risk of touching its
-    already-shipped, working behavior.
+    month. NO per-technician split at all (this is a company-wide chart,
+    not attributed to anyone) -- a plain Sum() over the same archived +
+    completed_at-windowed population every other revenue-driven feature
+    in this project uses (Top Earner, Profit Margin, Avg Job Value,
+    Monthly Revenue by Technician), NOT the separate Total Revenue tile's
+    Paid-invoices-only population. Deliberately a SEPARATE query from
+    _revenue_by_technician_for_month() (monthly_revenue.py) rather than
+    reusing/refactoring it -- that function's own per-technician
+    attribution machinery (calculate_top_earner()) isn't needed here at
+    all, and this avoids any risk of touching its already-shipped,
+    working behavior.
 
     expenses = Sum(line_item_cost) -- Jobber's own real jobCosting.
     lineItemCost, confirmed genuine and non-circular (see
-    PROJECT_CONTEXT.md's 2026-09-07 update) -- NOT expenseCost, which
-    stays confirmed dead (always 0 in this account) and isn't synced.
+    PROJECT_CONTEXT.md) -- NOT expenseCost, which stays confirmed dead
+    (always 0 in this account) and isn't synced.
 
     Returns (revenue, expenses) as plain floats. A month with zero
     archived jobs (or zero archived jobs with a KNOWN cost -- see below)
     returns (0.0, 0.0) -- a real, honest zero (no real, complete data
     this month), not a crash or a null.
 
-    FIX (2026-09-07, real discipline gap caught before shipping): a job
-    with line_item_cost IS NULL (not yet re-synced since this field was
-    added, or Jobber genuinely never returned a value) is now EXCLUDED
-    from BOTH sums for that month, not just defaulted to $0 cost. The
-    original version summed `total` over EVERY archived job in the
-    window but let Sum('line_item_cost')'s own null-skipping silently
-    drop the unknown-cost jobs from the expense side only -- a job with
-    real revenue and an unknown cost would count its full revenue while
-    contributing $0 to expenses, producing a misleadingly complete
-    "100% profit" figure instead of an honest "we don't know yet." Both
-    sides of the ratio must come from the SAME population, or the
-    result isn't just incomplete, it's actively misleading (a bigger
-    number than reality, not a smaller/more-cautious one) -- same class
-    of mistake this project has caught and fixed before (callback_bled_
-    amount's own "empty dict -> None, never a fabricated 0" fix). This
-    also directly explains today's flat "0% profit" results on this
-    account's real historical jobs once a real sync actually completes
-    -- BEFORE this fix, jobs still missing a synced line_item_cost were
-    silently excluded from expenses only and inflated the month's
-    apparent profit; AFTER this fix, a job only ever enters this
-    calculation once its real cost is known, so a job that HAS a real,
-    synced line_item_cost equal to its own total correctly shows $0
-    profit (an honest result, not a bug -- see PROJECT_CONTEXT.md's
-    2026-09-07 update), while a job whose cost genuinely isn't synced
-    yet is excluded entirely rather than guessed into either number.
+    A job with line_item_cost IS NULL (not yet re-synced since this field
+    was added, or Jobber genuinely never returned a value) is EXCLUDED
+    from BOTH sums for that month, not just defaulted to $0 cost. Both
+    sides of the ratio must come from the SAME population, or the result
+    isn't just incomplete, it's actively misleading: including a job's
+    full revenue while silently treating its unknown cost as $0 would
+    produce a falsely-inflated "100% profit" figure instead of an honest
+    "we don't know yet" -- same class of mistake as callback_bled_
+    amount's own "empty dict -> None, never a fabricated 0" rule. This is
+    also why this account's real historical jobs currently show a flat
+    "0% profit": a job only ever enters this calculation once its real
+    cost is known, and this account's synced jobs happen to have
+    line_item_cost equal to their own total -- an honest result, not a
+    bug (see PROJECT_CONTEXT.md).
     """
     range_start = timezone.make_aware(datetime.combine(month_start, time.min))
     range_end = timezone.make_aware(datetime.combine(month_start + relativedelta(months=1), time.min))

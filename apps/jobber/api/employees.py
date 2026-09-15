@@ -124,23 +124,25 @@ class JobberEmployeesView(APIView):
         return JobberAccount.objects.filter(tenant_id=user.tenant_id, is_active=True).first()
 
 
-# ── Local-table read path (Phase 2) ──────────────────────────────────────────
+# ── Local-table read path ─────────────────────────────────────────────────
 # Built alongside the live-proxy code above, NOT wired into
-# JobberEmployeesView yet. Confirmed via a side-by-side comparison against
-# the live-proxy output.
+# JobberEmployeesView yet — this is the one remaining live-proxy view (Jobs,
+# Invoices, and Accounts have already cut over). Confirmed via a
+# side-by-side comparison against the live-proxy output.
 
 def _rank_local_employees(tenant_id):
     """
     Local-table equivalent of _rank_employees(). Walks ALL of a job's
     Visits (not just the first — matching live's actual behavior, which
     walks every visit and credits every unique assignee once per job), but
-    each local Visit only ever has ONE assigned_user stored (see
-    sync.py's sync_visits() — a known, already-flagged gap from Step 2:
-    JobberVisit.assigned_user is a single nullable FK, not an M2M). So a
-    Jobber Visit that had multiple assignedUsers only ever contributes its
-    first one locally — this ranking will undercount those cases relative
-    to the live version. Expected, not a new bug; flagged again here since
-    it's directly relevant to reading the comparison script's output.
+    reads each Visit's singular assigned_user FK, not the separate
+    assigned_users M2M (added later, on JobberVisit, for Top Earner's
+    per-technician revenue split — see sync.py's sync_visits()). So a
+    Jobber Visit with multiple assignedUsers only ever contributes its
+    first one here — this ranking will undercount those cases relative to
+    the live version. Switching this function to read assigned_users
+    instead would fix it; not done here since this ranking function
+    predates that M2M.
     """
     employees = {}
 

@@ -81,12 +81,12 @@ def _accumulate_technician_callback_stats(archived_jobs):
     """
     Per-technician callback counts and dollar attribution across
     `archived_jobs` — the SAME archived + completed_at-windowed population
-    _accumulate_technician_job_stats() above uses (confirmed 2026-08-31,
-    Part B verification: Job.completed_at tracks the LATEST closure, not
-    the original one — a job's real completedAt landed within 4 seconds of
-    its real callback visit's own completedAt, over an hour after the
-    original visit's completion — so a job that was reopened recently
-    stays inside this rolling window even if its original work is older).
+    _accumulate_technician_job_stats() above uses. Job.completed_at tracks
+    the LATEST closure, not the original one — a job's real completedAt
+    lands within seconds of its real callback visit's own completedAt,
+    well after the original visit's completion — so a job that was
+    reopened recently stays inside this rolling window even if its
+    original work is older.
 
     Built entirely from already-proven primitives, nothing re-derived:
       - JobberVisit.is_callback — detect_and_freeze_callbacks()'s own
@@ -94,8 +94,7 @@ def _accumulate_technician_callback_stats(archived_jobs):
         SOLE place the "what counts as a callback" definition lives).
       - JobberVisit.assigned_users — the SAME multi-assignee field Top
         Earner already uses (assigned_users, not the single-assignee
-        assigned_user) — confirmed convention (2026-08-31), not
-        re-decided here.
+        assigned_user).
       - calculate_job_duration_by_user(job, created_at_or_after=
         job.first_archived_at) — unchanged, called with the SAME
         callback-only split detect_and_freeze_callbacks() itself uses.
@@ -107,8 +106,8 @@ def _accumulate_technician_callback_stats(archived_jobs):
     'callback_dollars_lost': float, 'has_unknown_callback_cost': bool}}.
 
     callback_visits_done: FULL credit to every real assignee of a
-    callback visit — the same "no-split" rule jobs_completed itself uses
-    (confirmed convention, 2026-08-31), not a proportional count.
+    callback visit — the same "no-split" rule jobs_completed itself uses,
+    not a proportional count.
 
     callback_dollars_lost: only sums a callback's dollar SHARE when
     job.callback_bled_amount is a real (non-null) number. A null
@@ -211,11 +210,11 @@ def _accumulate_completion_counts(tenant_id, period_start):
     completed_at, since a job that's never been completed has no
     completed_at at all.
 
-    Per TL instruction: cancelled jobs should be excluded from both sides
-    of this ratio, since a cancelled job was never really "supposed to
-    complete." NOT IMPLEMENTED AS SPECIFIED -- confirmed directly against
-    Jobber's own schema (JobStatusTypeEnum, the enum backing Job.jobStatus
-    exactly, not a different/looser one): its only values are
+    Cancelled jobs should in principle be excluded from both sides of this
+    ratio, since a cancelled job was never really "supposed to complete."
+    NOT IMPLEMENTED AS SPECIFIED -- confirmed directly against Jobber's
+    own schema (JobStatusTypeEnum, the enum backing Job.jobStatus exactly,
+    not a different/looser one): its only values are
     requires_invoicing, archived, late, today, upcoming, action_required,
     on_hold, unscheduled, active, expiring_within_30_days. There is no
     "cancelled" value anywhere in it, and JobberJob.job_status stores this
@@ -243,43 +242,35 @@ def _accumulate_completion_counts(tenant_id, period_start):
 def get_technician_stats(tenant):
     """
     Local-table source for the Electricians panel's per-technician card +
-    drawer fields that are now real: revenue, jobs_completed,
-    revenue_per_hour, avg_job_duration_seconds, completion_percentage,
-    team_revenue_share_percentage, current-month goal progress, and
-    (2026-08-21) a SIMPLE real annual goal progress -- goal amount vs.
-    real year-to-date revenue as a plain percentage, deliberately with
-    no "on pace"/projected-year-end field (see the ytd_jobs block below).
+    drawer fields: revenue, jobs_completed, revenue_per_hour,
+    avg_job_duration_seconds, completion_percentage,
+    team_revenue_share_percentage, current-month goal progress, and a
+    SIMPLE real annual goal progress -- goal amount vs. real year-to-date
+    revenue as a plain percentage, deliberately with no "on pace"/
+    projected-year-end field (see the ytd_jobs block below).
 
-    Takes a Tenant instance directly (not a Django user object) --
-    renamed and widened from the original _local_technician_stats_response(user)
-    (2026-08-21) specifically because this now has a SECOND real caller:
-    apps.alerts.services.evaluate_alert_rules() needs the exact same
-    numbers the Electricians panel's cards render, not a re-derived copy,
-    and a tenant-taking, unprefixed function is the natural shared shape
-    for that -- cheaper to introduce now, with 2 callers from the start,
-    than later. JobberTechnicianStatsView.get() below passes
-    request.user.tenant.
+    Takes a Tenant instance directly (not a Django user object) -- this
+    has TWO real callers: JobberTechnicianStatsView.get() below (passes
+    request.user.tenant) and apps.alerts.services.evaluate_alert_rules(),
+    which needs the exact same numbers the Electricians panel's cards
+    render, not a re-derived copy. A tenant-taking, unprefixed function is
+    the natural shared shape for that.
 
-    Explicitly OUT of scope here (per TL): "on pace"/projected year-end
-    for BOTH monthly and annual (pending TL -- needs real multi-month
-    history that doesn't exist yet), job history (separate endpoint,
-    next round), and monthly revenue trend chart (separate round). The
-    4 threshold-based alerts previously deferred here now have a real
-    home -- see apps.alerts.
+    Explicitly OUT of scope here: "on pace"/projected year-end for BOTH
+    monthly and annual (needs real multi-month history that doesn't exist
+    yet), job history (separate endpoint), and monthly revenue trend
+    chart (separate feature). Threshold-based alerts live in apps.alerts.
 
-    profit_margin_percentage was ORIGINALLY built (2026-09-03, labor_
-    cost_profit_margin_proposal.md) against Jobber's own real per-entry
-    labour_rate. SUPERSEDED (2026-09-06, direct TL decision, no design
-    proposal): most real customers won't have that field filled in --
+    profit_margin_percentage does NOT use Jobber's own real per-entry
+    labour_rate -- most real customers won't have that field filled in,
     the same onboarding-burden concern that already ruled out Custom
-    Fields elsewhere in this project -- so the margin below no longer
-    reads labor_costs/_accumulate_technician_labor_cost() at all. That
-    function (and the underlying labour_rate model field/sync
+    Fields elsewhere in this project -- so the margin below doesn't read
+    labor_costs/_accumulate_technician_labor_cost() at all. That function
+    (and the underlying labour_rate model field/sync
     widening/calculate_technician_labor_cost()) is left completely in
-    place, untouched, working code -- just no longer wired into THIS
-    number. See _accumulate_technician_callback_stats()'s own docstring
-    and the profit_margin_percentage block below for the real, current
-    formula.
+    place, untouched, working code -- just not wired into THIS number.
+    See _accumulate_technician_callback_stats()'s own docstring and the
+    profit_margin_percentage block below for the real, current formula.
     """
     if tenant is None:
         return dict(_NOT_CONNECTED_DATA)
@@ -307,15 +298,15 @@ def get_technician_stats(tenant):
 
     job_stats = _accumulate_technician_job_stats(archived_jobs)
     callback_stats = _accumulate_technician_callback_stats(archived_jobs)
-    # NOT called here (2026-09-06, superseded direct TL decision -- see
-    # this function's own docstring): _accumulate_technician_labor_cost()
-    # still exists, unchanged, and still works -- it's just no longer
-    # part of profit_margin_percentage's real formula below, so computing
-    # it here would be a real, wasted per-job cost for a value nobody
-    # reads. Revenue population for the margin below is still
+    # NOT called here -- see this function's own docstring:
+    # _accumulate_technician_labor_cost() still exists, unchanged, and
+    # still works -- it's just not part of profit_margin_percentage's
+    # real formula below, so computing it here would be a real, wasted
+    # per-job cost for a value nobody reads. Revenue population for the
+    # margin below is still
     # `revenue_totals` above (Top Earner's Job.total-attributed share),
     # explicitly NOT the separate Total Revenue tile's Paid-invoices-only
-    # figure -- that part of the original resolution is unchanged.
+    # figure.
     assigned_counts, archived_counts = _accumulate_completion_counts(tenant_id, period_start)
 
     # Current-month revenue, for goal progress -- calculate_top_earner()
@@ -327,10 +318,10 @@ def get_technician_stats(tenant):
     # function the Goals endpoints themselves use to decide "what month is
     # it" -- rather than this file separately deriving its own notion of
     # "today," which could silently disagree with Goals' if the two were
-    # computed differently. current_month() uses timezone.localdate()
-    # (2026-08-21 fix) -- correct relative to settings.TIME_ZONE ('UTC')
-    # regardless of the server's own OS clock timezone, not merely
-    # correct as long as the OS clock happens to also be UTC.
+    # computed differently. current_month() uses timezone.localdate() --
+    # correct relative to settings.TIME_ZONE ('UTC') regardless of the
+    # server's own OS clock timezone, not merely correct as long as the
+    # OS clock happens to also be UTC.
     month_date = current_month()
     current_month_start = timezone.make_aware(datetime.combine(month_date, time.min))
     current_month_jobs = list(JobberJob.objects.filter(
@@ -384,10 +375,9 @@ def get_technician_stats(tenant):
         total_seconds = stats['total_seconds'] if stats else 0
         tracked_job_count = stats['tracked_job_count'] if stats else 0
 
-        # PENDING CONFIRMATION status lifted (2026-08-31, approved) -- see
-        # _accumulate_technician_callback_stats()'s own docstring for the
-        # full reasoning (assigned_users attribution, full-credit count vs.
-        # proportional-dollar split, the has_unknown_callback_cost flag).
+        # See _accumulate_technician_callback_stats()'s own docstring for
+        # the full reasoning (assigned_users attribution, full-credit count
+        # vs. proportional-dollar split, the has_unknown_callback_cost flag).
         cb_stats = callback_stats.get(tech.id)
         callback_visits_done = cb_stats['callback_visits_done'] if cb_stats else 0
         callback_dollars_lost = cb_stats['callback_dollars_lost'] if cb_stats else 0.0
@@ -406,12 +396,11 @@ def get_technician_stats(tenant):
             round(total_seconds / tracked_job_count) if tracked_job_count > 0 else None
         )
 
-        # SUPERSEDED FORMULA (2026-09-06, direct TL decision -- see this
-        # function's own docstring for why labour_rate was dropped).
-        # profit_margin_percentage is now (revenue - callback_dollars_
-        # lost) / revenue x 100 -- reusing revenue_totals and
+        # profit_margin_percentage is (revenue - callback_dollars_lost) /
+        # revenue x 100 -- reusing revenue_totals and
         # _accumulate_technician_callback_stats()'s own output directly,
-        # no new calculation. This is deliberately NOT a full accounting
+        # no new calculation (see this function's own docstring for why
+        # labour_rate isn't used). This is deliberately NOT a full accounting
         # margin (no materials/other costs) -- it specifically measures
         # how much of this technician's revenue was eaten by real
         # callbacks (see TechnicianCard's own tooltip for the same
@@ -479,9 +468,9 @@ def get_technician_stats(tenant):
             'revenue_per_hour': round(revenue_per_hour, 2) if revenue_per_hour is not None else None,
             'avg_job_duration_seconds': avg_job_duration_seconds,
             'completion_percentage': completion_percentage,
-            # New (2026-09-03) -- the raw counts completion_percentage
-            # itself is computed from, exposed alongside it so the drawer
-            # can show "X of Y jobs" instead of just the ratio. Reuses
+            # The raw counts completion_percentage itself is computed
+            # from, exposed alongside it so the drawer can show "X of Y
+            # jobs" instead of just the ratio. Reuses
             # `assigned`/`archived_count` from _accumulate_completion_counts()
             # above directly -- not re-derived. Prefixed `completion_` on
             # purpose: this is a GENUINELY DIFFERENT population from
@@ -492,15 +481,13 @@ def get_technician_stats(tenant):
             # a real, silent mismatch, not just a naming nitpick.
             'completion_jobs_assigned': assigned,
             'completion_jobs_archived': archived_count,
-            # (revenue - callback_dollars_lost) / revenue x 100 (2026-09-06,
-            # superseded direct TL decision -- see the computation above for
-            # the full reasoning). null (not 0%) only when revenue itself is
-            # 0 this window -- never a divide-by-zero or a fabricated
-            # number.
+            # (revenue - callback_dollars_lost) / revenue x 100 -- see the
+            # computation above for the full reasoning. null (not 0%) only
+            # when revenue itself is 0 this window -- never a
+            # divide-by-zero or a fabricated number.
             'profit_margin_percentage': profit_margin_percentage,
             'team_revenue_share_percentage': team_revenue_share_percentage,
-            # New (2026-08-31, approved) -- backend-only this round, no
-            # frontend wiring yet. callback_visits_done: full credit to
+            # callback_visits_done: full credit to
             # every real assignee (assigned_users), same convention as
             # jobs_completed. callback_rate: null only when jobs_completed
             # is 0 (no data), a real 0.0 otherwise. callback_dollars_lost
@@ -543,8 +530,11 @@ class JobberTechnicianStatsView(APIView):
     """
     GET /v1/jobber/technician-stats/
     Per-technician real stats backing the Electricians panel's card +
-    drawer fields (see PROJECT_CONTEXT.md for exactly which fields this
-    covers and which remain mock/deferred). Reads local tables only via
+    drawer fields: revenue, jobs_completed, revenue_per_hour,
+    avg_job_duration_seconds, completion_percentage, callback stats,
+    profit_margin_percentage, team_revenue_share_percentage, and monthly +
+    annual goal progress (see get_technician_stats()'s own docstring for
+    what's deliberately out of scope). Reads local tables only via
     ensure_fresh() -- never calls Jobber directly.
     """
     permission_classes = [CustomerPermission]
