@@ -1,5 +1,5 @@
 """
-Jobber local-table sync engine (Phase 2 local-sync design doc, §2-§4).
+Jobber local-table sync engine.
 
 sync_tenant() is the single entry point: runs one sync attempt for one
 tenant's JobberAccount, in dependency order (Clients + Users, then Jobs,
@@ -8,11 +8,10 @@ one JobberSyncRun row per attempt and using that same row as the
 cross-process concurrency lock (select_for_update()).
 
 ensure_fresh(tenant, entities, require_complete) is the stale-request
-trigger built on top of sync_tenant() — it's what a view calls before
-reading local tables. Not built here (a later step): actually wiring any
-view to call it and read local data instead of Jobber live — that's a
-separate, explicit cutover step once the local-read paths built alongside
-the live ones have been compared and approved.
+trigger built on top of sync_tenant() — called by every real Jobber view
+(Jobs, Invoices, Accounts, Employees, Electricians Summary, Technician
+Stats, Monthly Revenue, Duration by Type, Revenue Composition) before it
+reads local tables.
 """
 
 import logging
@@ -40,36 +39,26 @@ from helpers.constants import JOBBER_SYNC_STATUS
 
 logger = logging.getLogger(__name__)
 
-# Whole-sync wall-clock ceiling, per the design doc's §3/FR-307 section — a
-# proposed default, not yet measured against real data volume beyond the one
-# connected test tenant. Checked before starting each new page fetch inside
-# fetch_all_pages_bounded(), not mid-page.
+# Whole-sync wall-clock ceiling — not yet measured against real data
+# volume beyond the one connected test tenant. Checked before starting
+# each new page fetch inside fetch_all_pages_bounded(), not mid-page.
 SYNC_WALL_CLOCK_CEILING = timedelta(seconds=25)
 
 ALL_ENTITIES = ('clients', 'users', 'jobs', 'visits', 'invoices', 'timesheet_entries', 'expenses')
 
-# ensure_fresh()'s staleness threshold. Originally the design doc's
-# proposed default (20 minutes, inside the 15-30 min window already
-# flagged elsewhere in this codebase). Lowered to 10 minutes (2026-09-15,
-# approved manual_sync_and_faster_staleness_proposal.md) alongside the
-# new manual "Sync Now" trigger — a shorter automatic window plus an
-# on-demand manual one together mean a customer waits less, either way,
-# for fresher local data. Single source of this constant — confirmed via
-# grep, no duplicated copy anywhere else in the codebase.
+# ensure_fresh()'s staleness threshold. Paired with the manual "Sync Now"
+# trigger so a customer isn't stuck waiting on the automatic window
+# alone. Single source of this constant — no duplicated copy anywhere
+# else in the codebase.
 STALENESS_THRESHOLD = timedelta(minutes=10)
 
-# Callback-detection window (2026-08-30, per PART A of the approved
-# addition to callback_hours_design.md) — the single, named home of the
-# "how many days late still counts as a callback" rule. Referenced ONLY
-# from detect_and_freeze_callbacks() below, nowhere else — confirmed no
-# other constant/hardcoded day-count for this exists anywhere in the
-# project (see callback_frontend_audit.md's Step 2 findings, which is
-# exactly what prompted adding this named constant instead of a bare
-# literal). Measured from the job's LAST COMPLETED visit before the
-# reopen, NOT from first_archived_at — archival can lag the actual work
-# by days on its own, so anchoring to first_archived_at would measure the
-# wrong interval. See detect_and_freeze_callbacks()'s own docstring for
-# the exact mechanics.
+# Callback-detection window — the single, named home of the "how many
+# days late still counts as a callback" rule. Referenced ONLY from
+# detect_and_freeze_callbacks() below. Measured from the job's LAST
+# COMPLETED visit before the reopen, NOT from first_archived_at —
+# archival can lag the actual work by days on its own, so anchoring to
+# first_archived_at would measure the wrong interval. See
+# detect_and_freeze_callbacks()'s own docstring for the exact mechanics.
 CALLBACK_WINDOW_DAYS = 14
 
 ENTITY_MODELS = {
@@ -88,10 +77,9 @@ def _to_decimal(value):
     Convert a raw Jobber JSON number to Decimal via str() first — never
     Decimal(value) directly on a float. Decimal(19.99) bakes that float's
     own binary representation error into the result (Decimal('19.9899999999
-    999948...')); Decimal(str(19.99)) does not. This is precisely the
-    floating-point risk the design doc's total/amount/balance
-    float-to-Decimal reasoning is about — declaring the column DecimalField
-    doesn't prevent it by itself, this conversion is what does.
+    999948...')); Decimal(str(19.99)) does not. Declaring the column
+    DecimalField doesn't prevent this by itself — this conversion is what
+    does.
     """
     if value is None:
         return None
@@ -113,17 +101,15 @@ def _to_datetime(value):
 
 def _claim_run(tenant):
     """
-    select_for_update() the tenant's most recent JobberSyncRun row inside a
-    short transaction — claiming a row IS starting a sync run (design doc's
-    concurrency guard). The actual Jobber calls happen OUTSIDE this
-    transaction; this only decides whether to proceed, then commits
-    immediately.
+    select_for_update()s the tenant's most recent JobberSyncRun row inside a
+    short transaction — claiming a row IS starting a sync run. The actual
+    Jobber calls happen OUTSIDE this transaction; this only decides whether
+    to proceed, then commits immediately.
 
     Returns the freshly-created RUNNING row this caller should update when
     done, or None if another process already holds a non-stale lock (that
-    caller should proceed against whatever's locally there now — see the
-    design doc's concurrency-guard section on this being an accepted trade,
-    not an oversight).
+    caller should proceed against whatever's locally there now — an
+    accepted trade, not an oversight).
     """
     with transaction.atomic():
         latest = (
@@ -200,10 +186,9 @@ def _extract_custom_field(custom_fields, label, value_key):
     usable keys at all if its real type didn't match any fragment we
     spread (see the comment on _USERS_QUERY).
 
-    label is matched via .strip() equality, NOT an exact match --
-    confirmed live (2026-08-20) that this real account's "Expertise" field
-    has a trailing space in its actual label ("Expertise "). Hardcoding
-    that exact string would only work by
+    label is matched via .strip() equality, NOT an exact match -- this
+    account's "Expertise" field has a trailing space in its actual label
+    ("Expertise "). Hardcoding that exact string would only work by
     accident for this one account and break the moment anyone re-types
     the field name without the trailing space.
 
@@ -277,33 +262,26 @@ def sync_jobs(account, tenant, deadline, clients_complete):
     # _client_tags_display import above, jobs.py side of the cycle this time.
     from apps.jobber.api.jobs import _format_address, _humanize_status, _job_service_type
 
-    # first=client.SYNC_JOBS_PAGE_SIZE (2026-09-07, URGENT fix) -- NOT the
-    # shared FETCH_ALL_PAGE_SIZE default every other synced entity still
-    # uses. See that constant's own comment in client.py for the real,
-    # confirmed diagnostic behind this: _SYNC_JOBS_QUERY's per-job nested
-    # cost (visits/timeSheetEntries/jobCosting/lineItems) now exceeds
-    # Jobber's query-cost ceiling at the shared page size, for this entity
-    # only -- Clients/Users/Invoices are not implicated and stay untouched.
+    # first=client.SYNC_JOBS_PAGE_SIZE, NOT the shared FETCH_ALL_PAGE_SIZE
+    # default every other synced entity uses — see that constant's own
+    # comment in client.py. _SYNC_JOBS_QUERY's per-job nested cost
+    # (visits/timeSheetEntries/jobCosting/lineItems) exceeds Jobber's
+    # query-cost ceiling at the shared page size, for this entity only —
+    # Clients/Users/Invoices are unaffected.
     nodes, own_complete = client.fetch_all_pages_bounded(
         client.fetch_jobs_for_sync, account, 'fetch_jobs_for_sync', deadline,
         first=client.SYNC_JOBS_PAGE_SIZE,
     )
 
-    # New (2026-09-04, approved callback_detection_trigger_fix_proposal.md)
-    # -- the real "did this job's status just transition INTO archived
-    # this pass" signal detect_and_freeze_callbacks() now triggers on,
-    # decoupled from first_archived_at's own one-time capture below (see
-    # that block's own comment for why conflating the two was a real,
-    # confirmed bug: first_archived_at only ever fires once per job, so
-    # using it as the detection trigger silently missed every reopen that
-    # happened after an earlier, callback-free sync had already archived
-    # the job once). Bulk-fetched ONCE here, before the per-node loop --
-    # one extra query per sync pass, not per job. A job with no prior
-    # local row at all (`previous_statuses.get(jobber_id)` is None) counts
-    # as "was NOT archived before" -- preserves the same self-heal
-    # bootstrap property first_archived_at's own capture rule already
-    # relies on for a job that's already archived the first time this
-    # feature ever sees it.
+    # The "did this job's status just transition INTO archived this pass"
+    # signal detect_and_freeze_callbacks() triggers on — deliberately
+    # decoupled from first_archived_at's own one-time capture below, since
+    # first_archived_at only ever fires once per job and can't be reused
+    # as a repeatable trigger for later reopens (see that block's own
+    # comment). Bulk-fetched once here, before the per-node loop, not per
+    # job. A job with no prior local row counts as "was NOT archived
+    # before" — a job already archived the first time this feature ever
+    # sees it still gets picked up.
     previous_statuses = dict(
         JobberJob.objects.filter(tenant=tenant, jobber_id__in=[n.get('id') for n in nodes if n.get('id')])
         .values_list('jobber_id', 'job_status')
@@ -362,36 +340,28 @@ def sync_jobs(account, tenant, deadline, clients_complete):
     if complete:
         JobberJob.objects.filter(tenant=tenant, is_active=True).exclude(jobber_id__in=seen_ids).update(is_active=False)
 
-    # Capture rule (2026-08-30, approved callback_hours_design.md) — freeze
-    # first_archived_at the FIRST sync pass that observes a job as archived;
-    # never overwritten again, including across a later reopen + re-archive.
-    # This is "first SYNC-OBSERVED archival," not Jobber's true archival
-    # instant — there's no webhook in this design (Phase 2 is pull-only), so
-    # a job that cycles active->archived->reopened->archived FASTER than the
-    # sync interval could have its second archival mistaken for its first. A
-    # real, accepted limitation, the same class of tradeoff as the
-    # deactivation sweep's own completeness gating above — not fixable here
-    # without webhooks. Also self-heals for a job that was ALREADY archived
-    # before this feature shipped: it simply gets first_archived_at set at
-    # whatever sync first runs post-deployment, folding its entire prior
-    # history into "original" — acceptable since this feature is about
-    # catching reopens going forward, not auditing history retroactively
-    # (see callback_hours_design.md).
+    # Freezes first_archived_at the FIRST sync pass that observes a job as
+    # archived; never overwritten again, including across a later reopen +
+    # re-archive. This is "first SYNC-OBSERVED archival," not Jobber's true
+    # archival instant — there's no webhook in this design (pull-only), so
+    # a job that cycles active->archived->reopened->archived FASTER than
+    # the sync interval could have its second archival mistaken for its
+    # first. A real, accepted limitation. Also self-heals for a job
+    # already archived before this feature shipped: it gets
+    # first_archived_at set at whatever sync first runs, folding its prior
+    # history into "original".
     #
     # Runs unconditionally, NOT gated on `complete` — even a partial pull
     # should still freeze the archival moment for whatever jobs it did see
-    # this pass; there's no reason to withhold that just because some other
-    # job elsewhere in the account wasn't reached this round.
+    # this pass.
     #
     # This local `newly_archived_ids` is PURELY internal bookkeeping for
-    # the .update() call directly below — it is deliberately NOT returned
-    # or reused as a trigger for anything else (2026-09-04 fix). It used
-    # to be returned and fed straight into detect_and_freeze_callbacks(),
-    # which was the real, confirmed bug: this only ever contains a job the
-    # FIRST time its anchor is set, so a reopen that happens after an
-    # earlier, callback-free sync already consumed the anchor was silently
-    # never checked. The real trigger for detection is now
-    # just_transitioned_to_archived_ids above, computed independently.
+    # the .update() call directly below — deliberately NOT returned or
+    # reused as a trigger for anything else. It only ever contains a job
+    # the FIRST time its anchor is set, so it can't serve as a repeatable
+    # callback-detection trigger for later reopens; that's what
+    # just_transitioned_to_archived_ids above is for, computed
+    # independently.
     newly_archived_ids = list(
         JobberJob.objects.filter(tenant=tenant, job_status='archived', first_archived_at__isnull=True)
         .values_list('id', flat=True)
@@ -410,41 +380,30 @@ def sync_jobs(account, tenant, deadline, clients_complete):
 def sync_visits(account, tenant, job_nodes, complete):
     """
     Visits are nested inside each Job node (job.visits), not pulled via
-    their own top-level Jobber query. Unlike Clients/Users/Jobs/Invoices,
-    there's no independently-confirmed root `visits` connection in Jobber's
-    schema for this codebase to build against — every other query in
-    client.py was written against a field shape already confirmed live
-    (either from Jobber's docs or a real account response) before shipping;
-    a standalone `visits(first, after)` query would be a guess this project
-    has repeatedly avoided making (see e.g. the Tag.name-vs-label
-    correction). job.visits[0..n].assignedUsers, by contrast, has been
-    proven working in production since the visits(first:1)->visits(first:10)
-    widening. So this derives Visit rows from the SAME job_nodes sync_jobs()
-    already pulled this run (via the sync-only jobs query, which asks for
-    each visit's own id alongside assignedUsers) — zero new schema risk, and
-    it avoids a second, wasteful full pull of every job just to re-read its
-    visits.
+    their own top-level Jobber query — there's no independently-confirmed
+    root `visits` connection in Jobber's schema; job.visits[0..n]
+    .assignedUsers is the confirmed-working shape already proven in
+    production. Deriving Visit rows from the SAME job_nodes sync_jobs()
+    already pulled this run avoids a second, wasteful full pull of every
+    job just to re-read its visits.
 
     If Jobber's schema does have a standalone `visits` query and a more
-    direct pull is preferred later, this can be revisited — flagging that
-    as a deliberate choice made under uncertainty, not an oversight.
+    direct pull is preferred later, this can be revisited — a deliberate
+    choice made under uncertainty, not an oversight.
 
     Only the first assignedUser per visit is stored on assigned_user
-    (single nullable FK, per the approved design, matching the live-proxy's
-    own existing "first assignee" convention — _first_assignee). This
-    field and its behavior are UNCHANGED here — still consumed by live,
+    (single nullable FK) — matches the live-proxy's own existing "first
+    assignee" convention (_first_assignee). Still consumed by live,
     shipped production code (JobberJobsView.get()'s "Assigned To" column
     via jobs.py's _local_first_assignee()/assigned_user_name).
 
-    NEW (2026-08-17): assigned_users (M2M) additionally stores EVERY
-    assignedUser on the visit, not just the first — for Top Earner's
-    per-technician revenue split, which needs to know every assignee, not
-    a single "first" one. Populated from the SAME assignedUsers(first: 5)
-    data already fetched for assigned_user above — no new Jobber query
-    cost, no new schema risk. This is the fix for the gap this function's
-    own docstring used to flag here (a visit with more than one assignee
-    only having its first one stored locally) — additive, not a
-    replacement of the existing behavior.
+    assigned_users (M2M) additionally stores EVERY assignedUser on the
+    visit, not just the first — needed for per-technician revenue-split
+    calculations, which require knowing every assignee, not a single
+    "first" one. Populated from the SAME assignedUsers(first: 5) data
+    already fetched for assigned_user above — no new Jobber query cost,
+    no new schema risk. Additive, not a replacement of assigned_user's
+    existing behavior.
 
     `complete` is sync_jobs()'s own completeness flag for this run, passed
     through unchanged — Visit data can't be any more complete than the Job
@@ -490,7 +449,7 @@ def sync_visits(account, tenant, job_nodes, complete):
                 },
             )
 
-            # New: populate the additive assigned_users M2M with EVERY
+            # Populates the additive assigned_users M2M with EVERY
             # assignee, reusing the exact same `assigned` list resolved
             # above — not a second Jobber fetch. .set() requires a saved
             # instance, so this happens after update_or_create() returns,
@@ -520,31 +479,20 @@ def sync_visits(account, tenant, job_nodes, complete):
 def sync_timesheet_entries(account, tenant, job_nodes, complete):
     """
     TimeSheetEntries are nested inside each Job node (job.timeSheetEntries),
-    not pulled via a standalone top-level query — same situation as Visits,
-    confirmed against the schema rather than assumed: Query.timeSheetEntries
-    does exist, but its own description is "All timesheet entries for users
-    on a given day" and its filter type (TimeSheetEntriesFilterAttributes)
-    has no job filter field at all — there is no way to ask the root query
-    "every entry for this job." So this derives JobberTimeSheetEntry rows
-    from the SAME job_nodes sync_jobs() already pulled this run (via the
-    sync-only jobs query, which asks for each entry's
-    id/startAt/endAt/finalDuration/user.id) — zero new schema risk, no
-    second per-job round-trip.
+    not pulled via a standalone top-level query — Query.timeSheetEntries
+    exists, but its filter type (TimeSheetEntriesFilterAttributes) has no
+    job filter field at all, so there's no way to ask the root query
+    "every entry for this job." Deriving rows from the SAME job_nodes
+    sync_jobs() already pulled this run avoids a second per-job round-trip.
 
     Stores every raw entry AS-IS, unmerged — even when the same (job, user)
     pair has overlapping time ranges. This is a real, confirmed case, not
-    hypothetical: one technician's own stop/restart mistake produced two
-    genuinely overlapping entries for one real job in this project's test
-    data (04:00-08:00 and 04:00-09:00, same person). Merging overlapping
-    intervals into a duration figure — and the separate, still-open
-    question of how to handle DIFFERENT users overlapping on the same job
-    (default: sum each user's own post-merge hours independently, i.e. a
-    labour-hours definition, not wall-clock elapsed time — flagged as a
-    real open question to revisit if a genuine case ever appears, see
-    PROJECT_CONTEXT.md) — is explicitly Part B's job (the average/merge
-    math), not this sync step's. This table's only job is to mirror
-    Jobber's real entries faithfully; no row here is ever merged, split,
-    or dropped for overlap reasons.
+    hypothetical: a technician's own stop/restart mistake can produce two
+    genuinely overlapping entries for the same job. Merging overlapping
+    intervals into a duration figure is a read-time concern (see
+    calculate_job_duration_by_user()), not this sync step's — this table's
+    only job is to mirror Jobber's real entries faithfully; no row here is
+    ever merged, split, or dropped for overlap reasons.
 
     `complete` is sync_jobs()'s own completeness flag for this run, passed
     through unchanged — same reasoning as sync_visits(): entry data can't
@@ -588,12 +536,11 @@ def sync_timesheet_entries(account, tenant, job_nodes, complete):
                     'started_at': _to_datetime(entry_node.get('startAt')),
                     'ended_at': _to_datetime(entry_node.get('endAt')),
                     'jobber_created_at': _to_datetime(entry_node.get('createdAt')),
-                    # New (2026-09-03, approved labor_cost_profit_margin_
-                    # proposal.md) -- real, native per-entry Jobber wage
-                    # rate. _to_decimal(None) is None, preserved as-is (not
-                    # coalesced to 0 here) -- the "0 = not entered"
-                    # interpretation is a read-time decision, made where
-                    # labor cost is computed, not baked into the sync.
+                    # Real, native per-entry Jobber wage rate.
+                    # _to_decimal(None) stays None (not coalesced to 0
+                    # here) -- the "0 = not entered" interpretation is a
+                    # read-time decision, made where labor cost is
+                    # computed, not baked into the sync.
                     'labour_rate': _to_decimal(entry_node.get('labourRate')),
                     'synced_at': timezone.now(),
                     'is_active': True,
@@ -609,115 +556,87 @@ def sync_timesheet_entries(account, tenant, job_nodes, complete):
 
 def detect_and_freeze_callbacks(account, tenant, job_ids_to_check):
     """
-    Approved design (2026-08-30, callback_hours_design.md, PART A addition
-    same day; trigger mechanism fixed 2026-09-04, see below). For each job
-    in `job_ids_to_check`, determine whether the job's real createdAt-
-    latest visit is a genuine callback — its own `invoice` is null, AND it
-    happened within CALLBACK_WINDOW_DAYS of the job's last completed visit
-    before it — and freeze that finding locally onto that specific visit.
+    For each job in `job_ids_to_check`, determines whether the job's real
+    createdAt-latest visit is a genuine callback — its own `invoice` is
+    null, AND it happened within CALLBACK_WINDOW_DAYS of the job's last
+    completed visit before it — and freezes that finding locally onto that
+    specific visit.
 
-    REAL TRIGGER, FIXED 2026-09-04 (callback_detection_trigger_fix_
-    proposal.md) — `job_ids_to_check` is now the set of jobs whose
-    job_status just transitioned INTO archived THIS sync pass (computed
-    independently in sync_jobs(), by comparing each job's previous local
-    job_status against its newly-pulled one), NOT jobs whose
-    first_archived_at was just set. This fixes a real, confirmed bug: the
-    two were previously the same signal, and first_archived_at only ever
-    transitions null->set ONCE per job's lifetime — so if any ordinary
-    sync landed between a job's original (callback-free) archival and a
-    later reopen, the anchor was already consumed, this function was never
-    called again for that job, and a genuine later callback was silently
-    never checked, permanently. Decoupling the two means this function now
-    runs on EVERY transition into archived, not just the first ever one —
-    first_archived_at itself (the original-vs-callback hour-split anchor)
-    is completely unaffected by this fix, still frozen once, forever, per
-    job, exactly as before.
+    `job_ids_to_check` is the set of jobs whose job_status just
+    transitioned INTO archived THIS sync pass (computed in sync_jobs() by
+    comparing each job's previous local job_status against its
+    newly-pulled one) — NOT jobs whose first_archived_at was just set.
+    first_archived_at only ever transitions null->set ONCE per job's
+    lifetime, so using it as the trigger would silently miss any later
+    reopen once that anchor is consumed. Decoupling the two means this
+    function runs on EVERY transition into archived, however many times
+    that happens — first_archived_at itself (the original-vs-callback
+    hour-split anchor) still gets frozen once, forever, per job.
 
     A SPECIFIC VISIT's is_callback flag, once set True, is never
-    re-evaluated or unset — that part of "freeze-once" is unchanged. What
-    changed is that this function can now run MULTIPLE times for the same
-    job (once per real reopen cycle), each time checking whatever is
-    CURRENTLY the createdAt-latest visit — so a job can end up with more
-    than one real visit flagged is_callback=True over its lifetime. See
-    the new open question below about what that means for
+    re-evaluated or unset. Since this function can run MULTIPLE times for
+    the same job (once per real reopen cycle), each time checking whatever
+    is CURRENTLY the createdAt-latest visit, a job can end up with more
+    than one real visit flagged is_callback=True over its lifetime — see
+    the open question below about what that means for
     callback_bled_amount specifically.
 
-    PART A (2026-08-30) — the day-window check. Confirmed genuinely absent
-    anywhere in this project before this (see callback_frontend_audit.md's
-    Step 2: no 14-day or any other day-count constant existed anywhere,
-    despite the original SRS suggesting one). CALLBACK_WINDOW_DAYS (module
-    constant above) is the single, named home of this rule — referenced
-    ONLY here. Measured from the job's LAST COMPLETED visit's own real
-    completedAt, NOT from first_archived_at — archival can lag the actual
-    work by days on its own, so anchoring to first_archived_at would
-    measure the wrong interval (how late the JOB was archived, not how
-    late the SECOND VISIT happened relative to the first one finishing).
-    If no other visit has a real completedAt before the reopen at all, this
-    does NOT assume the window is satisfied — no data is never treated as
-    "must be recent," same "no data != assumed" principle used everywhere
-    else in this app. If the reopen falls outside the window, is_callback
-    is simply never set — per the freeze-once property below, this is a
-    forward-only change: it does not retroactively re-evaluate anything
-    already frozen under the pre-window rule.
+    The day-window check: CALLBACK_WINDOW_DAYS (module constant above) is
+    the single, named home of this rule — referenced ONLY here. Measured
+    from the job's LAST COMPLETED visit's own real completedAt, NOT from
+    first_archived_at — archival can lag the actual work by days on its
+    own, so anchoring to first_archived_at would measure the wrong
+    interval (how late the JOB was archived, not how late the SECOND
+    VISIT happened relative to the first one finishing). If no other
+    visit has a real completedAt before the reopen at all, this does NOT
+    assume the window is satisfied — no data is never treated as "must be
+    recent," same "no data != assumed" principle used everywhere else in
+    this app. If the reopen falls outside the window, is_callback is
+    simply never set — this is a forward-only change: it does not
+    retroactively re-evaluate anything already frozen under an earlier
+    version of this rule.
 
     THIS FUNCTION IS THE SINGLE, SOLE PLACE the "what counts as a callback"
     definition lives — no other view, serializer, or frontend logic should
-    ever duplicate or re-derive it (confirmed 2026-08-30: is_callback/
-    callback_bled_amount are only ever written here; backfill_callback_bled_
-    amount.py recomputes callback_bled_amount using this exact same formula,
-    it does not encode a second definition).
+    ever duplicate or re-derive it. is_callback/callback_bled_amount are
+    only ever written here; backfill_callback_bled_amount.py recomputes
+    callback_bled_amount using this exact same formula, it does not encode
+    a second definition.
 
-    DELIBERATE, KNOWN PROPERTY (2026-08-30, not a hidden limitation) — since
-    every result here is frozen at write time and never re-evaluated: a
-    FUTURE CHANGE to this function's detection rule (e.g. adding a day
-    window between first_archived_at and the callback visit's own
-    createdAt, or changing the invoice-null criterion itself) affects ONLY
-    callbacks detected AFTER that code change ships. It does NOT
-    retroactively recompute or reinterpret any job/visit already frozen
-    under the old rule — those keep their old is_callback/
-    callback_bled_amount values forever, silently, unless someone
-    explicitly writes and runs a one-off backfill against the new rule
-    (the same pattern backfill_callback_bled_amount.py already established
-    for a different kind of correction). Any change to this function
-    should call this out explicitly in its own commit/PR description, not
-    assume it applies uniformly to historical data.
+    DELIBERATE, KNOWN PROPERTY, not a hidden limitation — since every
+    result here is frozen at write time and never re-evaluated: a FUTURE
+    CHANGE to this function's detection rule (e.g. adding a day window
+    between first_archived_at and the callback visit's own createdAt, or
+    changing the invoice-null criterion itself) affects ONLY callbacks
+    detected AFTER that code change ships. It does NOT retroactively
+    recompute or reinterpret any job/visit already frozen under an earlier
+    rule — those keep their old is_callback/callback_bled_amount values
+    forever, silently, unless someone explicitly writes and runs a one-off
+    backfill against the new rule. Any change to this function should call
+    this out explicitly in its own commit/PR description, not assume it
+    applies uniformly to historical data.
 
     NOT visit-based exclusion of timesheet hours — TimeSheetEntry.visit is
-    confirmed unreliable for that (verify_job1_manual_entry_visit.py found
-    it null even for a normal, non-callback, manually-added entry). The
-    hours split below goes through calculate_job_duration_by_user()'s new
-    created_before/created_at_or_after params instead, keyed on this job's
-    own frozen first_archived_at.
+    confirmed unreliable for that (null even for a normal, non-callback,
+    manually-added entry). The hours split below goes through
+    calculate_job_duration_by_user()'s created_before/created_at_or_after
+    params instead, keyed on this job's own frozen first_archived_at.
 
     One targeted live call per job whose status just transitioned into
     archived (client.fetch_job_visits_for_callback_detection() —
-    Query.job(id:), visits only) — NOT a full account scan, avoiding the
-    exact real cost mistake already found and fixed in
-    verify_callback_bleed.py earlier in this same investigation (a
-    full-account job search rejected outright at 28330/10000 query-cost
-    points).
+    Query.job(id:), visits only) — NOT a full account scan, which blows
+    past Jobber's query-cost ceiling.
 
-    RESOLVED 2026-09-04, not a limitation anymore: this used to only ever
-    detect a callback across the FIRST reopen-and-rearchive cycle after a
-    job's original archival (a second reopen got no fresh pass, since
-    first_archived_at — the old, incorrect trigger — is a one-time,
-    never-reset value). Fixed as a direct consequence of the trigger fix
-    above: every real transition into archived now gets its own detection
-    pass, so a second, third, or Nth reopen is checked too, not just the
-    first.
-
-    NEW OPEN QUESTION this surfaces, NOT decided or built here: since a
-    job can now end up with more than one real visit flagged
-    is_callback=True over its lifetime, but JobberJob.callback_bled_amount
-    is a single field per job, multiple real callbacks on the same job
-    can't each keep their own dollar figure as this function is written
-    below — it simply overwrites callback_bled_amount with whichever
-    callback was detected most recently. Leaning toward SUMMING across
-    every real callback ever detected for a job instead (a lifetime total,
-    not "most recent") once this is actually observed in real data — not
-    yet: this account has had exactly one real callback, ever, across all
-    testing so far, so there is nothing to sum. Revisit when a real second
-    callback on the same job actually appears.
+    OPEN QUESTION, NOT decided or built here: since a job can end up with
+    more than one real visit flagged is_callback=True over its lifetime,
+    but JobberJob.callback_bled_amount is a single field per job, multiple
+    real callbacks on the same job can't each keep their own dollar figure
+    as this function is written below — it simply overwrites
+    callback_bled_amount with whichever callback was detected most
+    recently. Leaning toward SUMMING across every real callback ever
+    detected for a job instead (a lifetime total, not "most recent") once
+    this is actually observed in real data. Revisit when a real second
+    callback on the same job appears.
 
     One named, accepted limitation, not silently engineered around: the
     DECISION below (which visit is createdAt-latest, does it have an
@@ -739,10 +658,13 @@ def detect_and_freeze_callbacks(account, tenant, job_ids_to_check):
     is skipped — and because the job's status won't transition into
     archived again unless it first leaves archived and comes back, THIS
     SPECIFIC transition is never retried (a *different* later reopen would
-    still get its own, fresh chance). Every real caller today requests
-    jobs/visits/timesheet_entries together (e.g. duration_by_type.py's
-    ensure_fresh() call), so this hasn't been observed live — flagged as a
-    known risk of the design as specified, not a silent gap.
+    still get its own, fresh chance). This function only ever runs when
+    'timesheet_entries' is in `wanted` (see sync_tenant()'s call order),
+    and every real caller that requests 'timesheet_entries' also requests
+    'visits' alongside it — so this hasn't been observed live. Some real
+    callers request 'jobs' without either (e.g. invoices.py, accounts.py),
+    but those never reach this function at all. A known risk of the
+    design as specified, not a silent gap, if that pairing ever changes.
     """
     # Deferred import — electricians_summary.py already imports
     # ensure_fresh from THIS module at its own top level; importing
@@ -779,14 +701,13 @@ def detect_and_freeze_callbacks(account, tenant, job_ids_to_check):
             # Not a callback under this definition — nothing to freeze.
             continue
 
-        # PART A (2026-08-30, approved) — CALLBACK_WINDOW_DAYS check. The
-        # reopen must have happened within CALLBACK_WINDOW_DAYS of the
-        # job's LAST COMPLETED visit BEFORE it — not from first_archived_at,
-        # which can lag the actual work by days on its own and would
-        # measure the wrong interval entirely. "Last completed visit
-        # before the reopen" = the visit (other than the candidate itself)
-        # with the latest real completedAt that is still chronologically
-        # before the reopen visit's own createdAt.
+        # CALLBACK_WINDOW_DAYS check — the reopen must have happened within
+        # CALLBACK_WINDOW_DAYS of the job's LAST COMPLETED visit BEFORE it,
+        # not from first_archived_at (see this function's own docstring for
+        # why). "Last completed visit before the reopen" = the visit
+        # (other than the candidate itself) with the latest real
+        # completedAt that is still chronologically before the reopen
+        # visit's own createdAt.
         reopen_at = _to_datetime(latest_visit_raw.get('createdAt'))
         completed_before_reopen = [
             v for v in visits_raw
@@ -835,20 +756,17 @@ def detect_and_freeze_callbacks(account, tenant, job_ids_to_check):
         original_hours = sum(original_by_user.values()) / 3600
         callback_hours = sum(callback_by_user.values()) / 3600
 
-        # Never a fabricated number — same convention as every other
-        # derived money/duration field in this app (the same "empty dict ->
-        # None, never 0" rule calculate_job_duration_seconds() already
-        # applies to itself). Left null if there's no real original-hours
-        # denominator, no real Job.total to divide, OR — FIX (2026-08-30,
-        # proven real on job_number=3) — if callback_by_user is an EMPTY
-        # dict: that means the flagged callback visit has ZERO real
-        # timesheet entries logged against it at all, a genuinely unknown
-        # cost, not a real 0-hour callback. Gating on `callback_by_user`
-        # itself (dict truthiness), not just `callback_hours > 0`, is what
-        # catches this — callback_hours computed from an empty dict is
-        # already 0.0, which is indistinguishable from a real zero by value
-        # alone; the previous version multiplied by that 0.0 and stored a
-        # confident $0.00 instead of leaving this null.
+        # Never a fabricated number — same "no data != 0" convention used
+        # elsewhere in this app (calculate_job_duration_seconds() applies
+        # the same rule to itself). Left null if there's no real
+        # original-hours denominator, no real Job.total to divide, OR if
+        # callback_by_user is an EMPTY dict: that means the flagged
+        # callback visit has ZERO real timesheet entries logged against it
+        # at all, a genuinely unknown cost, not a real 0-hour callback.
+        # Gating on `callback_by_user` itself (dict truthiness), not just
+        # `callback_hours > 0`, is what catches this — callback_hours
+        # computed from an empty dict is already 0.0, which is
+        # indistinguishable from a real zero by value alone.
         callback_bled_amount = None
         if callback_by_user and original_hours > 0 and job.total is not None:
             job_rate = job.total / _to_decimal(original_hours)
@@ -959,11 +877,9 @@ def sync_invoices(account, tenant, deadline, clients_complete, jobs_complete):
 
 def sync_expenses(account, tenant, deadline):
     """
-    Pull every Expense via its own real, standalone Query.expenses
-    connection (2026-09-14, approved cost_breakdown_dynamic_categories_
-    proposal.md) — unlike Visits/TimeSheetEntries, Expense doesn't need
-    to be derived from nested Job data; it has a real root-level query
-    (confirmed live — see verify_query_expenses_shape_and_cost.py).
+    Pulls every Expense via its own real, standalone Query.expenses
+    connection — unlike Visits/TimeSheetEntries, Expense doesn't need to
+    be derived from nested Job data; it has a real root-level query.
 
     Completeness is `own_complete` ONLY — no Clients/Jobs dependency
     gating, unlike sync_invoices(). This is a real, deliberate
@@ -1029,9 +945,8 @@ def _finish_run(run, wanted, counts, had_failure, error_message):
         status_value = JOBBER_SYNC_STATUS[1][0]
     else:
         # Either a ceiling/page-cap cutoff left some entities incomplete, or
-        # a failure hit partway through after real progress on others — the
-        # design doc's own example ("got clients+jobs but timed out on
-        # invoices") is explicitly PARTIAL, not FAILED.
+        # a failure hit partway through after real progress on others —
+        # both are PARTIAL, not FAILED.
         status_value = JOBBER_SYNC_STATUS[2][0]
 
     run.status = status_value
@@ -1042,10 +957,8 @@ def _finish_run(run, wanted, counts, had_failure, error_message):
     run.jobs_synced = counts.get('jobs', {}).get('count', run.jobs_synced)
     run.visits_synced = counts.get('visits', {}).get('count', run.visits_synced)
     run.invoices_synced = counts.get('invoices', {}).get('count', run.invoices_synced)
-    # New (2026-09-15, approved manual_sync_and_faster_staleness_
-    # proposal.md) -- closes the real gap named in the prior version of
-    # this comment: these 2 entities were always synced but never
-    # persisted their own count. Same pattern as the 5 above.
+    # Persists per-entity counts for these last 2 entities too, same
+    # pattern as the 5 above.
     run.timesheet_entries_synced = counts.get('timesheet_entries', {}).get('count', run.timesheet_entries_synced)
     run.expenses_synced = counts.get('expenses', {}).get('count', run.expenses_synced)
     run.save()
@@ -1053,12 +966,11 @@ def _finish_run(run, wanted, counts, had_failure, error_message):
 
 def sync_tenant(account, entities=None):
     """
-    Run one sync attempt for account.tenant, per the design doc's §2/§3/§4.
+    Run one sync attempt for account.tenant.
 
     entities: optional subset of ALL_ENTITIES to sync (e.g. ['jobs',
-    'invoices']). None means "sync everything". A future ensure_fresh()
-    (not built in this step) will use this to sync only what a given view
-    actually needs.
+    'invoices']). None means "sync everything" — ensure_fresh() uses this
+    to sync only what a given caller actually needs.
 
     Returns the JobberSyncRun row for this attempt — either the one this
     call created and finished, or (if another process held a non-stale lock)
@@ -1152,26 +1064,20 @@ def _last_run_was_unclean(tenant):
 
 def ensure_fresh(tenant, entities=None, require_complete=False):
     """
-    Sync-on-demand for a stale request, per the design doc's "wait-for-fresh"
-    architecture. Not wired into any view yet — built for the views to call
-    once the local-read paths are approved.
+    Sync-on-demand for a stale request — called by every real Jobber view
+    before it reads local tables (Jobs, Invoices, Accounts, Employees,
+    Electricians Summary, Technician Stats, Monthly Revenue, Duration by
+    Type, Revenue Composition).
 
     entities: which entities THIS caller needs (e.g. ['jobs', 'clients',
     'visits'] for the Jobs panel). Defaults to ALL_ENTITIES.
 
     require_complete: True for callers that need a full, correct picture to
-    rank from (Accounts, Employees) — per the design doc's section on what
-    ensure_fresh() does when a needed entity comes back PARTIAL: exactly one
-    synchronous retry if the first attempt comes back PARTIAL, then accept
-    PARTIAL either way rather than retrying forever. Paginated callers
-    (Jobs, Invoices) tolerate a PARTIAL/stale pass fine (that's already
+    rank from (Accounts, Employees) — triggers exactly one synchronous
+    retry if the first attempt comes back PARTIAL, then accepts PARTIAL
+    either way rather than retrying forever. Paginated callers (Jobs,
+    Invoices) tolerate a PARTIAL/stale pass fine (that's already
     pagination's normal contract) and should leave this False.
-
-    NOTE: this parameter isn't part of the task's literal two-argument
-    description of this function — it's added because the retry-once-if-
-    PARTIAL rule for Accounts/Employees specifically can't be implemented
-    without ensure_fresh() knowing which kind of caller it is. Flagging this
-    as an addition, not a silent one.
 
     Returns a small result dict:
       - 'last_synced_at': the OLDEST synced_at among the requested entities
@@ -1185,7 +1091,8 @@ def ensure_fresh(tenant, entities=None, require_complete=False):
         ('success'/'partial'/'failed'), or None if nothing was stale enough
         to trigger one.
       - 'entities': per-entity {'was_stale': bool, 'synced_at': datetime}
-        detail — mainly for the comparison test scripts.
+        detail — not currently read by any real caller (every real caller
+        only reads 'last_synced_at' and 'sync_warning').
     """
     wanted = tuple(entities) if entities else ALL_ENTITIES
 
