@@ -18,7 +18,7 @@ def api_exception_handler(exc, context):
     """
     Wired via REST_FRAMEWORK['EXCEPTION_HANDLER'].
     Normalises every DRF error into: {"success": false, "message": "<string>"}
-    Unhandled exceptions (non-DRF) are returned as a JSON 500.
+    Unhandled exceptions (non-DRF) are returned as  JSON 500.
     """
     response = exception_handler(exc, context)
 
