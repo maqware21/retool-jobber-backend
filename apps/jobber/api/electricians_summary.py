@@ -29,21 +29,18 @@ _NOT_CONNECTED_DATA = {
     'jobs_completed': None,
     'avg_job_duration_seconds': None,
     'top_earner': None,
-    # New (2026-09-06, Revenue Health Phase 1) -- see
-    # _local_electricians_summary_response()'s own comment for the
+    # See _local_electricians_summary_response()'s own comment for the
     # confirmed-deliberate population choice.
     'avg_job_value': None,
-    # New (2026-09-09, approved new_customers_metric_proposal.md) -- None
-    # here specifically because the whole account isn't connected, NOT a
-    # real 0 -- see _local_electricians_summary_response()'s own comment
-    # for why a real, connected 0 is a different, valid answer.
+    # None here specifically because the whole account isn't connected,
+    # NOT a real 0 -- see _local_electricians_summary_response()'s own
+    # comment for why a real, connected 0 is a different, valid answer.
     'new_customers': None,
     'labor_cost': None,
-    # New (2026-09-09) -- None here specifically because the whole
-    # account isn't connected, NOT a real $0 owed -- see
-    # _local_electricians_summary_response()'s own comment for why a
-    # real, connected $0 (every invoice fully paid) is a different,
-    # valid answer.
+    # None here specifically because the whole account isn't connected,
+    # NOT a real $0 owed -- see _local_electricians_summary_response()'s
+    # own comment for why a real, connected $0 (every invoice fully
+    # paid) is a different, valid answer.
     'outstanding': None,
     'period_months': PERIOD_MONTHS,
     'last_synced_at': None,
@@ -57,7 +54,7 @@ def _merge_intervals(intervals):
     the naive sum of each interval's own length — two overlapping ranges
     count their overlap once, not twice.
 
-    Confirmed decision (2026-08-16): Job 2's real two entries for the same
+    A real example this must get right: two entries for the same
     technician, 04:00-08:00 (14400s) and 04:00-09:00 (18000s), must merge
     to 04:00-09:00 = 18000s, not the naive sum 32400s. This is the function
     that produces that result — sort by start, walk forward, extend the
@@ -84,43 +81,35 @@ def _merge_intervals(intervals):
 
 def calculate_job_duration_by_user(job, created_before=None, created_at_or_after=None):
     """
-    created_before / created_at_or_after (2026-08-30, approved
-    callback_hours_design.md): optional cutoff datetimes, compared against
-    each entry's own real JobberTimeSheetEntry.jobber_created_at, for
-    splitting a job's real entries at its frozen first_archived_at moment
-    (the Callback Bleed original-vs-callback split — see
-    sync.py's detect_and_freeze_callbacks()). NOT visit-based —
-    TimeSheetEntry.visit is confirmed unreliable for this (null even for a
-    normal, non-callback, manually-added entry — see
-    verify_job1_manual_entry_visit.py's real finding). At most one of the
-    two should be passed at a time; both default to None, which preserves
-    the exact current behavior (every real entry, unfiltered) for every
-    existing caller unchanged. An entry whose jobber_created_at is None
-    (not yet backfilled by a re-sync, or genuinely missing) is excluded
-    from BOTH sides of a split rather than guessed into one — same "no
-    data != a guessed classification" principle already used everywhere
-    else in this project.
+    created_before / created_at_or_after: optional cutoff datetimes,
+    compared against each entry's own real
+    JobberTimeSheetEntry.jobber_created_at, for splitting a job's real
+    entries at its frozen first_archived_at moment (the Callback Bleed
+    original-vs-callback split — see sync.py's
+    detect_and_freeze_callbacks()). NOT visit-based — TimeSheetEntry.visit
+    is confirmed unreliable for this (null even for a normal,
+    non-callback, manually-added entry). At most one of the two should be
+    passed at a time; both default to None, which preserves the exact
+    current behavior (every real entry, unfiltered) for every existing
+    caller unchanged. An entry whose jobber_created_at is None (not yet
+    backfilled by a re-sync, or genuinely missing) is excluded from BOTH
+    sides of a split rather than guessed into one — same "no data != a
+    guessed classification" principle already used everywhere else in
+    this project.
 
     Same merge logic calculate_job_duration_seconds() below is built on —
     grouped by user, each user's own overlapping timesheet-entry intervals
-    merged via _merge_intervals() before summing — extracted out
-    (2026-08-17) as its own function so Top Earner's per-technician revenue
-    split can reuse the EXACT SAME, already-proven merge math instead of
-    re-deriving hours independently from raw TimeSheetEntry rows.
-    Re-implementing this a second time would risk silently reintroducing
-    the exact Job 2 double-counting bug this logic exists to prevent.
+    merged via _merge_intervals() before summing — factored out as its own
+    function so Top Earner's per-technician revenue split can reuse the
+    EXACT SAME, already-proven merge math instead of re-deriving hours
+    independently from raw TimeSheetEntry rows. Re-implementing this a
+    second time would risk silently reintroducing the same double-counting
+    bug this logic exists to prevent.
 
-    This is a PURE EXTRACTION of what used to be calculate_job_duration_seconds()'s
-    own body — the merge math itself is UNCHANGED, not just similar.
-    Verified bit-for-bit identical against real data: confirmed
-    calculate_job_duration_seconds() still returns exactly the same values
-    for jobs 1, 2, 5, 6, 7, 12 as it did before this refactor.
-
-    Per the confirmed decisions (2026-08-16, unchanged):
       - The SAME (job, user) pair's entries are merged into their time-range
         UNION before summing (via _merge_intervals above) — never a naive
         sum of each entry's own final_duration_seconds, which would
-        double-count real overlapping time (the confirmed Job 2 case).
+        double-count real overlapping time.
       - An entry with no linked local user can't be safely grouped with
         another no-user entry by identity — merging two unidentified
         people's time as if they were the same person would be a WORSE
@@ -142,7 +131,7 @@ def calculate_job_duration_by_user(job, created_before=None, created_at_or_after
     rounding the sum, so that rounding step stays where it always was.
 
     Takes a JobberJob instance, not a bare id — lets this be called
-    directly against real ORM objects in tests/verification scripts.
+    directly against real ORM objects outside a request/view.
     """
     entries = list(job.timesheet_entries.filter(is_active=True))
     if created_before is not None:
@@ -195,13 +184,10 @@ def calculate_job_duration_seconds(job):
     NOT inline in the endpoint, so it can be called directly against real
     JobberJob instances without going through a request/view at all.
 
-    Now a thin wrapper over calculate_job_duration_by_user() (2026-08-17
-    refactor) — that function owns the merge math; this just sums its
-    per-user breakdown and applies the same single sum-then-round step
-    this function always used, exactly reproducing pre-refactor behavior
-    bit-for-bit (verified via verify_top_earner_step3.py, Step 3a).
+    A thin wrapper over calculate_job_duration_by_user() — that function
+    owns the merge math; this just sums its per-user breakdown and applies
+    a single sum-then-round step.
 
-    Per the confirmed decisions (2026-08-16, unchanged by this refactor):
       - DIFFERENT users overlapping the same job (not yet observed in real
         data) are summed independently, each AFTER their own overlaps are
         merged — a labour-hours definition (e.g. 2 people x 4 concurrent
@@ -227,11 +213,10 @@ def _technician_labour_rate(job, user_id):
 
     0 (and null) are both treated as "not entered," never a real $0/hr
     rate — same "0 = not set" convention TechnicianGoal.goal_amount
-    already uses (see labor_cost_profit_margin_proposal.md). Confirmed
-    real as of 2026-09-03: this account's own entries all read 0.00
-    today, purely because no rate has ever been entered in Jobber, not
-    because the field itself is broken (a DIFFERENT, already-confirmed-
-    broken situation from jobCosting.labourCost).
+    already uses. This account's own entries all read 0.00 today, purely
+    because no rate has ever been entered in Jobber, not because the
+    field itself is broken (a DIFFERENT, already-confirmed-broken
+    situation from jobCosting.labourCost).
 
     If this technician's real entries on this job carry more than one
     DISTINCT real rate (a rate change over time, in principle possible in
@@ -239,7 +224,7 @@ def _technician_labour_rate(job, user_id):
     non-zero rates at all yet), this returns None rather than guessing
     which one is "the" rate — logged, not silently picked. Revisit this
     exact case once real, varying rate data actually exists to check
-    against (see the proposal's own named open question #2).
+    against.
     """
     entries = job.timesheet_entries.filter(is_active=True, user_id=user_id)
     rates = {e.labour_rate for e in entries if e.labour_rate}
@@ -284,23 +269,16 @@ def calculate_technician_labor_cost(job, user_id, hours_by_user):
 def labor_cost_for_jobs(tenant_id, jobs_queryset):
     """
     Real, company-wide labor cost — a plain PER-ENTRY sum (hours x that
-    entry's own real TimeSheetEntry.labour_rate) over `jobs_queryset`.
-    Extracted (2026-09-14, approved cost_breakdown_dynamic_categories_
-    proposal.md) from what was originally Revenue Health's own inline
-    Labor Cost KPI computation in _local_electricians_summary_response()
-    below — now a shared, reusable function so the Accounts panel's
-    "Labor (YTD)" stat can reuse the EXACT SAME formula, re-scoped to a
-    different job population (YTD instead of the rolling PERIOD_MONTHS
-    window), without duplicating it. `_local_electricians_summary_
-    response()` itself was updated to call this same function with its
-    own `archived_jobs` — confirmed byte-for-byte identical output
-    before/after this extraction (same real query, same real math, just
-    moved).
+    entry's own real TimeSheetEntry.labour_rate) over `jobs_queryset`. A
+    shared, reusable function — the Accounts panel's "Labor (YTD)" stat
+    calls this SAME formula, re-scoped to a different job population (YTD
+    instead of the rolling PERIOD_MONTHS window here), without
+    duplicating it.
 
     Only real entries with a non-null, non-zero labour_rate are
     included — "0 = not entered," same convention as everywhere else
     this field is read. Deliberately NOT the older calculate_technician_
-    labor_cost()/(the per-technician, per-job pair above) — that
+    labor_cost() (the per-technician, per-job pair above) — that
     requires ONE unambiguous rate per (job, technician) pair, bailing to
     None for the whole pair if a technician's entries on one job ever
     show 2+ DIFFERENT real rates. That would wrongly exclude a real,
@@ -310,11 +288,10 @@ def labor_cost_for_jobs(tenant_id, jobs_queryset):
     per-user approach would silently drop that job/technician's cost
     entirely.
 
-    KNOWN, UNDECIDED EDGE CASE (not resolved here, per explicit
-    instruction) — this project has already confirmed real overlapping
-    timesheet entries exist for at least one technician on one job (the
-    "Job 2" case, a stop/restart mistake, handled via interval-merging
-    for DURATION purposes elsewhere in this file). A plain per-entry sum
+    KNOWN, UNDECIDED EDGE CASE — this project has already confirmed real
+    overlapping timesheet entries exist for at least one technician on one
+    job (the "Job 2" case, a stop/restart mistake, handled via
+    interval-merging for DURATION purposes elsewhere in this file). A plain per-entry sum
     here would count BOTH overlapping entries' cost, potentially
     double-counting pay for the same overlapping wall-clock time.
     Whether that's correct (a real payroll mistake genuinely costs the
@@ -336,60 +313,54 @@ def labor_cost_for_jobs(tenant_id, jobs_queryset):
 
 def split_job_revenue_among_assignees(job_revenue, hours_by_user):
     """
-    "Top Earner" per-technician revenue split for one job — real,
+    "Top Earner" per-technician revenue split for one job — a real,
     standalone, testable pure function (plain numbers/dicts in and out, no
-    ORM/DB coupling), deliberately not inline in any endpoint/orchestration
-    code (none exists yet — this is Part A: schema + pure functions only).
+    ORM/DB coupling). Orchestration lives in calculate_job_revenue_shares()
+    below, which builds hours_by_user and calls this.
 
     hours_by_user: {user_id: tracked_seconds} — MUST include every person
     actually ASSIGNED to the job as a key, with 0 for anyone assigned but
     who tracked no time on it. This function has no concept of "assigned"
-    vs. "tracked" as separate things — the caller (future orchestration,
-    Part B) builds this dict from JobberVisit.assigned_users (every
-    assignee) and calculate_job_duration_by_user() (who actually tracked
-    what) before calling this.
+    vs. "tracked" as separate things — the caller
+    (calculate_job_revenue_shares()) builds this dict from
+    JobberVisit.assigned_users (every assignee) and
+    calculate_job_duration_by_user() (who actually tracked what) before
+    calling this.
 
     Per Jobber's own confirmed attribution rule (Team Productivity Report +
-    support bot) — 4 discrete cases, ALL confirmed (see case 4 below,
-    updated 2026-09-01 — previously flagged here as this project's own
-    unconfirmed interpretation; that gap is now closed):
+    support bot) — 4 discrete cases:
 
       1. Everyone assigned tracked time -> proportional split by hours.
-      2. No one tracked time -> EQUAL split among all assigned (per TL
-         decision, 2026-08-17: NOT excluded from Top Earner, even though a
-         job with zero tracked time is excluded from the separate Avg Job
-         Duration average — two different features, two different,
-         independently-confirmed rules for the same underlying "no time
-         data" situation).
+      2. No one tracked time -> EQUAL split among all assigned (NOT
+         excluded from Top Earner, even though a job with zero tracked
+         time IS excluded from the separate Avg Job Duration average —
+         two different features, two different, independently-confirmed
+         rules for the same underlying "no time data" situation).
       3. Exactly one person tracked time -> 100% to that one person.
-      4. CONFIRMED (2026-09-01, Jobber's own support bot, a real worked
-         example — not this project's own interpretation): some but not
-         all assigned people tracked time (2+ people tracked, but fewer
-         than everyone assigned) -> proportional split among only those who
-         tracked, excluding the 0-hour assignees from the pool entirely.
-         The worked example given: 3 technicians on one job, tracking
+      4. Some but not all assigned people tracked time (2+ people tracked,
+         but fewer than everyone assigned) -> proportional split among
+         only those who tracked, excluding the 0-hour assignees from the
+         pool entirely. Confirmed against a real worked example from
+         Jobber's own support bot: 3 technicians on one job, tracking
          3hrs/1hr/0hrs respectively -> revenue split 75%/25%/0% — exactly
-         the proportional-among-trackers-only math this function already
+         the proportional-among-trackers-only math this function
          implements (3/(3+1)=75%, 1/(3+1)=25%, the 0hr assignee excluded
-         entirely). No code change was needed here; this confirms the
-         existing logic was already correct, not a fix.
+         entirely).
 
     Returns {user_id: revenue_share} — a plain dict, same currency unit as
     job_revenue (no rounding applied here; that's a display concern for
     whatever renders this).
 
-    Intended pairing (Part B, not built yet): job_revenue = Job.total for
-    an archived job in the same completed_at-windowed population
-    jobs_completed/avg_job_duration_seconds already use — NOT the Paid-
-    invoice-filtered population Total Revenue uses. This is a genuine,
-    confirmed population/definition mismatch, not an oversight: Top
-    Earner's per-technician shares, summed across every technician, will
-    NOT necessarily equal the page's own Total Revenue tile, since
+    Actual pairing (see calculate_job_revenue_shares() below): job_revenue
+    = Job.total for an archived job in the same completed_at-windowed
+    population jobs_completed/avg_job_duration_seconds already use — NOT
+    the Paid-invoice-filtered population Total Revenue uses. This is a
+    genuine, confirmed population/definition mismatch, not an oversight:
+    Top Earner's per-technician shares, summed across every technician,
+    will NOT necessarily equal the page's own Total Revenue tile, since
     Job.total counts an archived job's full billed value regardless of
     that job's own invoice's payment status, while Total Revenue only
-    counts invoices already marked Paid. Flagged here so whoever wires up
-    the orchestration in Part B sees it at the exact point it matters, not
-    just in PROJECT_CONTEXT.md.
+    counts invoices already marked Paid.
     """
     assignees = list(hours_by_user.keys())
     if not assignees:
@@ -422,7 +393,7 @@ def _gather_job_assignees(job):
     """
     Every REAL, locally-known assignee across ALL of a job's visits,
     deduped by user id — the "assigned" side of Top Earner's split, from
-    JobberVisit.assigned_users (the additive M2M added in Part A). This is
+    JobberVisit.assigned_users (the additive M2M on JobberVisit). This is
     NOT the same population as calculate_job_duration_by_user()'s keys,
     which are keyed by whoever actually has a TimeSheetEntry (including a
     possible synthetic no-user bucket that doesn't correspond to any real
@@ -442,32 +413,29 @@ def _gather_job_assignees(job):
 
 def calculate_job_revenue_shares(job):
     """
-    Orchestration (impure — hits the DB) tying together every
-    already-verified Part A piece for ONE job's Top Earner contribution.
-    Nothing here is speculative; every piece below was individually
-    proven correct in Part A before this function combines them:
+    Orchestration (impure — hits the DB) tying together every piece below
+    for ONE job's Top Earner contribution:
 
       1. Every real assignee across the job's visits, deduped —
-         _gather_job_assignees() above, from the new assigned_users M2M.
+         _gather_job_assignees() above, from the assigned_users M2M.
       2. Each assignee's tracked hours on this job —
-         calculate_job_duration_by_user(job), the EXACT SAME merge logic
-         already verified bit-for-bit against real data (job 2 -> 18000s,
-         confirmed). NOT re-derived here. An assignee with zero timesheet
-         entries gets 0 hours (not omitted) — they must still appear in
-         hours_by_user for split_job_revenue_among_assignees() to
-         correctly tell "no one tracked" from "everyone tracked" from
-         "partial."
+         calculate_job_duration_by_user(job), the same merge logic used
+         elsewhere in this file. NOT re-derived here. An assignee with
+         zero timesheet entries gets 0 hours (not omitted) — they must
+         still appear in hours_by_user for
+         split_job_revenue_among_assignees() to correctly tell "no one
+         tracked" from "everyone tracked" from "partial."
       3. job.total as revenue — same archived + completed_at population
          jobs_completed/avg_job_duration_seconds already use, NOT the
-         Paid-invoice population Total Revenue uses (confirmed mismatch,
-         see split_job_revenue_among_assignees()'s own docstring).
-         Explicitly coerced to float here — job.total is a Decimal, and
+         Paid-invoice population Total Revenue uses (see
+         split_job_revenue_among_assignees()'s own docstring). Explicitly
+         coerced to float here — job.total is a Decimal, and
          split_job_revenue_among_assignees() does float division
          internally (Decimal * float raises TypeError in Python); this is
          the one place that conversion needs to happen, so it happens
-         here rather than inside the already-verified pure function.
-      4. split_job_revenue_among_assignees() — the already-verified pure
-         4-branch split, untouched.
+         here rather than inside the pure split function.
+      4. split_job_revenue_among_assignees() — the pure 4-branch split,
+         untouched.
 
     KNOWN EDGE CASE, not silently absorbed: a TimeSheetEntry with no
     linked local JobberUser (calculate_job_duration_by_user()'s synthetic
@@ -521,7 +489,7 @@ def pick_top_earner(totals, users_by_id):
     totals: {user_id: accumulated_revenue} from calculate_top_earner().
     users_by_id: {user_id: JobberUser}, for name resolution.
 
-    TIE-BREAK DECISION (2026-08-17, explicit, not silent): on an exact tie
+    TIE-BREAK DECISION, explicit, not silent: on an exact tie
     for the highest accumulated revenue, the winner is whoever's name
     sorts first alphabetically (ascending, case-insensitive). Simple,
     fully deterministic — the "Top Earner" tile can never flicker between
@@ -551,12 +519,10 @@ def pick_top_earner(totals, users_by_id):
 
 def _local_electricians_summary_response(user):
     """
-    Local-table source for the Electricians panel's KPI tiles — ALL 4 mock
-    tiles (Total Revenue, Jobs Completed, Avg Job Duration, Top Earner)
-    are now real, replaced in place with no visual distinction from the
-    original mock version, per TL decision. avg_job_value (2026-09-06,
-    Revenue Health Phase 1) is a 5th field added for that page's own "Avg
-    Job Value" KPI card, reusing this SAME endpoint/queryset rather than a
+    Local-table source for the Electricians panel's KPI tiles — Total
+    Revenue, Jobs Completed, Avg Job Duration, and Top Earner — plus
+    avg_job_value, added for the Revenue Health page's own "Avg Job
+    Value" KPI card, reusing this SAME endpoint/queryset rather than a
     new one.
 
     Calls ensure_fresh(require_complete=True) first — same reasoning
@@ -572,10 +538,10 @@ def _local_electricians_summary_response(user):
     entities. 'visits' is REQUIRED explicitly here, not implied by 'jobs'
     — confirmed against sync_tenant()'s own branching: 'jobs'/
     'timesheet_entries' only trigger the shared job_nodes fetch, but
-    sync_visits() (which populates JobberVisit.assigned_users, Part A)
-    only runs when 'visits' is itself in the requested entity set. Omitting
-    it here would silently leave top_earner reading stale/never-synced
-    assignee data.
+    sync_visits() (which populates JobberVisit.assigned_users) only runs
+    when 'visits' is itself in the requested entity set. Omitting it here
+    would silently leave top_earner reading stale/never-synced assignee
+    data.
 
     period_start uses dateutil.relativedelta(months=PERIOD_MONTHS), not
     timedelta(days=180) — a real calendar-month subtraction (e.g. Feb 12 ->
@@ -606,10 +572,10 @@ def _local_electricians_summary_response(user):
 
     # "archived = completed" is settled (confirmed from 3 separate angles —
     # direct testing, Jobber's own docs, Jobber's support bot). completed_at
-    # is nullable in Jobber's own schema and, per a live cross-check
-    # (2026-08-16), is untested for the one case that plausibly nulls it —
-    # an archived job with NO linked invoice at all (skip-invoicing config,
-    # or cancelled — a real, valid case). completed_at__gte=period_start
+    # is nullable in Jobber's own schema and is untested for the one case
+    # that plausibly nulls it — an archived job with NO linked invoice at
+    # all (skip-invoicing config, or cancelled — a real, valid case).
+    # completed_at__gte=period_start
     # naturally EXCLUDES a null completed_at (SQL: NULL >= X is unknown,
     # never true) rather than falling back to another date field (e.g.
     # jobber_created_at) — a job's creation date can sit arbitrarily far
@@ -659,10 +625,9 @@ def _local_electricians_summary_response(user):
         # dict unexpectedly (it also guards this itself, belt-and-braces).
         top_earner = None
 
-    # New (2026-09-06, Revenue Health Phase 1, confirmed reuse -- no new
-    # query, no new entity). Same archived-jobs population as jobs_
-    # completed/avg_job_duration_seconds/top_earner above -- the fourth
-    # consumer of this exact queryset, not a new one. Deliberately job.total
+    # Same archived-jobs population as jobs_completed/avg_job_duration_
+    # seconds/top_earner above -- the fourth consumer of this exact
+    # queryset, not a new one. Deliberately job.total
     # averaged directly, NOT total_revenue / jobs_completed -- those are 2
     # DIFFERENT populations (Paid invoices vs. every archived job regardless
     # of invoice status), and dividing across them would produce a
@@ -673,29 +638,28 @@ def _local_electricians_summary_response(user):
     job_totals = [job.total for job in archived_jobs]
     avg_job_value = (float(sum(job_totals)) / len(job_totals)) if job_totals else None
 
-    # New Customers (2026-09-09, approved new_customers_metric_proposal.md,
-    # Option b -- a client's earliest-ever real job, NOT Client.createdAt,
-    # per that proposal's own reasoning: createdAt is a CRM record-
-    # creation timestamp, not a "we gained new business" one). ALL job
-    # statuses -- deliberately NOT archived_jobs above -- a brand-new
-    # client's very first job might still be Upcoming/Active, not yet
-    # archived; restricting to archived-only would systematically
-    # UNDERCOUNT genuinely new clients whose first job hasn't completed
-    # yet. Uses the client's FULL, unwindowed job history (Min() across
-    # EVERY real job they've ever had, not just this period's) -- "new"
-    # is a property of the client's real, earliest event, which requires
-    # looking past this window, not just within it.
+    # New Customers -- a client's earliest-ever real job, NOT
+    # Client.createdAt (createdAt is a CRM record-creation timestamp, not
+    # a "we gained new business" one). ALL job statuses -- deliberately
+    # NOT archived_jobs above -- a brand-new client's very first job might
+    # still be Upcoming/Active, not yet archived; restricting to
+    # archived-only would systematically UNDERCOUNT genuinely new clients
+    # whose first job hasn't completed yet. Uses the client's FULL,
+    # unwindowed job history (Min() across EVERY real job they've ever
+    # had, not just this period's) -- "new" is a property of the client's
+    # real, earliest event, which requires looking past this window, not
+    # just within it.
     #
     # Sync-completeness note: this reuses the SAME ensure_fresh(
     # require_complete=True) call above ('jobs' is already requested for
     # every other field on this endpoint) -- no new entity, no new gating
-    # needed. A real, named caveat from the approved proposal still
-    # applies: if this client's OWN earliest jobs were never fully synced
-    # (e.g. a historical max_pages cap), Min(jobber_created_at) could be
-    # wrong (too recent) for that one client -- not solvable by gating on
-    # 'jobs' completeness alone, since that only guarantees THIS pass's
-    # pull reached hasNextPage: false, not that every historical page
-    # ever has been pulled. Flagged, not silently assumed away.
+    # needed. A real, named caveat still applies: if this client's OWN
+    # earliest jobs were never fully synced (e.g. a historical max_pages
+    # cap), Min(jobber_created_at) could be wrong (too recent) for that
+    # one client -- not solvable by gating on 'jobs' completeness alone,
+    # since that only guarantees THIS pass's pull reached hasNextPage:
+    # false, not that every historical page ever has been pulled.
+    # Flagged, not silently assumed away.
     first_job_dates = (
         JobberJob.objects.filter(tenant_id=tenant_id, is_active=True)
         .values('client_id')
@@ -706,21 +670,18 @@ def _local_electricians_summary_response(user):
         if row['first_job_at'] is not None and row['first_job_at'] >= period_start
     )
 
-    # Labor Cost (2026-09-09, approved labor_cost_kpi_proposal.md) -- over
-    # the SAME archived_jobs/completed_at-windowed population as Jobs
-    # Completed/Avg Job Duration/Avg Job Value above. EXTRACTED
-    # (2026-09-14, approved cost_breakdown_dynamic_categories_proposal.md)
-    # into labor_cost_for_jobs() above -- reused directly, not duplicated
-    # -- so the Accounts panel's own "Labor (YTD)" stat can call the exact
-    # same formula against a different job population (YTD instead of
-    # this rolling PERIOD_MONTHS window) without a second implementation.
-    # Confirmed byte-for-byte identical output before/after this
-    # extraction. See labor_cost_for_jobs()'s own docstring for the full
-    # reasoning (why NOT calculate_technician_labor_cost(), and the known,
-    # undecided overlapping-entries edge case).
+    # Labor Cost -- over the SAME archived_jobs/completed_at-windowed
+    # population as Jobs Completed/Avg Job Duration/Avg Job Value above.
+    # Computed via labor_cost_for_jobs() above -- reused directly, not
+    # duplicated -- so the Accounts panel's own "Labor (YTD)" stat can
+    # call the exact same formula against a different job population (YTD
+    # instead of this rolling PERIOD_MONTHS window) without a second
+    # implementation. See labor_cost_for_jobs()'s own docstring for the
+    # full reasoning (why NOT calculate_technician_labor_cost(), and the
+    # known, undecided overlapping-entries edge case).
     labor_cost = labor_cost_for_jobs(tenant_id, archived_jobs)
 
-    # Outstanding (2026-09-09) -- real remaining balance across genuinely
+    # Outstanding -- real remaining balance across genuinely
     # unpaid invoices. Draft excluded, same "a draft hasn't been sent
     # yet, so it isn't real money" reasoning already established for the
     # Invoices panel's own Total Billed/Pending buckets (_compute_summary()
@@ -794,10 +755,10 @@ def _local_electricians_summary_response(user):
 class JobberElectriciansSummaryView(APIView):
     """
     GET /v1/jobber/electricians-summary/
-    Backs the Electricians panel's KPI tiles as they go real one at a time
-    (see PROJECT_CONTEXT.md for exactly which ones are real vs. still
-    mock). Reads local tables only via ensure_fresh() — never calls Jobber
-    directly.
+    Backs the Electricians panel's Total Revenue, Jobs Completed, Avg Job
+    Duration, and Top Earner KPI tiles, plus avg_job_value for the Revenue
+    Health page's own KPI card. Reads local tables only via ensure_fresh()
+    — never calls Jobber directly.
     """
     permission_classes = [CustomerPermission]
 

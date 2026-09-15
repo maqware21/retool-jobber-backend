@@ -109,17 +109,14 @@ def _log_throttle_status(body, tenant_id):
     Log the throttle bucket state AND the cost of the query that just
     produced it.
 
-    requestedQueryCost/actualQueryCost added (2026-08-28) -- confirmed
-    real gap: these are sibling fields of throttleStatus under
-    extensions.cost (extensions.cost = {requestedQueryCost,
-    actualQueryCost, throttleStatus}, per Jobber's own API rate-limits
-    docs), not previously logged at all. They're the exact missing
-    evidence that would have explained a real, confirmed paradox this
-    project hit -- a response reporting a FULL throttleStatus bucket
-    (currentlyAvailable == maximumAvailable) while ALSO carrying a
-    THROTTLED error -- which is otherwise unexplainable from
-    throttleStatus alone. See verify_jobber_trivial_query.py's docstring
-    for the full incident this fixes visibility into.
+    requestedQueryCost/actualQueryCost are sibling fields of
+    throttleStatus under extensions.cost (extensions.cost =
+    {requestedQueryCost, actualQueryCost, throttleStatus}, per Jobber's
+    own API rate-limits docs). Logging both matters: a response can
+    report a FULL throttleStatus bucket (currentlyAvailable ==
+    maximumAvailable) while ALSO carrying a THROTTLED error — otherwise
+    unexplainable from throttleStatus alone, but clear once the
+    request's own cost is visible too.
     """
     cost = (body.get('extensions') or {}).get('cost') or {}
     throttle = cost.get('throttleStatus') or {}
@@ -165,7 +162,7 @@ def execute(account, query, variables=None):
       - Retries once on 401 in case Jobber invalidated the token early.
 
     Rate-limit handling — Jobber has TWO distinct limiters, handled
-    separately (2026-08-28, confirmed against Jobber's own docs):
+    separately, per Jobber's own docs:
       - GraphQL query-cost leaky bucket: logs ``throttleStatus`` (plus
         requestedQueryCost/actualQueryCost) from every response for
         visibility. On a THROTTLED response, waits ``THROTTLE_RETRY_DELAY``
@@ -174,10 +171,9 @@ def execute(account, query, variables=None):
         "throttled" from other failures.
       - DDoS-layer/Rack::Attack request-count limiter (2500 req/5min per
         app/account): surfaces as a raw HTTP 429, not a body-level error —
-        logged and raised with its own distinct message, no retry (no
-        considered backoff policy for this limiter yet). Previously fell
-        into the generic "not response.ok" failure below, indistinguishable
-        from any other HTTP error.
+        logged and raised with its own distinct message so it's never
+        confused with the query-cost throttle above. No retry attempted
+        (no considered backoff policy for this limiter yet).
 
     Error handling:
       - Standard GraphQL errors arrive as a top-level ``errors`` array.
@@ -195,20 +191,15 @@ def execute(account, query, variables=None):
         account.store_tokens(token_data)
         response = _post_graphql(account.access_token, query, variables)
 
-    # New (2026-08-28) -- a raw HTTP 429 is Jobber's DDoS-layer/Rack::Attack
-    # request-count limiter (2500 req/5min per app/account, confirmed via
-    # Jobber's own API rate-limits docs) — a SEPARATE mechanism from the
-    # GraphQL query-cost throttle handled below (extensions.cost.
-    # throttleStatus / _is_throttled()). Before this, a 429 fell straight
-    # into the generic "not response.ok" branch below and raised the same
-    # message as any other failure (a bad query, a 500, anything) — a real
-    # confirmed gap: this project had to guess after the fact whether a
-    # real failure was this limiter or the cost-bucket one, instead of
-    # being told directly. Logged and raised distinctly now so that
-    # distinction is immediate, not inferred. No retry attempted here —
-    # this project doesn't yet have a considered backoff policy for THIS
-    # limiter specifically (distinct from THROTTLE_RETRY_DELAY below,
-    # which is tuned for the cost bucket's restore rate, not this one).
+    # A raw HTTP 429 is Jobber's DDoS-layer/Rack::Attack request-count
+    # limiter (2500 req/5min per app/account, per Jobber's own API
+    # rate-limits docs) — a SEPARATE mechanism from the GraphQL
+    # query-cost throttle handled below (extensions.cost.throttleStatus
+    # / _is_throttled()). Logged and raised distinctly so the two are
+    # never confused. No retry attempted here — this project doesn't yet
+    # have a considered backoff policy for THIS limiter specifically
+    # (distinct from THROTTLE_RETRY_DELAY below, which is tuned for the
+    # cost bucket's restore rate, not this one).
     if response.status_code == 429:
         logger.error(
             "Jobber DDoS-layer rate limit hit (HTTP 429) for tenant=%s -- the "
@@ -294,32 +285,30 @@ _ACCOUNT_QUERY = "query { account { id name } }"
 # immediately invalidates all tokens for the app on that account.
 _APP_DISCONNECT_MUTATION = "mutation { appDisconnect { userErrors { message } } }"
 
-# lineItems: re-added per TL approval (2026-08-05) — jobCosting remains
-# excluded (still no need for it here). lineItems.category is still a
-# confirmed dead end (PRODUCT/SERVICE only, never a trade taxonomy) and is
-# NOT queried; only linkedProductOrService.name is, for a free-text "Trade"
-# label. Only the first line item is fetched — that's all _job_service_type
-# uses. client.tags: added per TL approval for a free-text Accounts "Type"
-# column (Tag only has id/label — NOT name — confirmed against the schema).
+# lineItems: jobCosting remains excluded (no need for it here).
+# lineItems.category is a confirmed dead end (PRODUCT/SERVICE only, never
+# a trade taxonomy) and is NOT queried; only linkedProductOrService.name
+# is, for a free-text "Trade" label. Only the first line item is fetched
+# — that's all _job_service_type uses.
 #
-# This query is shared by three consumers: the Jobs single-page endpoint,
-# and the Accounts/Employees full-pulls (via client.fetch_all_pages). Widening
-# it adds a small per-request cost to ALL THREE, not just Jobs — acceptable
-# per TL's approval, revisit if a real account's job list grows large enough
-# to matter.
+# client.tags: Tag only has id/label, NOT name (confirmed against the
+# schema). Currently unread by any live code — Jobs' and Accounts' own
+# former live-proxy callers (which used it for Accounts' free-text
+# "Type" column) are now dead code, kept only for rollback (see jobs.py's
+# / accounts.py's own comments); the live local-table paths get client
+# tags from _CLIENTS_QUERY instead. Employees' full-pull (this query's
+# only remaining live caller) doesn't use it either.
 #
-# The Phase 2 local-sync engine (apps/jobber/services/sync.py) needs two
-# fields these three live consumers don't: jobCosting (labour_cost /
-# labour_duration_seconds on JobberJob) and each visit's own id (needed to
-# key JobberVisit rows — the three live views only ever read
+# The local-sync engine (apps/jobber/services/sync.py) needs two fields
+# this query doesn't carry: jobCosting (labour_cost / labour_duration_
+# seconds on JobberJob) and each visit's own id (needed to key
+# JobberVisit rows — Employees' live view only ever reads
 # visit.assignedUsers, never the visit's own identity). Rather than widen
-# THIS query and add that cost to all three live consumers for something
-# only the sync engine needs, there's a separate _SYNC_JOBS_QUERY /
-# fetch_jobs_for_sync() below, used only by sync.py. Revisit merging the two
-# if/when jobs.py/accounts.py/employees.py migrate to reading from the local
-# tables instead of calling Jobber live (see the design doc's
-# endpoint-migration section) — at that point this query has only one
-# caller left (the sync engine) and the two can merge safely.
+# THIS query for something only the sync engine needs, there's a
+# separate _SYNC_JOBS_QUERY / fetch_jobs_for_sync() below, used only by
+# sync.py. Revisit merging the two once Employees also migrates to
+# reading from local tables — at that point this query would have no
+# live caller left and the two can merge safely.
 _JOBS_QUERY = """
 query GetJobs($first: Int!, $after: String) {
   jobs(first: $first, after: $after) {
@@ -351,9 +340,13 @@ query GetJobs($first: Int!, $after: String) {
 """
 
 
-# client.tags added per TL approval — same free-text Accounts "Type" reasoning
-# as _JOBS_QUERY. Shared by the Invoices single-page endpoint and Accounts'
-# full-pull; the extra field is fetched but unused by Invoices itself.
+# client.tags: same free-text Accounts "Type" reasoning as _JOBS_QUERY —
+# Tag only has id/label, NOT name. Invoices' and Accounts' own former
+# live-proxy callers (Invoices single-page, Accounts full-pull) are now
+# dead code, kept only for rollback; this query's real active caller
+# today is the sync engine (sync_invoices()), which — like sync_jobs()
+# above — gets client tags from _CLIENTS_QUERY instead, not from here.
+# So client.tags here is currently unread by anything live.
 _INVOICES_QUERY = """
 query GetInvoices($first: Int!, $after: String) {
   invoices(first: $first, after: $after) {
@@ -377,10 +370,10 @@ query GetInvoices($first: Int!, $after: String) {
 # customFields is a UNION (CustomFieldUnion -- confirmed against the
 # schema): [CustomFieldArea | CustomFieldDropdown | CustomFieldLink |
 # CustomFieldNumeric | CustomFieldText | CustomFieldTrueFalse]. Only the
-# 2 branches below are spread -- the CONFIRMED real shapes for this
+# 2 branches below are spread -- the confirmed real shapes for this
 # account's "Expertise" (CustomFieldText) and "Experience"
-# (CustomFieldNumeric) Team custom fields (confirmed live, 2026-08-20). A
-# different tenant's custom field of the same name
+# (CustomFieldNumeric) Team custom fields. A different tenant's custom
+# field of the same name
 # configured as a different type (or not configured at all) simply comes
 # back without a `label` match for our spread fragments -- GraphQL does
 # not error on an unmatched union member, it just omits the fields we
@@ -406,10 +399,11 @@ query GetUsers($first: Int!, $after: String) {
 """
 
 
-# New for the sync engine — Clients were previously only ever seen nested
-# inside Job/Invoice nodes (client { id name tags }), never pulled
-# independently. Not shared with any live-proxy view, so no cost tradeoff
-# to weigh here the way there is for _SYNC_JOBS_QUERY below.
+# Clients are pulled independently here — unlike the nested
+# client { id name tags } shape in the other queries above, this is a
+# genuine standalone Client pull. Not shared with any live-proxy view
+# (sync.py is the only caller), so no cost tradeoff to weigh here the
+# way there is for _SYNC_JOBS_QUERY below.
 _CLIENTS_QUERY = """
 query GetClients($first: Int!, $after: String) {
   clients(first: $first, after: $after) {
@@ -424,23 +418,20 @@ query GetClients($first: Int!, $after: String) {
 """
 
 
-# New for the sync engine (2026-09-14, approved cost_breakdown_dynamic_
-# categories_proposal.md) — Query.expenses is a real, standalone,
-# root-level connection (confirmed live via introspection AND a real
-# fetch — see verify_query_expenses_shape_and_cost.py's own output,
-# requestedQueryCost=205/actualQueryCost=13 for this account's one real
-# expense), unlike Visits/TimeSheetEntries, which have no such
-# standalone query and must be derived from nested Job data. Only the
-# fields CONFIRMED to exist on Expense are requested here (title,
-# description, date, total, linkedJob{id}) — accounting codes/
-# categories are NOT requested because they were exhaustively confirmed
-# ABSENT from the real schema (no such field or type exists anywhere;
-# see PROJECT_CONTEXT.md's dated entry) — this is not an oversight.
-# `filter`/`searchTerm` args exist on Query.expenses (confirmed via
-# introspection) but are deliberately NOT used here — their real input
-# shape (ExpenseFilterAttributes) was never introspected, and local
-# filtering by the already-confirmed `incurred_at` field after syncing
-# is both simpler and avoids one more live-schema guess.
+# Sync engine only — Query.expenses is a real, standalone, root-level
+# connection (confirmed live via introspection and a real fetch), unlike
+# Visits/TimeSheetEntries, which have no such standalone query and must
+# be derived from nested Job data. Only the fields confirmed to exist on
+# Expense are requested here (title, description, date, total,
+# linkedJob{id}) — accounting codes/categories are NOT requested because
+# they were exhaustively confirmed ABSENT from the real schema (no such
+# field or type exists anywhere; see PROJECT_CONTEXT.md) — this is not
+# an oversight. `filter`/`searchTerm` args exist on Query.expenses
+# (confirmed via introspection) but are deliberately NOT used here —
+# their real input shape (ExpenseFilterAttributes) was never
+# introspected, and local filtering by the already-confirmed
+# `incurred_at` field after syncing is both simpler and avoids one more
+# live-schema guess.
 _EXPENSES_QUERY = """
 query GetExpenses($first: Int!, $after: String) {
   expenses(first: $first, after: $after) {
@@ -459,28 +450,22 @@ query GetExpenses($first: Int!, $after: String) {
 
 
 # Sync-only — see the comment on _JOBS_QUERY above for why this isn't just
-# _JOBS_QUERY widened in place. Adds jobCosting (for JobberJob.labour_cost /
-# labour_duration_seconds), each visit's own id (for JobberVisit.jobber_id
-# — visits are synced by extracting them from these same job nodes, not via
-# a separate top-level query; see sync.py's sync_visits() docstring for why),
-# completedAt (for JobberJob.completed_at — confirmed live 2026-08-16 to
-# track when invoicing clears, not when work physically finished; see the
-# model field's own comment for the full verification), and timeSheetEntries
-# (for JobberTimeSheetEntry — same "no viable standalone root query" situation
-# as Visits, confirmed against the schema: Query.timeSheetEntries exists but
-# has no job filter at all, so this is the only path; see
-# JobberTimeSheetEntry's model docstring and sync.py's sync_timesheet_entries()).
-# labourRate added 2026-09-03 (approved labor_cost_profit_margin_proposal.md)
-# for JobberTimeSheetEntry.labour_rate — a REAL, native per-entry Jobber
-# wage rate, confirmed via verify_labour_rate_field.py; a DIFFERENT field
-# from jobCosting.labourCost above (already confirmed broken/always 0).
-# lineItemCost added 2026-09-07 (approved revenue_composition_expense_
-# profit_proposal.md) for JobberJob.line_item_cost — one more scalar
-# field on the jobCosting object already being fetched here for every
-# job, not a new query or a new per-job cost category. Confirmed
-# genuine and non-circular (see PROJECT_CONTEXT.md's 2026-09-07 update);
-# a DIFFERENT field from jobCosting.expenseCost, which stays confirmed
-# dead (0.0 on every job checked) and is deliberately NOT requested here.
+# _JOBS_QUERY widened in place. Adds jobCosting (for JobberJob.labour_cost
+# / labour_duration_seconds / line_item_cost — labourCost and expenseCost
+# are confirmed broken/always 0 on this account, lineItemCost is genuine
+# and non-circular; see the model fields' own comments), each visit's own
+# id (for JobberVisit.jobber_id — visits are synced by extracting them
+# from these same job nodes, not via a separate top-level query; see
+# sync.py's sync_visits() docstring for why), completedAt (for
+# JobberJob.completed_at — tracks when invoicing clears, not when work
+# physically finished; see the model field's own comment), and
+# timeSheetEntries (for JobberTimeSheetEntry — same "no viable standalone
+# root query" situation as Visits: Query.timeSheetEntries exists but has
+# no job filter at all, so this is the only path; see
+# JobberTimeSheetEntry's model docstring and sync.py's
+# sync_timesheet_entries()). timeSheetEntries.labourRate is a REAL,
+# native per-entry Jobber wage rate — a DIFFERENT field from
+# jobCosting.labourCost above (already confirmed broken/always 0).
 _SYNC_JOBS_QUERY = """
 query GetJobsForSync($first: Int!, $after: String) {
   jobs(first: $first, after: $after) {
@@ -525,17 +510,18 @@ query GetJobsForSync($first: Int!, $after: String) {
 }
 """
 
-# Callback-detection-only (2026-08-30, approved callback_hours_design.md) —
-# called at most ONCE per job, exactly when that job's first_archived_at is
-# first set (see sync.py's detect_and_freeze_callbacks()). Deliberately NOT
-# folded into _SYNC_JOBS_QUERY above — that query runs for EVERY job on
-# EVERY sync pass, but this one only ever needs to run for the handful of
-# jobs that just transitioned to archived. Keeping it separate avoids
+# Callback-detection-only — called once per job each time that job's
+# status transitions INTO archived (see sync.py's
+# detect_and_freeze_callbacks()); a job can trigger this more than once
+# over its lifetime across multiple reopen/re-archive cycles. Deliberately
+# NOT folded into _SYNC_JOBS_QUERY above — that query runs for EVERY job
+# on EVERY sync pass, but this one only ever needs to run for the handful
+# of jobs that just transitioned to archived. Keeping it separate avoids
 # paying this cost on every job, every pass — the same "don't widen a
 # shared query for something only one narrow caller needs" reasoning
-# _SYNC_JOBS_QUERY itself already exists for. Uses Query.job(id: EncodedId!)
-# — the same cheap single-job lookup verify_callback_bleed.py's fix
-# confirmed real and inexpensive.
+# _SYNC_JOBS_QUERY itself already exists for. Uses Query.job(id:
+# EncodedId!) — a cheap single-job lookup, confirmed inexpensive in
+# practice.
 _CALLBACK_DETECTION_QUERY = """
 query GetJobVisitsForCallbackDetection($id: EncodedId!) {
   job(id: $id) {
@@ -556,14 +542,14 @@ query GetJobVisitsForCallbackDetection($id: EncodedId!) {
 def fetch_job_visits_for_callback_detection(account, job_id):
     """
     Real visits (id, createdAt, completedAt, invoice) for exactly one job,
-    by its real jobber_id — used at most once per job by sync.py's
-    detect_and_freeze_callbacks(). completedAt added (2026-08-30, PART A of
-    the approved callback window addition) — needed to measure the
-    CALLBACK_WINDOW_DAYS interval from the job's last COMPLETED visit
-    before the reopen, not from createdAt or first_archived_at. Returns
-    the raw node list (possibly empty if the job/visits aren't found —
-    never raises for that case, only for a genuine JobberAPIError from
-    execute()).
+    by its real jobber_id — used once per job each time it transitions
+    into archived, by sync.py's detect_and_freeze_callbacks() (a job can
+    trigger this more than once over its lifetime). completedAt is needed
+    to measure the CALLBACK_WINDOW_DAYS interval from the job's last
+    COMPLETED visit before the reopen, not from createdAt or
+    first_archived_at. Returns the raw node list (possibly empty if the
+    job/visits aren't found — never raises for that case, only for a
+    genuine JobberAPIError from execute()).
     """
     data = execute(account, _CALLBACK_DETECTION_QUERY, {'id': job_id})
     job_node = (data or {}).get('job') or {}
@@ -577,36 +563,26 @@ def fetch_job_visits_for_callback_detection(account, job_id):
 FETCH_ALL_PAGE_SIZE = 25
 FETCH_ALL_MAX_PAGES = 20
 
-# URGENT fix (2026-09-07) -- confirmed via diagnose_sync_jobs_query_cost.py
-# against the real connected account: a real request at FETCH_ALL_PAGE_SIZE
-# (25) for fetch_jobs_for_sync() now costs requestedQueryCost=10380,
-# rejected outright against Jobber's 10000 ceiling (actualQueryCost=0) --
-# real jobs have accumulated increasing nested visits/timeSheetEntries
-# over many testing rounds, and _SYNC_JOBS_QUERY's per-job cost (lineItems,
-# jobCosting, visits+assignedUsers, timeSheetEntries, all nested) is now too
-# high at this page size. This broke ALL of this account's synced data,
-# not just one entity -- sync_tenant() calls sync_jobs() unconditionally
-# whenever 'jobs'/'visits'/'timesheet_entries' are requested, and a
-# JobberAPIError here aborts the whole sync pass.
+# This project's other synced entities (Clients, Users, Invoices) are
+# safe at the shared FETCH_ALL_PAGE_SIZE (25); Jobs' own per-job nested
+# cost (lineItems, jobCosting, visits+assignedUsers, timeSheetEntries, all
+# nested in _SYNC_JOBS_QUERY) grows as real jobs accumulate more of these
+# over time, and can exceed Jobber's 10000 query-cost ceiling at page size
+# 25 — a rejected request costs nothing but aborts the whole sync pass,
+# since sync_tenant() calls sync_jobs() unconditionally whenever
+# 'jobs'/'visits'/'timesheet_entries' are requested. Lowering the SHARED
+# constant would touch Clients/Users/Invoices too, none of which are
+# implicated — only Jobs' own query has grown expensive. Fix: a SEPARATE,
+# smaller page size passed explicitly at fetch_jobs_for_sync()'s own call
+# site in sync_jobs() only — every other entity keeps using
+# FETCH_ALL_PAGE_SIZE, untouched.
 #
-# CONFIRMED (not assumed) before choosing where to fix this: grepped every
-# real call site of fetch_all_pages()/fetch_all_pages_bounded() in this
-# project -- Clients, Users, and Invoices (both the sync engine's own
-# fetch_clients/fetch_users/fetch_invoices AND the live-proxy Accounts/
-# Employees endpoints' fetch_jobs/fetch_invoices/fetch_users) all rely on
-# FETCH_ALL_PAGE_SIZE's shared default, none pass an explicit override.
-# Real diagnostic results at OTHER sizes (same account, same real request):
-# first=15 -> requestedQueryCost=6230 (succeeded), first=10 -> 4155
-# (succeeded), first=5 -> 2080 (succeeded). Lowering the SHARED constant
-# would touch Clients/Users/Invoices too, none of which are implicated in
-# this failure -- only Jobs' own query has grown expensive. Fix: a
-# SEPARATE, smaller page size passed explicitly at fetch_jobs_for_sync()'s
-# own call site in sync_jobs() only -- every other entity's real,
-# still-safe page size is completely untouched, still defaulting to
-# FETCH_ALL_PAGE_SIZE. 10 chosen (not 15) for real headroom under the
-# 10000 ceiling as this account's real jobs keep accumulating more nested
-# visits/timesheet entries over time, without going small enough (5) to
-# meaningfully multiply the real total request count for no added safety
+# Measured directly against the real connected account at several sizes:
+# first=25 -> requestedQueryCost=10380 (rejected, ceiling is 10000),
+# first=15 -> 6230 (succeeded), first=10 -> 4155 (succeeded), first=5 ->
+# 2080 (succeeded). 10 chosen over 15 for real headroom as jobs keep
+# accumulating more nested data over time, without going as low as 5 —
+# which would needlessly multiply the total request count for no safety
 # margin that matters at this account's current scale.
 SYNC_JOBS_PAGE_SIZE = 10
 
@@ -643,8 +619,8 @@ def fetch_all_pages_bounded(fetch_fn, account, label, deadline, first=FETCH_ALL_
     """
     Same pagination loop as fetch_all_pages(), for the sync engine
     specifically (apps/jobber/services/sync.py). Two differences, both
-    needed for the local-sync design doc's §3 wall-clock ceiling and §2's
-    deactivation-sweep fix:
+    needed for the sync engine's wall-clock ceiling and deactivation-sweep
+    safety:
 
       - Checks ``deadline`` (a timezone-aware datetime) before starting each
         new page fetch — stops cleanly, without starting one more Jobber
@@ -659,10 +635,12 @@ def fetch_all_pages_bounded(fetch_fn, account, label, deadline, first=FETCH_ALL_
         this run.
 
     A sibling to fetch_all_pages(), not a replacement for it — kept
-    completely separate so fetch_all_pages()'s three existing live-proxy
-    callers (jobs.py's single-page view aside, accounts.py's and
-    employees.py's full-pulls) are entirely unaffected; their return
-    contract (a plain node list, no deadline) doesn't change.
+    completely separate so fetch_all_pages()'s own callers are entirely
+    unaffected; their return contract (a plain node list, no deadline)
+    doesn't change. fetch_all_pages()'s only remaining live caller today is
+    JobberEmployeesView's full-pull (job + user rosters); Accounts' own
+    former full-pull caller is now dead code, kept only for rollback (see
+    accounts.py's own comments).
     """
     all_nodes = []
     cursor = None
@@ -737,9 +715,9 @@ def fetch_clients(account, first=25, after=None):
     Return the raw ``clients`` connection for ``account``:
     ``{'nodes': [...], 'pageInfo': {'hasNextPage': ..., 'endCursor': ...}}``.
 
-    New for the sync engine — no live-proxy view fetches Clients
-    independently today. Raises JobberAPIError on failure like every other
-    call through ``execute()``.
+    Sync-engine only — no live-proxy view fetches Clients independently.
+    Raises JobberAPIError on failure like every other call through
+    ``execute()``.
     """
     data = execute(account, _CLIENTS_QUERY, {'first': first, 'after': after})
     return (data or {}).get('clients') or {
@@ -783,8 +761,8 @@ def fetch_expenses(account, first=25, after=None):
     Return the raw ``expenses`` connection for ``account``:
     ``{'nodes': [...], 'pageInfo': {'hasNextPage': ..., 'endCursor': ...}}``.
 
-    Sync-only (2026-09-14) — not called by any live-proxy view. Raises
-    JobberAPIError on failure like every other call through ``execute()``.
+    Sync-only — not called by any live-proxy view. Raises JobberAPIError
+    on failure like every other call through ``execute()``.
     """
     data = execute(account, _EXPENSES_QUERY, {'first': first, 'after': after})
     return (data or {}).get('expenses') or {

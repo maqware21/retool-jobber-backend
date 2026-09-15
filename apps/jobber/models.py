@@ -19,7 +19,7 @@ SYNC_RUN_STALE_AFTER = timedelta(minutes=5)
 
 class JobberAccount(DateModel):
     """
-    The OAuth link between one VoltPro Tenant and one connected Jobber account.
+    The OAuth link between one Tenant and one connected Jobber account.
 
     Holds the access/refresh tokens issued by Jobber's OAuth 2.0 flow. One row
     per tenant — a tenant re-connecting overwrites the same row (see
@@ -89,8 +89,8 @@ class JobberAccount(DateModel):
 class JobberClient(DateModel):
     """
     Local mirror of one Jobber Client, populated and refreshed by the sync
-    engine (Phase 2). A full sync pass no longer seeing a previously-synced
-    jobber_id sets is_active=False rather than deleting the row.
+    engine. A full sync pass no longer seeing a previously-synced jobber_id
+    sets is_active=False rather than deleting the row.
     """
 
     tenant = models.ForeignKey(
@@ -130,17 +130,16 @@ class JobberUser(DateModel):
     )
     jobber_id = models.CharField(max_length=255, db_index=True)
     name = models.CharField(max_length=255)
-    # User.phone.friendly — confirmed real in Jobber's schema (2026-08-19),
-    # not previously synced. Nullable: a real user can have no phone on
-    # file in Jobber at all, not just "not yet synced."
+    # User.phone.friendly. Nullable: a real user can have no phone on file
+    # in Jobber at all, not just "not yet synced."
     phone = models.CharField(max_length=50, null=True, blank=True)
     # From User.customFields (a GraphQL UNION -- see _USERS_QUERY's own
-    # comment), matched by label after trimming whitespace (confirmed
-    # live, 2026-08-20: this account's real "Expertise" label has a
-    # trailing space). Both nullable -- a tenant without these exact
-    # Team custom fields configured (wrong label, wrong type, or simply
-    # never set up) gets a clean null, never a crash; confirmed real for
-    # THIS account only, not guaranteed for a future tenant.
+    # comment), matched by label after trimming whitespace -- this
+    # account's real "Expertise" label has a trailing space. Both
+    # nullable -- a tenant without these exact Team custom fields
+    # configured (wrong label, wrong type, or simply never set up) gets a
+    # clean null, never a crash; confirmed real for THIS account only,
+    # not guaranteed for a future tenant.
     expertise = models.CharField(max_length=255, null=True, blank=True)
     # FloatField, not Decimal -- deliberately NOT the DecimalField(12, 2)
     # money-field convention used elsewhere in this project: years of
@@ -205,68 +204,63 @@ class JobberJob(DateModel):
     start_at = models.DateTimeField(null=True, blank=True)
     # Reuses _format_address() verbatim.
     address = models.CharField(max_length=500, null=True, blank=True)
-    # From Jobber's jobCosting { labourDuration labourCost } — added now
-    # rather than in a later migration, for the Electricians "Avg Job
-    # Duration" card. labourDuration is a Seconds int scalar; labour_cost
-    # gets the same float-to-Decimal treatment as total.
+    # From Jobber's jobCosting { labourDuration labourCost }, for the
+    # Electricians "Avg Job Duration" card. labourDuration is a Seconds int
+    # scalar; labour_cost gets the same float-to-Decimal treatment as total.
     labour_duration_seconds = models.IntegerField(null=True, blank=True)
     labour_cost = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
-    # From Jobber's jobCosting { lineItemCost } -- added 2026-09-07,
-    # approved revenue_composition_expense_profit_proposal.md, for Revenue
-    # Health's Composition chart. A DIFFERENT, confirmed-real field from
-    # labour_cost above (already confirmed broken/always 0) -- this is the
-    # sum of each line item's real Unit Cost x quantity, confirmed genuine
-    # and non-circular via a live test job with a deliberately different
-    # cost vs price (Unit Cost 200 x qty 2 = 400, Unit Price 500 x qty 2 =
-    # 1000 -- live API returned lineItemCost=400.0, an exact match to
-    # Jobber's own dashboard). Same float-to-Decimal treatment as total/
-    # labour_cost. Null only if Jobber itself returns null (not expected in
-    # practice -- every real job checked so far returns a real number, 0.0
-    # for a job with no line items or no cost entered -- but stored
-    # defensively nullable, same convention as every other synced money
-    # field here). This account's own real historical jobs happen to show
-    # lineItemCost == total on every one (cost=price, zero measured
-    # profit) -- a real property of this account's data, not a limitation
-    # of the field itself; see PROJECT_CONTEXT.md's 2026-09-07 update for
-    # the full finding and the 3 named, unconfirmed reasons why.
+    # From Jobber's jobCosting { lineItemCost }, for Revenue Health's
+    # Composition chart. A DIFFERENT, confirmed-real field from labour_cost
+    # above (already confirmed broken/always 0) -- this is the sum of each
+    # line item's real Unit Cost x quantity, confirmed genuine and
+    # non-circular via a live test job with a deliberately different cost
+    # vs price (live API result matched Jobber's own dashboard exactly).
+    # Same float-to-Decimal treatment as total/labour_cost. Null only if
+    # Jobber itself returns null (not expected in practice -- every real
+    # job checked so far returns a real number, 0.0 for a job with no line
+    # items or no cost entered -- but stored defensively nullable, same
+    # convention as every other synced money field here). This account's
+    # own real historical jobs happen to show lineItemCost == total on
+    # every one (cost=price, zero measured profit) -- a real property of
+    # this account's data, not a limitation of the field itself; see
+    # PROJECT_CONTEXT.md for the full finding and the named, unconfirmed
+    # reasons why.
     line_item_cost = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
     # From Jobber's own completedAt field (ISO8601DateTime, nullable in the
-    # schema). Confirmed via live cross-check (2026-08-16, 3 real archived
-    # jobs): this tracks when the INVOICING loop closes (invoice
-    # created/sent), NOT when the physical work was done — completedAt
-    # landed 10-23 seconds before each job's own invoice was issued, and
-    # about a full day after job.start_at. That's the correct field for
-    # "Jobs Completed" regardless (archived = completed, confirmed from 3
-    # separate angles — direct testing, Jobber's own docs, Jobber's support
-    # bot — see PROJECT_CONTEXT.md), it just doesn't mean "finished on-site
-    # that day." Nullable here because Jobber's own schema nulls it, and
+    # schema). Confirmed via live cross-check against real archived jobs:
+    # this tracks when the INVOICING loop closes (invoice created/sent),
+    # NOT when the physical work was done -- completedAt lands seconds
+    # before the job's own invoice is issued, and roughly a day after
+    # job.start_at. That's the correct field for "Jobs Completed"
+    # regardless (archived = completed, confirmed from 3 separate angles --
+    # direct testing, Jobber's own docs, Jobber's support bot -- see
+    # PROJECT_CONTEXT.md), it just doesn't mean "finished on-site that
+    # day." Nullable here because Jobber's own schema nulls it, and
     # specifically because an archived job with NO linked invoice at all
-    # (skip-invoicing config, or a cancelled job — a real, valid case, not
-    # an error) may not populate it — untested in this project's real data
-    # as of 2026-08-16 (no such job existed in the test account at the
-    # time), so treated defensively rather than assumed safe. See
+    # (skip-invoicing config, or a cancelled job -- a real, valid case, not
+    # an error) may not populate it -- not yet observed in this project's
+    # real data, so treated defensively rather than assumed safe. See
     # sync.py's sync_jobs() and electricians_summary.py for how a null
     # value here is handled (excluded, not defaulted to another date).
     completed_at = models.DateTimeField(null=True, blank=True)
-    # New (2026-08-30, approved callback_hours_design.md) — the frozen
-    # boundary between "original" and "callback" work on this job. Set
-    # EXACTLY ONCE, the first sync pass that observes job_status=='archived'
-    # for this row, and never overwritten again — including across a later
-    # reopen + re-archive. This is "first SYNC-OBSERVED archival," not
-    # Jobber's true archival instant (no webhook in this design; see
-    # sync.py's sync_jobs() for the exact capture rule and its named
-    # limitations).
+    # The frozen boundary between "original" and "callback" work on this
+    # job. Set EXACTLY ONCE, the first sync pass that observes
+    # job_status=='archived' for this row, and never overwritten again --
+    # including across a later reopen + re-archive. This is "first
+    # SYNC-OBSERVED archival," not Jobber's true archival instant (no
+    # webhook in this design; see sync.py's sync_jobs() for the exact
+    # capture rule and its named limitations).
     first_archived_at = models.DateTimeField(null=True, blank=True)
-    # New (2026-08-30) — the frozen Callback Bleed dollar result for this
-    # job: callback hours (entries with jobber_created_at >= first_archived_at)
-    # x this job's own rate (total / original hours, entries with
-    # jobber_created_at < first_archived_at). Null whenever it can't be
-    # computed for real (no original hours, or no callback visit found) —
-    # never a fabricated 0, same convention as every other derived money/
-    # duration field in this app. Same DecimalField(12, 2) convention as
-    # total/labour_cost above. Computed once by sync.py's
-    # detect_and_freeze_callbacks(), at the same moment is_callback is set
-    # on the relevant JobberVisit — see that function's docstring.
+    # The frozen Callback Bleed dollar result for this job: callback hours
+    # (entries with jobber_created_at >= first_archived_at) x this job's
+    # own rate (total / original hours, entries with jobber_created_at <
+    # first_archived_at). Null whenever it can't be computed for real (no
+    # original hours, or no callback visit found) -- never a fabricated 0,
+    # same convention as every other derived money/duration field in this
+    # app. Same DecimalField(12, 2) convention as total/labour_cost above.
+    # Computed once by sync.py's detect_and_freeze_callbacks(), at the same
+    # moment is_callback is set on the relevant JobberVisit -- see that
+    # function's docstring.
     callback_bled_amount = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
     synced_at = models.DateTimeField()
 
@@ -295,8 +289,8 @@ class JobberVisit(DateModel):
     Local mirror of one Jobber Visit. A Job's assignee is a Visit's
     assignee, not the Job's own field — confirmed by the live-proxy's own
     _first_assignee, which reads job.visits[0].assignedUsers. Storing this
-    as a real table (instead of a denormalized name string on Job) is the
-    actual upgrade this phase enables.
+    as a real table (instead of a denormalized name string on Job) is what
+    makes filtering/querying by assignee directly possible.
     """
 
     tenant = models.ForeignKey(
@@ -311,7 +305,7 @@ class JobberVisit(DateModel):
     )
     # Nullable — "Unassigned" becomes null instead of a string.
     #
-    # ADDITIVE-ONLY, deliberately not replaced (2026-08-17): this field and
+    # ADDITIVE-ONLY, deliberately not replaced: this field and
     # assigned_user_name below are consumed by LIVE, SHIPPED production
     # code — JobberJobsView.get() (the real /v1/jobber/jobs/ endpoint,
     # already cut over to local reads) reads assigned_user_name via
@@ -321,8 +315,8 @@ class JobberVisit(DateModel):
     # internal refactor — so it stays completely untouched, same values,
     # same "first assignee, 'Unassigned' fallback" semantics, forever
     # (or until that live consumer is deliberately migrated off it).
-    # assigned_users (plural, below) is the new, separate, additive field
-    # for anything that needs EVERY assignee, not just the first.
+    # assigned_users (plural, below) is the separate, additive field for
+    # anything that needs EVERY assignee, not just the first.
     assigned_user = models.ForeignKey(
         JobberUser,
         on_delete=models.SET_NULL,
@@ -330,27 +324,26 @@ class JobberVisit(DateModel):
         blank=True,
         related_name='visits',
     )
-    # New (2026-08-17), for Top Earner's per-technician revenue split —
-    # Jobber's own schema has always supported multiple assignees per visit
-    # (Visit.assignedUsers is a UserConnection, confirmed against the
-    # schema, not assumed) and assignedUsers(first: 5) is already being
-    # fetched by the sync-only query for every visit; today's sync just
-    # discards everything past the first entry. This field captures all of
-    # them instead, at zero new Jobber query cost. related_name is
-    # 'assigned_visits', not 'visits' — assigned_user above already owns
-    # that reverse accessor name on JobberUser, and the two need to coexist
-    # without colliding.
+    # For Top Earner's per-technician revenue split — Jobber's own schema
+    # has always supported multiple assignees per visit (Visit.assignedUsers
+    # is a UserConnection, confirmed against the schema, not assumed) and
+    # assignedUsers(first: 5) is already being fetched by the sync-only
+    # query for every visit; the sync itself only writes assigned_user
+    # above from the first entry. This field captures all of them instead,
+    # at zero new Jobber query cost. related_name is 'assigned_visits', not
+    # 'visits' — assigned_user above already owns that reverse accessor
+    # name on JobberUser, and the two need to coexist without colliding.
     assigned_users = models.ManyToManyField(
         JobberUser,
         related_name='assigned_visits',
         blank=True,
     )
     jobber_id = models.CharField(max_length=255, db_index=True)
-    # New (2026-08-30, approved callback_hours_design.md) — frozen EXACTLY
-    # ONCE, never re-evaluated: True only when this visit was this job's
-    # createdAt-latest visit AT THE MOMENT its job's first_archived_at was
-    # first set, AND that visit's own real `invoice` field was null at that
-    # moment (see sync.py's detect_and_freeze_callbacks()). Deliberately
+    # Frozen EXACTLY ONCE, never re-evaluated: True only when this visit
+    # was this job's createdAt-latest visit AT THE MOMENT its job's
+    # first_archived_at was first set, AND that visit's own real `invoice`
+    # field was null at that moment (see sync.py's
+    # detect_and_freeze_callbacks()). Deliberately
     # NOT derived from TimeSheetEntry.visit or Visit.invoice live on every
     # read — both are confirmed real but this specific frozen-snapshot
     # meaning ("was this THE callback, as of first archival") can't be
@@ -430,12 +423,12 @@ class JobberInvoice(DateModel):
 class JobberTimeSheetEntry(DateModel):
     """
     Local mirror of one Jobber TimeSheetEntry, populated and refreshed by
-    the sync engine. Motivated by a confirmed finding (2026-08-16):
-    Job.jobCosting.labourDuration does NOT reflect real logged time — 6 of
-    13 real archived jobs have genuine TimeSheetEntry records (real
-    technicians, real non-zero finalDuration) while jobCosting reports 0
-    for all of them. "Avg Job Duration" needs this real entity, not a
-    derived jobCosting field.
+    the sync engine. Motivated by a confirmed finding:
+    Job.jobCosting.labourDuration does NOT reflect real logged time — a
+    real, meaningful share of archived jobs have genuine TimeSheetEntry
+    records (real technicians, real non-zero finalDuration) while
+    jobCosting reports 0 for all of them. "Avg Job Duration" needs this
+    real entity, not a derived jobCosting field.
 
     Like JobberVisit, there is no viable standalone root-level query for
     this — Query.timeSheetEntries exists but its own description is "All
@@ -445,14 +438,15 @@ class JobberTimeSheetEntry(DateModel):
     Job.timeSheetEntries(first, after), pulled per-job from the same job
     nodes the sync already has in memory — identical situation to Visits.
 
-    Known real case, NOT yet handled by this model/sync step (Part B, not
-    built here): the SAME (job, user) pair can have multiple entries whose
-    time ranges genuinely overlap (confirmed real, not hypothetical — a
-    technician's own stop/restart mistake produced two overlapping entries
-    for one job in this project's real test data). Storing every raw entry
-    here, unmerged, is deliberate — this table is meant to hold Jobber's
-    real entries as they are; any overlap-merging or duration aggregation
-    happens downstream, over these rows, not by editing/dropping rows here.
+    Known real case, deliberately NOT handled at this layer: the SAME
+    (job, user) pair can have multiple entries whose time ranges genuinely
+    overlap (confirmed real, not hypothetical — a technician's own
+    stop/restart mistake produced two overlapping entries for one job in
+    this project's real test data). Storing every raw entry here, unmerged,
+    is deliberate — this table is meant to hold Jobber's real entries as
+    they are; overlap-merging and duration aggregation happen downstream,
+    in calculate_job_duration_by_user(), over these rows — never by
+    editing/dropping rows here.
     """
 
     tenant = models.ForeignKey(
@@ -488,28 +482,27 @@ class JobberTimeSheetEntry(DateModel):
     # endAt IS genuinely nullable in the schema — an entry with a currently
     # running timer has no endAt yet.
     ended_at = models.DateTimeField(null=True, blank=True)
-    # New (2026-08-30, approved callback_hours_design.md) — from Jobber's
-    # own TimeSheetEntry.createdAt (ISO8601DateTime!, confirmed non-null in
-    # the schema). Named jobber_created_at, not created_at — DateModel
-    # already owns created_at for THIS ROW's own local creation time; this
-    # is Jobber's entry-creation timestamp, a genuinely different fact.
-    # Same naming precedent as JobberJob.jobber_created_at. This is the
-    # field the original-vs-callback split is computed against
+    # From Jobber's own TimeSheetEntry.createdAt (ISO8601DateTime!,
+    # confirmed non-null in the schema). Named jobber_created_at, not
+    # created_at — DateModel already owns created_at for THIS ROW's own
+    # local creation time; this is Jobber's entry-creation timestamp, a
+    # genuinely different fact. Same naming precedent as
+    # JobberJob.jobber_created_at. This is the field the
+    # original-vs-callback split is computed against
     # (calculate_job_duration_by_user()'s created_before/
     # created_at_or_after params) — NOT TimeSheetEntry.visit, confirmed
     # unreliable for this (null even for a normal, non-callback
-    # manually-added entry — see verify_job1_manual_entry_visit.py).
+    # manually-added entry).
     jobber_created_at = models.DateTimeField(null=True, blank=True)
-    # New (2026-09-03, approved labor_cost_profit_margin_proposal.md) —
-    # from Jobber's own TimeSheetEntry.labourRate (confirmed real via
-    # verify_labour_rate_field.py; a DIFFERENT field from the already-
-    # confirmed-broken JobberJob.labour_cost/jobCosting.labourCost above).
-    # Reads 0.00 in this account today only because no rate has been
-    # entered in Jobber yet, not because the field is broken — treated as
-    # "not entered," never a real $0/hr rate, same "0 = not set"
-    # convention already used for TechnicianGoal.goal_amount. Same
-    # DecimalField(12, 2) money-field convention as every other stored
-    # dollar figure in this app.
+    # From Jobber's own TimeSheetEntry.labourRate (confirmed real; a
+    # DIFFERENT field from the already-confirmed-broken
+    # JobberJob.labour_cost/jobCosting.labourCost above). Reads 0.00 in
+    # this account today only because no rate has been entered in Jobber
+    # yet, not because the field is broken — treated as "not entered,"
+    # never a real $0/hr rate, same "0 = not set" convention already used
+    # for TechnicianGoal.goal_amount. Same DecimalField(12, 2)
+    # money-field convention as every other stored dollar figure in this
+    # app.
     labour_rate = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
     synced_at = models.DateTimeField()
 
@@ -528,20 +521,17 @@ class JobberTimeSheetEntry(DateModel):
 class JobberExpense(DateModel):
     """
     Local mirror of one Jobber Expense, populated and refreshed by the
-    sync engine. New (2026-09-14, approved cost_breakdown_dynamic_
-    categories_proposal.md) -- built for the Accounts panel's real
-    "Total Expenses (YTD)" stat, after Jobber's own "Accounting Codes"
-    were CONFIRMED PERMANENTLY ABSENT from the real GraphQL schema
-    (exhaustively verified across all 738 real schema types -- see
-    PROJECT_CONTEXT.md's own dated entry). Category-based Cost
-    Breakdown is dead; this model exists purely to support a real,
-    company-wide expense TOTAL, not a per-category breakdown -- there
-    is no category field anywhere to store.
+    sync engine -- built for the Accounts panel's real "Total Expenses
+    (YTD)" stat, after Jobber's own "Accounting Codes" were CONFIRMED
+    PERMANENTLY ABSENT from the real GraphQL schema (exhaustively
+    verified across all real schema types -- see PROJECT_CONTEXT.md).
+    Category-based Cost Breakdown is dead; this model exists purely to
+    support a real, company-wide expense TOTAL, not a per-category
+    breakdown -- there is no category field anywhere to store.
 
     Unlike JobberVisit/JobberTimeSheetEntry, Expense DOES have its own
     real, standalone, root-level Query.expenses connection (confirmed
-    live, cheap -- see verify_query_expenses_shape_and_cost.py's real
-    output) -- pulled directly, not derived from nested Job data.
+    live, cheap) -- pulled directly, not derived from nested Job data.
     """
 
     tenant = models.ForeignKey(
@@ -592,9 +582,9 @@ class JobberExpense(DateModel):
 class JobberSyncRun(models.Model):
     """
     One row per sync attempt for a tenant (not one mutable row per tenant —
-    FR-308 needs history). Does double duty as both the FR-308 audit trail
+    history needs to be kept). Does double duty as both the audit trail
     and the concurrency lock: claiming a row IS starting a sync run, via
-    select_for_update() in the sync engine (not built in this step).
+    select_for_update() in the sync engine (see sync.py's _claim_run()).
 
     Deliberately does NOT inherit DateModel — its is_active toggle doesn't
     mean anything for a historical run record; a past run isn't "inactive,"
@@ -624,14 +614,12 @@ class JobberSyncRun(models.Model):
     jobs_synced = models.IntegerField(default=0)
     visits_synced = models.IntegerField(default=0)
     invoices_synced = models.IntegerField(default=0)
-    # New (2026-09-15, approved manual_sync_and_faster_staleness_
-    # proposal.md) -- closes a real, previously-deliberate gap: these 2
-    # entities were always synced (see sync_jobs()'s docstring for
-    # timesheet_entries, sync_expenses() for expenses) but never had
-    # their own persisted count column, unlike the 5 above. Needed now
-    # so the new manual "Sync Now" endpoint's real response message can
+    # These 2 entities are always synced (see sync_jobs()'s docstring for
+    # timesheet_entries, sync_expenses() for expenses) but only these two
+    # get their own persisted count column here, unlike the 5 above --
+    # needed so the manual "Sync Now" endpoint's response message can
     # honestly report a real expense/timesheet-entry count instead of
-    # silently omitting 2 of the 7 real entities this app now syncs.
+    # silently omitting 2 of the 7 real entities this app syncs.
     timesheet_entries_synced = models.IntegerField(default=0)
     expenses_synced = models.IntegerField(default=0)
 
