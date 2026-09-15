@@ -118,13 +118,13 @@ class JobberAccountsView(APIView):
     """
     GET /v1/jobber/accounts/
 
-    Phase 2 cutover: now reads from local tables via
-    _local_accounts_response() (ensure_fresh(require_complete=True) + local
-    tables), not Jobber directly. The original live-proxy body is
-    preserved, unused, in _get_live() below for a fast rollback if needed —
-    revert by having get() call self._get_live(request) instead of
-    _local_accounts_response(). Jobs and Invoices are also cut over;
-    Employees is unchanged — still live-proxy, per the current rollout.
+    Reads from local tables via _local_accounts_response()
+    (ensure_fresh(require_complete=True) + local tables), not Jobber
+    directly. The original live-proxy body is preserved, unused, in
+    _get_live() below for a fast rollback if needed — revert by having
+    get() call self._get_live(request) instead of _local_accounts_response().
+    Jobs and Invoices are also cut over to local reads the same way;
+    Employees is still live-proxy.
     """
     permission_classes = [CustomerPermission]
 
@@ -157,9 +157,9 @@ class JobberAccountsView(APIView):
     def _get_live(self, request):
         """
         DEAD CODE — deliberately kept, not called from anywhere. This is the
-        exact live-proxy body get() used before the Phase 2 cutover above.
-        Rollback: make get() call self._get_live(request) again instead of
-        _local_accounts_response().
+        exact live-proxy body get() used before the cutover to local reads
+        above. Rollback: make get() call self._get_live(request) again
+        instead of _local_accounts_response().
         """
         data = {
             'connected': False,
@@ -197,9 +197,10 @@ class JobberAccountsView(APIView):
             return api_response_parser(data=data, message=msg, status=st, success=success)
 
 
-# ── Local-table read path (Phase 2) ──────────────────────────────────────────
-# Built alongside the live-proxy code above, NOT wired into JobberAccountsView
-# yet. Confirmed via a side-by-side comparison against the live-proxy output.
+# ── Local-table read path ─────────────────────────────────────────────────
+# JobberAccountsView.get() above calls _local_accounts_response() below,
+# not the live-proxy functions — confirmed via a side-by-side comparison
+# against the live-proxy output before the cutover.
 #
 # Structurally different from _rank_accounts()/_service_type_breakdown() by
 # necessity, not by choice: those two derive type/service-type fields from
@@ -254,14 +255,13 @@ def _local_service_type_breakdown(tenant_id):
 
 def _cost_breakdown(tenant_id):
     """
-    Real Cost Breakdown (2026-09-14, approved cost_breakdown_dynamic_
-    categories_proposal.md) — replaces the old fully-mock 6-fixed-bucket
-    chart entirely. Jobber's own "Accounting Codes" were CONFIRMED
-    PERMANENTLY ABSENT from the real GraphQL schema (exhaustively
-    verified across all 738 real schema types — see PROJECT_CONTEXT.md's
-    own dated entry) — there is no real category field anywhere to group
-    expenses by, so this is 2 real, honest company-wide stats instead of
-    a category breakdown: Labor and Total Expenses, both YTD.
+    Real Cost Breakdown — replaces the old fully-mock 6-fixed-bucket chart
+    entirely. Jobber's own "Accounting Codes" were CONFIRMED PERMANENTLY
+    ABSENT from the real GraphQL schema (exhaustively verified across all
+    real schema types — see PROJECT_CONTEXT.md) — there is no real
+    category field anywhere to group expenses by, so this is 2 real,
+    honest company-wide stats instead of a category breakdown: Labor and
+    Total Expenses, both YTD.
 
     Labor (YTD): reuses labor_cost_for_jobs() (electricians_summary.py)
     UNCHANGED — the exact same per-entry-sum formula Revenue Health's own
@@ -269,7 +269,7 @@ def _cost_breakdown(tenant_id):
     of that KPI's rolling PERIOD_MONTHS window. None (never a fabricated
     0) when zero real entries anywhere in the YTD window have a usable
     rate — matches this account's own current real state (no non-zero
-    labour_rate entered yet, confirmed in an earlier round).
+    labour_rate entered yet).
 
     Total Expenses (YTD): Sum(total) across every real, locally-synced
     JobberExpense row whose real `incurred_at` falls in the YTD window.
@@ -303,8 +303,8 @@ def _local_accounts_response(user):
     """
     Local-table equivalent of JobberAccountsView.get()'s `data` dict. Calls
     ensure_fresh() first (require_complete=True — a ranking over an
-    incomplete pull is a wrong answer, not just a stale one, per the design
-    doc), then reads local tables — never Jobber directly.
+    incomplete pull is a wrong answer, not just a stale one), then reads
+    local tables — never Jobber directly.
     """
     tenant_id = user.tenant_id
     if not tenant_id:
@@ -314,10 +314,10 @@ def _local_accounts_response(user):
     if account is None:
         return {'connected': False, 'accounts': [], 'service_type_breakdown': [], 'cost_breakdown': None, 'computed_at': None}
 
-    # 'expenses' added (2026-09-14) alongside the existing 'clients'/'jobs'/
-    # 'invoices' this view already requests — same require_complete=True
-    # reasoning: a Total Expenses total computed over a partially-synced
-    # entity set is a WRONG number, not just a stale one.
+    # 'expenses' is requested alongside 'clients'/'jobs'/'invoices' — same
+    # require_complete=True reasoning: a Total Expenses total computed
+    # over a partially-synced entity set is a WRONG number, not just a
+    # stale one.
     fresh = ensure_fresh(account.tenant, entities=['clients', 'jobs', 'invoices', 'expenses'], require_complete=True)
 
     data = {

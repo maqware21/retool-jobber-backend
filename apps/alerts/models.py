@@ -6,16 +6,15 @@ from helpers.models import DateModel
 
 class AlertRule(DateModel):
     """
-    One customer-configured, COMPANY-WIDE alert policy (2026-08-21,
-    confirmed TL correction -- rules are NOT tied to one named
-    technician at creation time; see below). A SINGLE generic model
-    covers all rule types (not one model per type) -- every type needs
-    exactly the same 3 real fields (threshold, severity, enabled) and
-    differs only in which comparison evaluate_alert_rules() runs for it,
-    not in shape. Unlike Goals' Monthly/Annual split, nothing Alerts-
-    related was already shipped when this was designed, so there was no
-    live code protecting a narrower shape -- see PROJECT_CONTEXT.md for
-    the full reasoning against separate models per type.
+    One customer-configured, COMPANY-WIDE alert policy -- rules are NOT
+    tied to one named technician at creation time; see below. A SINGLE
+    generic model covers all rule types (not one model per type) -- every
+    type needs exactly the same 3 real fields (threshold, severity,
+    enabled) and differs only in which comparison evaluate_alert_rules()
+    runs for it, not in shape. Unlike Goals' Monthly/Annual split, nothing
+    Alerts-related was already shipped when this was designed, so there
+    was no live code protecting a narrower shape -- see PROJECT_CONTEXT.md
+    for the full reasoning against separate models per type.
 
     OUR OWN data, entered directly by the customer -- NOT synced from
     Jobber, never wired into sync_tenant()/ensure_fresh().
@@ -23,10 +22,7 @@ class AlertRule(DateModel):
     NO `user` FIELD, on purpose -- a rule is a policy ("monthly goal
     below 70% = critical"), automatically evaluated against EVERY active
     technician by evaluate_alert_rules(), not a one-time pick of a
-    single named person at creation time. This field existed briefly in
-    migration 0001 under the original (incorrect) "per-technician rule"
-    design and was removed in 0002 before any real row existed in
-    production -- a clean schema fix, not a data migration.
+    single named person at creation time.
 
     is_enabled is a SEPARATE field from DateModel's own is_active,
     deliberately -- is_active stays reserved for this project's existing

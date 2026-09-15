@@ -20,10 +20,8 @@ class AlertRuleListView(APIView):
         Every active AlertRule for the customer's tenant, plus the list
         of real rule_type choices (so the frontend's dropdown never
         hardcodes a copy that could drift from the backend's own
-        choices). No technician roster here (2026-08-21) -- that only
-        ever existed for the old per-rule technician picker, which is
-        gone now that a rule is a company-wide policy, not tied to one
-        named person.
+        choices). No technician roster here -- a rule is a company-wide
+        policy, not tied to one named person.
 
     POST /v1/alerts/rules/
         {"rule_type": "...", "threshold_value": "...", "severity":

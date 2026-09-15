@@ -6,25 +6,21 @@ from apps.goals.utils import current_month
 from apps.jobber.api.monthly_revenue import _revenue_by_technician_for_month
 from apps.jobber.api.technician_stats import get_technician_stats
 
-# Sort rank for the one required ordering rule (2026-08-21, confirmed
-# TL decision): Critical always before Warning, everywhere a
-# triggered-alerts list is displayed. Sorted ONCE here, server-side --
-# every consumer (AlarmPanel, the technician drawer's Active Alerts
-# section) reads this same already-sorted list via GET
-# /v1/alerts/triggered/, so neither has to re-sort it itself.
+# Sort rank for the one required ordering rule: Critical always before
+# Warning, everywhere a triggered-alerts list is displayed. Sorted ONCE
+# here, server-side -- every consumer (AlarmPanel, the technician
+# drawer's Active Alerts section) reads this same already-sorted list via
+# GET /v1/alerts/triggered/, so neither has to re-sort it itself.
 _SEVERITY_SORT_RANK = {'critical': 0, 'warning': 1}
 
-# Every rule_type's real trigger direction (2026-09-03, added alongside
-# callback_rate_above_pct). Every rule before this one was a "falls
-# BELOW threshold = bad" check -- the comparison itself used to be
-# hardcoded as `actual < threshold` with no concept of direction at all,
-# because every existing rule happened to share that direction. A high
-# callback rate is bad, not a low one, so it can't reuse that same
-# comparison unmodified -- this dict is what makes the comparison
-# direction-aware instead of adding a second, parallel evaluation path.
-# Every rule_type in helpers.constants.ALERT_RULE_TYPES MUST have an
-# entry here, or it silently falls through unevaluated (see the
-# 'no evaluator branch yet' comment in _actual_value below).
+# Every rule_type's real trigger direction. Most rules are a "falls BELOW
+# threshold = bad" check; a high callback rate is bad, not a low one, so
+# it can't reuse that same comparison unmodified -- this dict is what
+# makes the comparison direction-aware instead of adding a second,
+# parallel evaluation path. Every rule_type in
+# helpers.constants.ALERT_RULE_TYPES MUST have an entry here, or it
+# silently falls through unevaluated (see the 'no evaluator branch yet'
+# comment in _actual_value below).
 _RULE_TYPE_DIRECTION = {
     'monthly_goal_pct': 'below',
     'annual_goal_pct': 'below',
@@ -49,12 +45,11 @@ def _actual_value(rule_type, tech, team_avg_revenue, last_month_data=None):
     it's the same value for every TEAM_AVG_REVENUE_PCT check this call
     runs.
 
-    last_month_data (2026-09-04, approved last_month_goal_alert_
-    proposal.md) -- optional, defaults to None, so every existing call
-    for every rule_type other than last_month_goal_pct behaves exactly
-    as before this parameter was added (unused by any other branch,
-    never even read unless rule_type == 'last_month_goal_pct'). Unlike
-    every other branch here, this ISN'T a field get_technician_stats()
+    last_month_data -- optional, defaults to None, so every call for
+    every rule_type other than last_month_goal_pct is unaffected by it
+    (unused by any other branch, never even read unless rule_type ==
+    'last_month_goal_pct'). Unlike every other branch here, this ISN'T a
+    field get_technician_stats()
     itself computes -- it's a per-tenant {user_id: percentage_or_None}
     dict evaluate_alert_rules() computes ONCE, lazily, only when a
     last_month_goal_pct rule actually exists for this tenant (see that
@@ -100,10 +95,10 @@ def evaluate_alert_rules(tenant):
     Returns every currently-triggered alert for `tenant`'s active,
     enabled AlertRules.
 
-    Each AlertRule is a COMPANY-WIDE policy (2026-08-21, confirmed TL
-    correction), not tied to one named technician -- so for EACH active
-    rule, this evaluates EVERY active technician against it and emits
-    one triggered entry per technician who crosses the threshold. A
+    Each AlertRule is a COMPANY-WIDE policy, not tied to one named
+    technician -- so for EACH active rule, this evaluates EVERY active
+    technician against it and emits one triggered entry per technician
+    who crosses the threshold. A
     single rule can legitimately produce MULTIPLE triggered entries in
     one call (one per violating technician) -- intentional, not a bug;
     it can also produce zero if nobody currently violates it.
@@ -125,9 +120,9 @@ def evaluate_alert_rules(tenant):
     because they show a "connect Jobber" prompt state that Alerts has no
     equivalent of).
 
-    Nothing is collapsed or hidden (2026-08-21, confirmed TL decision) --
-    every triggered entry is returned. The only ordering guarantee is
-    Critical before Warning; within the same severity, entries keep
+    Nothing is collapsed or hidden -- every triggered entry is returned.
+    The only ordering guarantee is Critical before Warning; within the
+    same severity, entries keep
     whatever order they were generated in (rules ordered by `id`,
     technicians already ordered by name via get_technician_stats()) --
     a stable sort (list.sort(), guaranteed stable) preserves that
@@ -157,9 +152,8 @@ def evaluate_alert_rules(tenant):
     # zero-activity ones" convention.
     team_avg_revenue = team_revenue_total / len(technicians)
 
-    # Lazy, once-per-tenant (2026-09-04, approved last_month_goal_alert_
-    # proposal.md) -- computed AT MOST ONCE per call, before the rule
-    # loop below, and ONLY when at least one last_month_goal_pct rule
+    # Lazy, once-per-tenant -- computed AT MOST ONCE per call, before the
+    # rule loop below, and ONLY when at least one last_month_goal_pct rule
     # actually exists for this tenant. Two rules of this same type with
     # different thresholds (the standard critical/warning 2-tier
     # pattern -- see AlertRule's own docstring) both read from this one
@@ -201,10 +195,9 @@ def evaluate_alert_rules(tenant):
             if actual is None:
                 continue  # no data this window for this technician -- not a trigger, not an error
 
-            # Direction-aware (2026-09-03) -- see _RULE_TYPE_DIRECTION's
-            # own comment. Defaults to 'below' (the original, only
-            # behavior before this) for any rule_type that somehow lacks
-            # an entry there, rather than crashing on a real but
+            # Direction-aware -- see _RULE_TYPE_DIRECTION's own comment.
+            # Defaults to 'below' for any rule_type that somehow lacks an
+            # entry there, rather than crashing on a real but
             # unanticipated gap.
             threshold = float(rule.threshold_value)
             direction = _RULE_TYPE_DIRECTION.get(rule.rule_type, 'below')

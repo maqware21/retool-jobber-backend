@@ -142,7 +142,7 @@ class TeamAnnualGoal(DateModel):
     )
     year = models.DateField()  # always Jan 1 of that year
     # Same DecimalField(12, 2) as the monthly shape -- confirmed
-    # deliberately, not carried forward by default (2026-08-19): 12
+    # deliberately, not just carried forward by default: 12
     # max_digits/2 decimal_places allows up to $9,999,999,999.99, the
     # same money-field convention already used for Job.total/
     # Invoice.amount/TeamGoal.goal_amount/TechnicianGoal.goal_amount

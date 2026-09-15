@@ -137,7 +137,7 @@ class JobberCallbackView(APIView):
         if is_reconnect:
             self._invalidate_local_data(tenant)
 
-        # Phase 2 local-sync bootstrap: seed the tenant's first JobberSyncRun
+        # Local-sync bootstrap: seed the tenant's first JobberSyncRun
         # row as an already-finished SUCCESS with zero counts, in the same
         # transaction as the JobberAccount row above. The sync engine's
         # concurrency guard (select_for_update on the tenant's latest
@@ -278,8 +278,7 @@ class JobberDisconnectView(APIView):
             return api_response_parser(data=data, message=msg, status=st, success=success)
 
 
-# Real, honest per-outcome message (2026-09-15, approved manual_sync_and_
-# faster_staleness_proposal.md) -- NOT a single generic string. The
+# Real, honest per-outcome message -- NOT a single generic string. The
 # customer-facing frontend still builds its own real message from the
 # per-entity counts below; this is the response envelope's own top-level
 # `message`, which needed to stop implying success for a real 'partial'/
@@ -312,8 +311,7 @@ class JobberSyncNowView(APIView):
     double-click, or this firing at the same moment as an automatic
     sync, both resolve correctly with zero changes needed here: whichever
     call's transaction commits first does the real work; the other
-    genuinely gets back the same current row rather than double-syncing
-    (see manual_sync_and_faster_staleness_proposal.md's own trace).
+    genuinely gets back the same current row rather than double-syncing.
 
     HTTP-level success=True/200 even for a real 'partial'/'failed' SYNC
     outcome — this endpoint call itself did what was asked (ran a real

@@ -9,9 +9,8 @@ class AlertRuleSerializer(serializers.ModelSerializer):
     create (POST), and update (PATCH) endpoints -- PATCH passes
     partial=True, everything else is identical.
 
-    No `user` field (2026-08-21, confirmed TL correction) -- a rule is a
-    company-wide policy, not tied to one named technician at creation
-    time. See AlertRule's own docstring.
+    No `user` field -- a rule is a company-wide policy, not tied to one
+    named technician at creation time. See AlertRule's own docstring.
     """
     rule_type_display = serializers.CharField(source='get_rule_type_display', read_only=True)
 
