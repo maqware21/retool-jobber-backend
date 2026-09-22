@@ -103,21 +103,29 @@ def _accumulate_technician_callback_stats(archived_jobs):
         above uses it for whole-job revenue.
 
     Returns {user_id: {'callback_visits_done': int,
-    'callback_dollars_lost': float, 'has_unknown_callback_cost': bool}}.
+    'callback_dollars_lost': float, 'has_unknown_callback_cost': bool,
+    'has_estimated_callback_cost': bool}}.
 
     callback_visits_done: FULL credit to every real assignee of a
     callback visit — the same "no-split" rule jobs_completed itself uses,
     not a proportional count.
 
     callback_dollars_lost: only sums a callback's dollar SHARE when
-    job.callback_bled_amount is a real (non-null) number. A null
-    callback_bled_amount means "unknown cost" — Job #3's own real,
-    confirmed case (a genuine callback with zero logged hours on the
-    callback visit) — and must NEVER be silently coalesced into a clean
-    $0 total. Split proportionally via split_job_revenue_among_assignees(),
-    weighted by the CALLBACK-VISIT-ONLY hours (not the whole job's hours,
-    since this dollar figure is specifically about the callback's own
-    cost, not the original work).
+    job.callback_bled_amount is a real (non-null) number — whether that
+    number came from real logged hours OR the scheduled-time fallback
+    (see has_estimated_callback_cost below); either way it's a real
+    number to sum, just with different confidence. A null
+    callback_bled_amount means genuinely unknown cost (no logged hours
+    AND no usable scheduled time either) and must NEVER be silently
+    coalesced into a clean $0 total. Split proportionally via
+    split_job_revenue_among_assignees(), weighted by the
+    CALLBACK-VISIT-ONLY hours (not the whole job's hours, since this
+    dollar figure is specifically about the callback's own cost, not the
+    original work) — real logged hours specifically, even when
+    callback_bled_amount itself came from the scheduled-time fallback,
+    which is exactly why that fallback case naturally lands on
+    split_job_revenue_among_assignees()'s own "nobody tracked time ->
+    equal split" branch, unchanged, no special-casing needed here.
 
     has_unknown_callback_cost: True for any technician with at least one
     REAL callback (is_callback=True, correctly attributed to them via
@@ -125,6 +133,15 @@ def _accumulate_technician_callback_stats(archived_jobs):
     explicit flag — never dropped, never merged into the dollar total —
     so a technician's $0 in the response is never ambiguous between
     "confirmed zero lost" and "we don't actually know."
+
+    has_estimated_callback_cost: True for any technician with at least
+    one real callback whose job.callback_bled_amount_is_estimated is
+    True — a DIFFERENT, less severe caveat than has_unknown_callback_cost
+    above (a real number exists here, just estimated from schedule
+    rather than logged time), so it gets its own flag rather than being
+    folded into the same one. A technician can have both flags true at
+    once (a different callback, unknown; this one, estimated) — that's a
+    real, valid state, not a contradiction.
     """
     stats = {}
     for job in archived_jobs:
@@ -138,6 +155,7 @@ def _accumulate_technician_callback_stats(archived_jobs):
         # but this doesn't assume that).
         callback_hours_by_user = calculate_job_duration_by_user(job, created_at_or_after=job.first_archived_at)
         has_known_amount = job.callback_bled_amount is not None
+        is_estimated_amount = has_known_amount and job.callback_bled_amount_is_estimated
 
         for visit in callback_visits:
             assignees = list(visit.assigned_users.all())
@@ -152,11 +170,18 @@ def _accumulate_technician_callback_stats(archived_jobs):
             for user in assignees:
                 entry = stats.setdefault(
                     user.id,
-                    {'callback_visits_done': 0, 'callback_dollars_lost': 0.0, 'has_unknown_callback_cost': False},
+                    {
+                        'callback_visits_done': 0,
+                        'callback_dollars_lost': 0.0,
+                        'has_unknown_callback_cost': False,
+                        'has_estimated_callback_cost': False,
+                    },
                 )
                 entry['callback_visits_done'] += 1
                 if has_known_amount:
                     entry['callback_dollars_lost'] += dollar_shares.get(user.id, 0.0)
+                    if is_estimated_amount:
+                        entry['has_estimated_callback_cost'] = True
                 else:
                     entry['has_unknown_callback_cost'] = True
     return stats
@@ -382,6 +407,7 @@ def get_technician_stats(tenant):
         callback_visits_done = cb_stats['callback_visits_done'] if cb_stats else 0
         callback_dollars_lost = cb_stats['callback_dollars_lost'] if cb_stats else 0.0
         has_unknown_callback_cost = cb_stats['has_unknown_callback_cost'] if cb_stats else False
+        has_estimated_callback_cost = cb_stats['has_estimated_callback_cost'] if cb_stats else False
         # None (not 0) when jobs_completed is 0 -- "no data" (this
         # technician completed nothing this window, the ratio is
         # undefined), distinct from a real, confirmed 0% when they
@@ -501,6 +527,7 @@ def get_technician_stats(tenant):
             'callback_rate': callback_rate,
             'callback_dollars_lost': round(callback_dollars_lost, 2),
             'has_unknown_callback_cost': has_unknown_callback_cost,
+            'has_estimated_callback_cost': has_estimated_callback_cost,
             'goal_progress': {
                 'goal_amount': float(goal_amount) if goal_amount is not None else None,
                 'current_month_revenue': round(float(current_month_revenue), 2),
