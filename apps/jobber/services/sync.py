@@ -9,9 +9,10 @@ cross-process concurrency lock (select_for_update()).
 
 ensure_fresh(tenant, entities, require_complete) is the stale-request
 trigger built on top of sync_tenant() — called by every real Jobber view
-(Jobs, Invoices, Accounts, Employees, Electricians Summary, Technician
-Stats, Monthly Revenue, Duration by Type, Revenue Composition) before it
-reads local tables.
+that reads local tables (Jobs, Invoices, Accounts, Electricians Summary,
+Technician Stats, Monthly Revenue, Duration by Type, Revenue Composition)
+before it does so. Employees is the one exception — it still live-proxies
+Jobber on every request instead.
 """
 
 import logging
@@ -1065,19 +1066,20 @@ def _last_run_was_unclean(tenant):
 def ensure_fresh(tenant, entities=None, require_complete=False):
     """
     Sync-on-demand for a stale request — called by every real Jobber view
-    before it reads local tables (Jobs, Invoices, Accounts, Employees,
+    that reads local tables before it does so (Jobs, Invoices, Accounts,
     Electricians Summary, Technician Stats, Monthly Revenue, Duration by
-    Type, Revenue Composition).
+    Type, Revenue Composition). Employees is the one exception — it still
+    live-proxies Jobber on every request instead of calling this.
 
     entities: which entities THIS caller needs (e.g. ['jobs', 'clients',
     'visits'] for the Jobs panel). Defaults to ALL_ENTITIES.
 
     require_complete: True for callers that need a full, correct picture to
-    rank from (Accounts, Employees) — triggers exactly one synchronous
-    retry if the first attempt comes back PARTIAL, then accepts PARTIAL
-    either way rather than retrying forever. Paginated callers (Jobs,
-    Invoices) tolerate a PARTIAL/stale pass fine (that's already
-    pagination's normal contract) and should leave this False.
+    rank from (Accounts and every aggregate endpoint above) — triggers
+    exactly one synchronous retry if the first attempt comes back PARTIAL,
+    then accepts PARTIAL either way rather than retrying forever. Paginated
+    callers (Jobs, Invoices) tolerate a PARTIAL/stale pass fine (that's
+    already pagination's normal contract) and should leave this False.
 
     Returns a small result dict:
       - 'last_synced_at': the OLDEST synced_at among the requested entities
