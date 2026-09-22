@@ -622,6 +622,23 @@ def detect_and_freeze_callbacks(account, tenant, job_ids_to_check):
     calculate_job_duration_by_user()'s created_before/created_at_or_after
     params instead, keyed on this job's own frozen first_archived_at.
 
+    SCHEDULED-TIME FALLBACK for callback_bled_amount, applies ONLY to the
+    callback visit's own hours, never to original_hours: if the callback
+    visit has zero real logged hours, this falls back to its real
+    scheduled startAt/endAt (fetched by the same live call, see
+    client.fetch_job_visits_for_callback_detection()) instead of leaving
+    callback_bled_amount null outright. JobberJob.callback_bled_amount_is_
+    estimated is frozen True in exactly this case, alongside
+    callback_bled_amount itself, so a real logged-hours result stays
+    honestly distinguishable from a schedule-based estimate downstream —
+    see that field's own model comment. A genuine unscheduled/"Anytime"
+    visit (both startAt and endAt null — a real, confirmed Jobber state,
+    not a data gap) still correctly falls through to callback_bled_amount
+    staying null. This fallback does not touch original_hours, or any
+    other consumer of calculate_job_duration_by_user()/
+    calculate_job_duration_seconds() (Avg Job Duration, Top Earner, Labor
+    Cost) — all of those continue to use real logged time only.
+
     One targeted live call per job whose status just transitioned into
     archived (client.fetch_job_visits_for_callback_detection() —
     Query.job(id:), visits only) — NOT a full account scan, which blows
@@ -760,22 +777,45 @@ def detect_and_freeze_callbacks(account, tenant, job_ids_to_check):
         # elsewhere in this app (calculate_job_duration_seconds() applies
         # the same rule to itself). Left null if there's no real
         # original-hours denominator, no real Job.total to divide, OR if
-        # callback_by_user is an EMPTY dict: that means the flagged
-        # callback visit has ZERO real timesheet entries logged against it
-        # at all, a genuinely unknown cost, not a real 0-hour callback.
-        # Gating on `callback_by_user` itself (dict truthiness), not just
-        # `callback_hours > 0`, is what catches this — callback_hours
-        # computed from an empty dict is already 0.0, which is
-        # indistinguishable from a real zero by value alone.
+        # callback_by_user is an EMPTY dict AND no usable scheduled-time
+        # fallback exists either: an empty dict means the flagged callback
+        # visit has ZERO real timesheet entries logged against it, a
+        # genuinely unknown cost by logged-time standards — but not
+        # necessarily unknown outright, see the scheduled-time fallback
+        # below. Gating on `callback_by_user` itself (dict truthiness), not
+        # just `callback_hours > 0`, is what distinguishes this from a real
+        # 0-hour callback — callback_hours computed from an empty dict is
+        # already 0.0, which is indistinguishable from a real zero by value
+        # alone.
         callback_bled_amount = None
+        is_estimated = False
         if callback_by_user and original_hours > 0 and job.total is not None:
+            # Real logged hours on the callback visit — unchanged.
             job_rate = job.total / _to_decimal(original_hours)
             callback_bled_amount = job_rate * _to_decimal(callback_hours)
+        elif not callback_by_user and original_hours > 0 and job.total is not None:
+            # No logged hours at all on the callback visit — fall back to
+            # its real SCHEDULED time rather than leaving this unknown
+            # outright. Both startAt and endAt must be real and in a sane
+            # order; a genuine unscheduled/"Anytime" visit (confirmed
+            # against Jobber's own schema: both come back null together
+            # for this case, never just one) falls through with
+            # callback_bled_amount staying None below — same "no data !=
+            # assumed" principle as everywhere else in this app, not a
+            # guess.
+            scheduled_start = _to_datetime(latest_visit_raw.get('startAt'))
+            scheduled_end = _to_datetime(latest_visit_raw.get('endAt'))
+            if scheduled_start and scheduled_end and scheduled_end > scheduled_start:
+                scheduled_hours = (scheduled_end - scheduled_start).total_seconds() / 3600
+                job_rate = job.total / _to_decimal(original_hours)
+                callback_bled_amount = job_rate * _to_decimal(scheduled_hours)
+                is_estimated = True
 
         local_visit.is_callback = True
         local_visit.save(update_fields=['is_callback'])
         job.callback_bled_amount = callback_bled_amount
-        job.save(update_fields=['callback_bled_amount'])
+        job.callback_bled_amount_is_estimated = is_estimated
+        job.save(update_fields=['callback_bled_amount', 'callback_bled_amount_is_estimated'])
         flagged += 1
 
     return {'checked': len(jobs), 'flagged': flagged}

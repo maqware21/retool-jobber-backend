@@ -531,6 +531,8 @@ query GetJobVisitsForCallbackDetection($id: EncodedId!) {
         id
         createdAt
         completedAt
+        startAt
+        endAt
         invoice { id }
       }
     }
@@ -541,15 +543,20 @@ query GetJobVisitsForCallbackDetection($id: EncodedId!) {
 
 def fetch_job_visits_for_callback_detection(account, job_id):
     """
-    Real visits (id, createdAt, completedAt, invoice) for exactly one job,
-    by its real jobber_id — used once per job each time it transitions
-    into archived, by sync.py's detect_and_freeze_callbacks() (a job can
-    trigger this more than once over its lifetime). completedAt is needed
-    to measure the CALLBACK_WINDOW_DAYS interval from the job's last
-    COMPLETED visit before the reopen, not from createdAt or
-    first_archived_at. Returns the raw node list (possibly empty if the
-    job/visits aren't found — never raises for that case, only for a
-    genuine JobberAPIError from execute()).
+    Real visits (id, createdAt, completedAt, startAt, endAt, invoice) for
+    exactly one job, by its real jobber_id — used once per job each time
+    it transitions into archived, by sync.py's
+    detect_and_freeze_callbacks() (a job can trigger this more than once
+    over its lifetime). completedAt is needed to measure the
+    CALLBACK_WINDOW_DAYS interval from the job's last COMPLETED visit
+    before the reopen, not from createdAt or first_archived_at.
+    startAt/endAt are the visit's real SCHEDULED time — confirmed against
+    Jobber's own schema that both come back null together for a genuine
+    unscheduled/"Anytime" visit, never one without the other — used as a
+    fallback when the callback visit itself has no logged hours (see
+    detect_and_freeze_callbacks()). Returns the raw node list (possibly
+    empty if the job/visits aren't found — never raises for that case,
+    only for a genuine JobberAPIError from execute()).
     """
     data = execute(account, _CALLBACK_DETECTION_QUERY, {'id': job_id})
     job_node = (data or {}).get('job') or {}

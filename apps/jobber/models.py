@@ -262,6 +262,16 @@ class JobberJob(DateModel):
     # moment is_callback is set on the relevant JobberVisit -- see that
     # function's docstring.
     callback_bled_amount = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    # True only when callback_bled_amount above was computed from the
+    # callback visit's real SCHEDULED start/end time, not real logged
+    # hours -- the callback visit itself had zero logged entries, so the
+    # dollar figure is an estimate, not a confirmed amount. False in both
+    # other real cases: a real logged-hours amount, or callback_bled_amount
+    # still null (schedule was also missing/unusable -- a genuine
+    # unscheduled visit, never guessed at). Frozen at the exact same
+    # moment as callback_bled_amount, for the same reason that field is
+    # frozen -- see detect_and_freeze_callbacks()'s own docstring.
+    callback_bled_amount_is_estimated = models.BooleanField(default=False)
     synced_at = models.DateTimeField()
 
     class Meta:
