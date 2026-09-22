@@ -61,6 +61,19 @@ STALENESS_THRESHOLD = timedelta(minutes=10)
 # detect_and_freeze_callbacks()'s own docstring for the exact mechanics.
 CALLBACK_WINDOW_DAYS = 14
 
+# Sanity ceiling for the scheduled-time callback fallback (see
+# detect_and_freeze_callbacks()) -- a scheduled visit block beyond this
+# is treated as untrustworthy (a placeholder/multi-day/malformed block,
+# not a real single visit's work window) and falls through to the
+# existing "unknown" state instead of producing an estimate. Confirmed
+# real trigger for this: a real ~25-hour scheduled block on a genuine
+# callback visit produced a real, confirmed-wrong $5,000 estimate on a
+# $600 job (job.total=$600, 3.0 real logged original hours -> $200/hr
+# rate, x 25 scheduled hours). 12 hours is generous enough to cover a
+# real long single-day visit while decisively excluding results like
+# that one, which structurally exceeds a full calendar day.
+CALLBACK_SCHEDULED_HOURS_CEILING = 12
+
 ENTITY_MODELS = {
     'clients': JobberClient,
     'users': JobberUser,
@@ -634,7 +647,13 @@ def detect_and_freeze_callbacks(account, tenant, job_ids_to_check):
     see that field's own model comment. A genuine unscheduled/"Anytime"
     visit (both startAt and endAt null — a real, confirmed Jobber state,
     not a data gap) still correctly falls through to callback_bled_amount
-    staying null. This fallback does not touch original_hours, or any
+    staying null. A real, oversized scheduled block (confirmed: a real
+    ~25-hour scheduled window on one real callback produced a real,
+    confirmed-wrong $5,000 estimate on a $600 job) is NOT trusted either —
+    CALLBACK_SCHEDULED_HOURS_CEILING (module constant above) rejects
+    anything past a plausible single-visit workday, falling through to
+    the same unknown state, logged rather than silently dropped. This
+    fallback does not touch original_hours, or any
     other consumer of calculate_job_duration_by_user()/
     calculate_job_duration_seconds() (Avg Job Duration, Top Earner, Labor
     Cost) — all of those continue to use real logged time only.
@@ -807,9 +826,18 @@ def detect_and_freeze_callbacks(account, tenant, job_ids_to_check):
             scheduled_end = _to_datetime(latest_visit_raw.get('endAt'))
             if scheduled_start and scheduled_end and scheduled_end > scheduled_start:
                 scheduled_hours = (scheduled_end - scheduled_start).total_seconds() / 3600
-                job_rate = job.total / _to_decimal(original_hours)
-                callback_bled_amount = job_rate * _to_decimal(scheduled_hours)
-                is_estimated = True
+                if scheduled_hours <= CALLBACK_SCHEDULED_HOURS_CEILING:
+                    job_rate = job.total / _to_decimal(original_hours)
+                    callback_bled_amount = job_rate * _to_decimal(scheduled_hours)
+                    is_estimated = True
+                else:
+                    logger.info(
+                        "detect_and_freeze_callbacks: job=%s's callback visit=%s has a "
+                        "%.1f-hour scheduled window, over the %s-hour sanity ceiling -- "
+                        "not trusted as a real work-duration proxy, leaving cost unknown "
+                        "rather than producing an unrealistic estimate.",
+                        job.jobber_id, latest_visit_id, scheduled_hours, CALLBACK_SCHEDULED_HOURS_CEILING,
+                    )
 
         local_visit.is_callback = True
         local_visit.save(update_fields=['is_callback'])
