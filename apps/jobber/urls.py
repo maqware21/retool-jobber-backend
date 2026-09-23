@@ -42,8 +42,8 @@ urlpatterns = [
     path('duration-by-type/', JobberDurationByTypeView.as_view(), name='duration-by-type'),
 
     # ── Webhooks (public — authenticated via HMAC-SHA256 signature) ────────────
-    # Register this URL in the Jobber Developer Center for the APP_DISCONNECT
-    # topic (and any others added later):
+    # Register this URL in the Jobber Developer Center for the APP_DISCONNECT,
+    # JOB_UPDATE, and JOB_CLOSED topics (and any others added later):
     #   https://api.techtrackpro.com/v1/jobber/webhook/
     path('webhook/', JobberWebhookView.as_view(), name='webhook'),
 ]

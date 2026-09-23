@@ -5,9 +5,15 @@ All webhook events sent by Jobber arrive here via POST. The endpoint is public
 (no JWT) — authenticity is established by verifying the HMAC-SHA256 signature
 Jobber includes on every request.
 
-Jobber requires a 200 response within 1 second. Heavy processing should be
-offloaded to a background task (TODO: move to Celery/RQ when task
-infrastructure is added).
+Jobber requires a 200 response within 1 second. APP_DISCONNECT's own handler
+stays synchronous (a single filtered UPDATE on one row, effectively
+instant). JOB_UPDATE/JOB_CLOSED cannot make that same claim — the real
+action they trigger is a full sync_tenant() call, which can legitimately
+take close to sync.SYNC_WALL_CLOCK_CEILING (~25s) — so those two dispatch
+to background_sync.submit_tenant_sync() instead of running inline. See
+background_sync.py's own module docstring and
+jobber_webhooks_design_proposal.md for the full reasoning (a bounded
+ThreadPoolExecutor, not Celery/RQ, and not a raw unbounded thread either).
 """
 
 import base64
@@ -23,6 +29,7 @@ from django.views import View
 from django.views.decorators.csrf import csrf_exempt
 
 from apps.jobber.models import JobberAccount
+from apps.jobber.services.background_sync import submit_tenant_sync
 
 logger = logging.getLogger(__name__)
 
@@ -50,8 +57,8 @@ class JobberWebhookView(View):
     POST /v1/jobber/webhook/
 
     Receives and dispatches Jobber webhook events. Must be registered in the
-    Jobber Developer Center with the APP_DISCONNECT topic (and any others
-    added later) pointing at:
+    Jobber Developer Center with the APP_DISCONNECT, JOB_UPDATE, and
+    JOB_CLOSED topics (and any others added later) pointing at:
         https://api.techtrackpro.com/v1/jobber/webhook/
     """
 
@@ -86,9 +93,13 @@ class JobberWebhookView(View):
         logger.info("Jobber webhook received: topic=%r", topic)
 
         if topic == 'APP_DISCONNECT':
-            # TODO: move to a background task (Celery/RQ) if DB latency
-            # ever risks breaching Jobber's 1-second response requirement.
+            # Stays inline — a single filtered UPDATE on one row, well
+            # within the 1-second budget on its own.
             self._handle_app_disconnect(payload)
+        elif topic in ('JOB_UPDATE', 'JOB_CLOSED'):
+            # NOT run inline — see this module's own docstring for why a
+            # real sync_tenant() call can't honestly stay synchronous here.
+            self._handle_job_change(payload)
         else:
             logger.info("Jobber webhook: no handler for topic %r — ignoring", topic)
 
@@ -133,3 +144,50 @@ class JobberWebhookView(View):
             account.tenant_id,
             account_id,
         )
+
+    def _handle_job_change(self, payload):
+        """
+        Submits a real, targeted sync to the background pool for the
+        account this JOB_UPDATE/JOB_CLOSED event belongs to.
+
+        The payload only carries topic/accountId/itemId, never the changed
+        job data itself — itemId is NOT used to filter the sync (sync_jobs()
+        has no per-job fetch today; this is a real, accepted inefficiency,
+        see jobber_webhooks_design_proposal.md point 4). This exists purely
+        as a trigger: "something changed for this account, go find out via
+        the existing full-tenant sync" — same trigger-only role
+        APP_DISCONNECT's own accountId already plays above.
+
+        Idempotency: intentionally has NO dedup logic of its own. Jobber's
+        at-least-once delivery (including duplicate near-simultaneous
+        deliveries) is already absorbed for free by sync_tenant()'s own
+        _claim_run() select_for_update() lock — two near-simultaneous
+        deliveries for the same tenant just resolve to "whichever commits
+        first does the real work," identical to JobberSyncNowView's own
+        documented double-click safety.
+        """
+        event = (payload.get('data') or {}).get('webHookEvent', {})
+        account_id = event.get('accountId')
+        topic = event.get('topic')
+
+        if not account_id:
+            logger.warning("%s webhook payload missing accountId — cannot act", topic)
+            return
+
+        account = JobberAccount.objects.filter(
+            jobber_account_id=account_id,
+            is_active=True,
+        ).first()
+
+        if account is None:
+            logger.info(
+                "%s for accountId=%r — no active JobberAccount found, nothing to sync",
+                topic, account_id,
+            )
+            return
+
+        logger.info(
+            "%s: submitting background sync for JobberAccount tenant=%s (accountId=%r)",
+            topic, account.tenant_id, account_id,
+        )
+        submit_tenant_sync(account, entities=['jobs', 'visits', 'timesheet_entries'])
