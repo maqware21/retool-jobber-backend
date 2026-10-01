@@ -187,6 +187,126 @@ def _accumulate_technician_callback_stats(archived_jobs):
     return stats
 
 
+def _accumulate_technician_cross_job_callback_stats(tenant_id, period_start):
+    """
+    Per-technician cross-job callback counts and dollar attribution,
+    mirroring _accumulate_technician_callback_stats() above's exact
+    return shape and semantics, sourced from the NEW cross-job model
+    (cross_job_callback_detection.py) instead of the old same-job-reopen
+    one.
+
+    Population: every real JobberJob with cross_job_callback_of NOT
+    null for this tenant, windowed by THIS (later) job's own real
+    jobber_created_at >= period_start -- deliberately NOT
+    job_status='archived' + completed_at the way the old population
+    above is windowed. Confirmed via real data (tenant_id=6's own JOB-5)
+    that a genuine, already-detected, already-priced cross-job callback
+    can sit at job_status='requires_invoicing' indefinitely -- a real
+    no-charge job has no invoice to close it out, so it may never reach
+    'archived' or get a real completed_at at all. Gating on either would
+    silently exclude a real, confirmed callback from ever appearing
+    here.
+
+    Attribution: the LATER job's own real assignees
+    (_gather_job_assignees(job) -- every one of its visits'
+    assigned_users, deduped), full credit each, same "no-split" rule
+    callback_visits_done already uses above -- there's no separate
+    "callback visit" to single out in this model; the entire later job
+    IS the callback.
+
+    callback_dollars_lost: cross_job_callback_bled_amount split via
+    split_job_revenue_among_assignees(), weighted by the later job's own
+    REAL LOGGED HOURS (whole job -- no archival split needed, since the
+    2 jobs are already separate rows) -- same reuse of the existing
+    4-rule split logic the old function above already uses, not
+    re-derived.
+
+    has_unknown_callback_cost / has_estimated_callback_cost: same
+    meaning as above, read from cross_job_callback_bled_amount /
+    cross_job_callback_bled_amount_is_estimated instead.
+    """
+    later_jobs = JobberJob.objects.filter(
+        tenant_id=tenant_id,
+        is_active=True,
+        cross_job_callback_of__isnull=False,
+        jobber_created_at__gte=period_start,
+    )
+    stats = {}
+    for job in later_jobs:
+        assignees = _gather_job_assignees(job)
+        if not assignees:
+            continue
+
+        has_known_amount = job.cross_job_callback_bled_amount is not None
+        is_estimated_amount = has_known_amount and job.cross_job_callback_bled_amount_is_estimated
+
+        dollar_shares = {}
+        if has_known_amount:
+            hours_by_user = calculate_job_duration_by_user(job)
+            hours_by_user = {user_id: hours_by_user.get(user_id, 0) for user_id in assignees}
+            dollar_shares = split_job_revenue_among_assignees(
+                float(job.cross_job_callback_bled_amount), hours_by_user,
+            )
+
+        for user_id in assignees:
+            entry = stats.setdefault(
+                user_id,
+                {
+                    'callback_visits_done': 0,
+                    'callback_dollars_lost': 0.0,
+                    'has_unknown_callback_cost': False,
+                    'has_estimated_callback_cost': False,
+                },
+            )
+            entry['callback_visits_done'] += 1
+            if has_known_amount:
+                entry['callback_dollars_lost'] += dollar_shares.get(user_id, 0.0)
+                if is_estimated_amount:
+                    entry['has_estimated_callback_cost'] = True
+            else:
+                entry['has_unknown_callback_cost'] = True
+    return stats
+
+
+def _merge_callback_stats(old_stats, new_stats):
+    """
+    Combines the OLD system's already-frozen historical callback stats
+    (same-job-reopen model; its trigger is disconnected in sync_tenant()
+    — see detect_and_freeze_callbacks()'s own docstring — so nothing new
+    will ever populate it again) with the NEW cross-job system's stats,
+    into one per-technician dict in the SAME shape both already use.
+
+    This is "preserve known-true history," not hybrid detection: every
+    value old_stats carries is a closed historical fact being displayed,
+    never a live re-detection. Safe against double-counting by
+    construction, not just by assumption -- the two inputs are keyed off
+    completely different, non-overlapping stored fields
+    (callback_bled_amount vs. cross_job_callback_bled_amount) and
+    completely different structural definitions (a visit reopened within
+    the SAME job, vs. a job being a DIFFERENT job's real free follow-up).
+    Even in the rare case a single job genuinely satisfied both
+    definitions independently, that would be 2 distinct real incidents
+    on that job, correctly both counted -- not 1 fact counted twice.
+    """
+    merged = {}
+    for source in (old_stats, new_stats):
+        for user_id, entry in source.items():
+            target = merged.setdefault(
+                user_id,
+                {
+                    'callback_visits_done': 0,
+                    'callback_dollars_lost': 0.0,
+                    'has_unknown_callback_cost': False,
+                    'has_estimated_callback_cost': False,
+                },
+            )
+            target['callback_visits_done'] += entry['callback_visits_done']
+            target['callback_dollars_lost'] += entry['callback_dollars_lost']
+            target['has_unknown_callback_cost'] = target['has_unknown_callback_cost'] or entry['has_unknown_callback_cost']
+            target['has_estimated_callback_cost'] = target['has_estimated_callback_cost'] or entry['has_estimated_callback_cost']
+    return merged
+
+
 def _accumulate_technician_labor_cost(archived_jobs):
     """
     Real labor cost per technician across `archived_jobs` -- the SAME
@@ -322,7 +442,15 @@ def get_technician_stats(tenant):
     team_revenue_total = sum(revenue_totals.values())
 
     job_stats = _accumulate_technician_job_stats(archived_jobs)
-    callback_stats = _accumulate_technician_callback_stats(archived_jobs)
+    # Merges the OLD system's already-frozen historical callback stats
+    # (same-job-reopen model, trigger disconnected -- preserved so a
+    # real, already-correct historical record doesn't disappear from the
+    # live product) with the NEW cross-job system's stats -- see
+    # _merge_callback_stats()'s own docstring for why this is "preserve
+    # known-true history," not hybrid detection.
+    old_callback_stats = _accumulate_technician_callback_stats(archived_jobs)
+    cross_job_callback_stats = _accumulate_technician_cross_job_callback_stats(tenant_id, period_start)
+    callback_stats = _merge_callback_stats(old_callback_stats, cross_job_callback_stats)
     # NOT called here -- see this function's own docstring:
     # _accumulate_technician_labor_cost() still exists, unchanged, and
     # still works -- it's just not part of profit_margin_percentage's
