@@ -337,6 +337,7 @@ def sync_jobs(account, tenant, deadline, clients_complete):
                 'start_at': _to_datetime(node.get('startAt')),
                 'completed_at': _to_datetime(node.get('completedAt')),
                 'address': _format_address(node.get('property')),
+                'property_id': (node.get('property') or {}).get('id'),
                 'labour_duration_seconds': costing.get('labourDuration'),
                 'labour_cost': _to_decimal(costing.get('labourCost')),
                 'line_item_cost': _to_decimal(costing.get('lineItemCost')),
@@ -457,6 +458,8 @@ def sync_visits(account, tenant, job_nodes, complete):
                 defaults={
                     'job': job,
                     'assigned_user': assigned_user,
+                    'title': visit_node.get('title'),
+                    'instructions': visit_node.get('instructions'),
                     'synced_at': timezone.now(),
                     'is_active': True,
                 },
@@ -1082,12 +1085,33 @@ def sync_tenant(account, entities=None):
             counts['visits'] = sync_visits(account, tenant, job_nodes, jobs_complete)
         if 'timesheet_entries' in wanted:
             counts['timesheet_entries'] = sync_timesheet_entries(account, tenant, job_nodes, jobs_complete)
-            # Needs THIS pass's freshly-synced jobber_created_at values to
-            # compute an accurate hours split — see detect_and_freeze_
-            # callbacks()'s own docstring for why this is gated here and
-            # not on 'jobs' alone.
-            if just_transitioned_to_archived_job_ids:
-                detect_and_freeze_callbacks(account, tenant, just_transitioned_to_archived_job_ids)
+        if 'jobs' in wanted or 'visits' in wanted:
+            # Replaced by cross_job_callback_detection.py's
+            # detect_cross_job_callbacks(), per TL decision — the
+            # client's validated 4-condition approach (same real
+            # address+client+keyword+service_type, within 30 days)
+            # catches a real case this old, same-job-reopen-only trigger
+            # structurally cannot (a brand-new job, never reopened). This
+            # function itself is kept fully intact and callable, not
+            # deleted, for reference and in case of rollback — see its
+            # own docstring, unchanged. See
+            # cross_job_callback_detection_replacement_plan.md for the
+            # full design.
+            # if just_transitioned_to_archived_job_ids:
+            #     detect_and_freeze_callbacks(account, tenant, just_transitioned_to_archived_job_ids)
+            #
+            # Gated on 'jobs' or 'visits' here, deliberately NOT on
+            # 'timesheet_entries' (unlike the old call above) -- this
+            # function's real detection (property/client/keyword/
+            # service_type matching) has no dependency on timesheet data
+            # at all; only its dollar-amount calculation does, and that
+            # already degrades to None (never a crash or a fabricated
+            # number) when logged hours are missing or stale -- see
+            # _compute_cross_job_bled_amount()'s own docstring and
+            # calculate_job_duration_by_user()'s own confirmed "{} on no
+            # entries" contract.
+            from apps.jobber.services.cross_job_callback_detection import detect_cross_job_callbacks
+            detect_cross_job_callbacks(account, tenant)
         if 'invoices' in wanted:
             counts['invoices'] = sync_invoices(account, tenant, deadline, clients_complete, jobs_complete)
         if 'expenses' in wanted:

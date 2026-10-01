@@ -204,6 +204,16 @@ class JobberJob(DateModel):
     start_at = models.DateTimeField(null=True, blank=True)
     # Reuses _format_address() verbatim.
     address = models.CharField(max_length=500, null=True, blank=True)
+    # Jobber's own real Property id (EncodedId) -- a real, exact identity
+    # key, confirmed against the schema: two jobs at the same real service
+    # address share this value. Deliberately separate from `address`
+    # above (a pre-flattened display string, never meant for exact
+    # matching) -- this field exists specifically for
+    # cross_job_callback_detection.py's Signal 1, which matches on exact
+    # equality here, never string/fuzzy comparison on `address`. Nullable
+    # defensively, same convention as every other synced field here --
+    # not expected in practice but not assumed safe either.
+    property_id = models.CharField(max_length=255, null=True, blank=True)
     # From Jobber's jobCosting { labourDuration labourCost }, for the
     # Electricians "Avg Job Duration" card. labourDuration is a Seconds int
     # scalar; labour_cost gets the same float-to-Decimal treatment as total.
@@ -272,6 +282,57 @@ class JobberJob(DateModel):
     # moment as callback_bled_amount, for the same reason that field is
     # frozen -- see detect_and_freeze_callbacks()'s own docstring.
     callback_bled_amount_is_estimated = models.BooleanField(default=False)
+
+    # ── Cross-job callback detection (cross_job_callback_detection.py) ──
+    # Deliberately SEPARATE fields from callback_bled_amount/is_callback
+    # above, not a reuse -- the two detection systems have different
+    # definitions of "callback" (same job reopened, vs. a brand-new
+    # separate job) and different owners; keeping them in distinct fields
+    # means it's never ambiguous which system produced a given value, even
+    # though detect_and_freeze_callbacks() itself is left fully intact and
+    # callable (see that function's own docstring; its live trigger is
+    # disconnected in sync_tenant(), not the function).
+    #
+    # Nullable FK to the EARLIER JobberJob this one is a real callback of.
+    # Frozen EXACTLY ONCE, the same moment cross_job_callback_resolved
+    # below is first set True with a real match -- never re-evaluated
+    # again afterward, even if the matching conditions would no longer
+    # hold (e.g. a title edited later to remove the keyword). Same
+    # freeze-once philosophy as first_archived_at/is_callback above, for
+    # the same reason: a detection reflects real conditions at the moment
+    # confirmed, not "whatever the data says now". on_delete=SET_NULL
+    # (not CASCADE) -- the earlier job being deactivated/deleted shouldn't
+    # erase the fact that THIS job was already confirmed as its callback.
+    cross_job_callback_of = models.ForeignKey(
+        'self',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='cross_job_callbacks',
+    )
+    # True once this job's real 30-day candidate window has been fully,
+    # permanently decided -- either a match was found and frozen above, OR
+    # CROSS_JOB_CALLBACK_WINDOW_DAYS has elapsed with no match. Needed
+    # because this detection re-scans a rolling window on every sync pass
+    # (unlike detect_and_freeze_callbacks()'s one-shot "just transitioned"
+    # trigger) -- without an explicit resolved state, a genuinely
+    # non-matching job would be re-checked forever. Mirrors this app's own
+    # existing "will NOT be retried" precedent for detect_and_freeze_
+    # callbacks()'s own dead-end cases, just needed explicitly here.
+    cross_job_callback_resolved = models.BooleanField(default=False)
+    # Same Option-1 dollar-calculation adaptation as the old system's
+    # callback_bled_amount, just sourced from 2 separate jobs instead of
+    # one split by first_archived_at: cross_job_callback_of's own real
+    # rate (its total / its own real logged hours) x THIS job's own real
+    # logged hours, or the same scheduled-time fallback + 12-hour ceiling
+    # if this job has no logged hours. Null whenever it genuinely can't be
+    # computed -- never a fabricated 0, same convention as
+    # callback_bled_amount above.
+    cross_job_callback_bled_amount = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    # Same meaning as callback_bled_amount_is_estimated above, for this
+    # separate field.
+    cross_job_callback_bled_amount_is_estimated = models.BooleanField(default=False)
+
     synced_at = models.DateTimeField()
 
     class Meta:
@@ -349,6 +410,13 @@ class JobberVisit(DateModel):
         blank=True,
     )
     jobber_id = models.CharField(max_length=255, db_index=True)
+    # Added for cross_job_callback_detection.py's Signal 3 -- 2 of its 4
+    # real keyword-match locations (the other 2 are JobberJob.title and
+    # the deferred Notes follow-up; see that module's own docstring).
+    # Neither existed as a local field before this -- JobberVisit carried
+    # no text fields at all previously.
+    title = models.CharField(max_length=255, null=True, blank=True)
+    instructions = models.TextField(null=True, blank=True)
     # Frozen EXACTLY ONCE, never re-evaluated: True only when this visit
     # was this job's createdAt-latest visit AT THE MOMENT its job's
     # first_archived_at was first set, AND that visit's own real `invoice`
