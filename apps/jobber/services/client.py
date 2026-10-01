@@ -466,6 +466,14 @@ query GetExpenses($first: Int!, $after: String) {
 # sync_timesheet_entries()). timeSheetEntries.labourRate is a REAL,
 # native per-entry Jobber wage rate — a DIFFERENT field from
 # jobCosting.labourCost above (already confirmed broken/always 0).
+#
+# property.id and visits.title/instructions were added for
+# cross_job_callback_detection.py -- property.id is a real, exact
+# identity key (JobberJob.property_id), and visit title/instructions
+# are 2 of that function's 4 real keyword-match locations (job title,
+# the 3rd, already came from this query's own top-level `title` above;
+# Notes, the 4th, is a deliberately deferred follow-up -- see that
+# module's own docstring for why).
 _SYNC_JOBS_QUERY = """
 query GetJobsForSync($first: Int!, $after: String) {
   jobs(first: $first, after: $after) {
@@ -480,7 +488,7 @@ query GetJobsForSync($first: Int!, $after: String) {
       createdAt
       completedAt
       client { id name tags(first: 5) { nodes { label } } }
-      property { street city province postalCode }
+      property { id street city province postalCode }
       lineItems(first: 1) {
         nodes {
           linkedProductOrService { name }
@@ -490,6 +498,8 @@ query GetJobsForSync($first: Int!, $after: String) {
       visits(first: 10) {
         nodes {
           id
+          title
+          instructions
           assignedUsers(first: 5) { nodes { id name { full } } }
         }
       }
