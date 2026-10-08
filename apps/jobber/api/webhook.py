@@ -7,13 +7,22 @@ Jobber includes on every request.
 
 Jobber requires a 200 response within 1 second. APP_DISCONNECT's own handler
 stays synchronous (a single filtered UPDATE on one row, effectively
-instant). JOB_UPDATE/JOB_CLOSED cannot make that same claim — the real
-action they trigger is a full sync_tenant() call, which can legitimately
-take close to sync.SYNC_WALL_CLOCK_CEILING (~25s) — so those two dispatch
-to background_sync.submit_tenant_sync() instead of running inline. See
-background_sync.py's own module docstring and
-jobber_webhooks_design_proposal.md for the full reasoning (a bounded
-ThreadPoolExecutor, not Celery/RQ, and not a raw unbounded thread either).
+instant). The "job changed" family of topics below cannot make that same
+claim — the real action they trigger is a full sync_tenant() call, which
+can legitimately take close to sync.SYNC_WALL_CLOCK_CEILING (~25s) — so
+those dispatch to background_sync.submit_tenant_sync() instead of running
+inline. See background_sync.py's own module docstring for the full
+reasoning (a bounded ThreadPoolExecutor, not Celery/RQ, and not a raw
+unbounded thread either).
+
+_JOB_CHANGE_WEBHOOK_TOPICS is kept as one named constant, not inlined in
+the dispatch below, so adding another topic (e.g. VISIT_DESTROY or
+JOB_DESTROY) later is a 1-line change. Confirmed real, exact spellings
+against jobber_graphql_schema.json's own WebHookTopicEnum, not guessed.
+TIMESHEET_DESTROY specifically: confirmed live that deleting a time
+entry fires NO webhook at all under JOB_UPDATE/TIMESHEET_UPDATE alone --
+a plain delete is its own distinct topic, not folded into
+TIMESHEET_UPDATE.
 """
 
 import base64
@@ -29,9 +38,20 @@ from django.views import View
 from django.views.decorators.csrf import csrf_exempt
 
 from apps.jobber.models import JobberAccount
-from apps.jobber.services.background_sync import submit_tenant_sync
+from apps.jobber.services.background_sync import mark_pending_resync, submit_tenant_sync, tenant_sync_in_flight
 
 logger = logging.getLogger(__name__)
+
+_JOB_CHANGE_WEBHOOK_TOPICS = (
+    'JOB_CREATE',
+    'JOB_UPDATE',
+    'JOB_CLOSED',
+    'TIMESHEET_CREATE',
+    'TIMESHEET_UPDATE',
+    'TIMESHEET_DESTROY',
+    'VISIT_UPDATE',
+    'VISIT_COMPLETE',
+)
 
 
 def _verify_signature(raw_body: bytes, header_value: str) -> bool:
@@ -57,8 +77,8 @@ class JobberWebhookView(View):
     POST /v1/jobber/webhook/
 
     Receives and dispatches Jobber webhook events. Must be registered in the
-    Jobber Developer Center with the APP_DISCONNECT, JOB_UPDATE, and
-    JOB_CLOSED topics (and any others added later) pointing at:
+    Jobber Developer Center with the APP_DISCONNECT topic plus every topic in
+    _JOB_CHANGE_WEBHOOK_TOPICS above (and any others added later) pointing at:
         https://api.techtrackpro.com/v1/jobber/webhook/
     """
 
@@ -96,7 +116,7 @@ class JobberWebhookView(View):
             # Stays inline — a single filtered UPDATE on one row, well
             # within the 1-second budget on its own.
             self._handle_app_disconnect(payload)
-        elif topic in ('JOB_UPDATE', 'JOB_CLOSED'):
+        elif topic in _JOB_CHANGE_WEBHOOK_TOPICS:
             # NOT run inline — see this module's own docstring for why a
             # real sync_tenant() call can't honestly stay synchronous here.
             self._handle_job_change(payload)
@@ -148,21 +168,34 @@ class JobberWebhookView(View):
     def _handle_job_change(self, payload):
         """
         Submits a real, targeted sync to the background pool for the
-        account this JOB_UPDATE/JOB_CLOSED event belongs to.
+        account this event belongs to -- or, if one is already genuinely
+        in flight for this tenant, marks it as pending instead (see
+        background_sync.py's own module docstring for the full
+        coalescing design this is part of).
 
         The payload only carries topic/accountId/itemId, never the changed
         job data itself — itemId is NOT used to filter the sync (sync_jobs()
-        has no per-job fetch today; this is a real, accepted inefficiency,
-        see jobber_webhooks_design_proposal.md point 4). This exists purely
-        as a trigger: "something changed for this account, go find out via
-        the existing full-tenant sync" — same trigger-only role
-        APP_DISCONNECT's own accountId already plays above.
+        has no per-job fetch today, a real, accepted inefficiency). This
+        exists purely as a trigger: "something changed for this account, go
+        find out via the existing full-tenant sync" — same trigger-only
+        role APP_DISCONNECT's own accountId already plays above.
 
-        Idempotency: intentionally has NO dedup logic of its own. Jobber's
-        at-least-once delivery (including duplicate near-simultaneous
-        deliveries) is already absorbed for free by sync_tenant()'s own
-        _claim_run() select_for_update() lock — two near-simultaneous
-        deliveries for the same tenant just resolve to "whichever commits
+        Confirmed live: a single real user action can fire 2-3 of these
+        webhooks within well under a second of each other, on different
+        gunicorn workers, in no reliable order (delivery order is not
+        guaranteed to match the order the underlying changes actually
+        happened in) -- tenant_sync_in_flight()/mark_pending_resync()
+        below is what keeps a real burst like that from submitting
+        several redundant background tasks at once, without ever
+        silently dropping whichever event arrived while one was already
+        running.
+
+        Idempotency beyond that: still has no dedup logic of its own for
+        the "nothing in flight yet" case. Jobber's at-least-once delivery
+        (including duplicate near-simultaneous deliveries) is already
+        absorbed for free by sync_tenant()'s own _claim_run()
+        select_for_update() lock — two near-simultaneous deliveries that
+        BOTH see "nothing in flight" just resolve to "whichever commits
         first does the real work," identical to JobberSyncNowView's own
         documented double-click safety.
         """
@@ -183,6 +216,15 @@ class JobberWebhookView(View):
             logger.info(
                 "%s for accountId=%r — no active JobberAccount found, nothing to sync",
                 topic, account_id,
+            )
+            return
+
+        if tenant_sync_in_flight(account.tenant):
+            mark_pending_resync(account.tenant)
+            logger.info(
+                "%s: sync already in flight for tenant=%s — marked pending, "
+                "the in-flight pass's own trailing check will pick it up",
+                topic, account.tenant_id,
             )
             return
 

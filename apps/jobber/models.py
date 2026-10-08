@@ -41,6 +41,19 @@ class JobberAccount(DateModel):
     # Space-separated scopes actually granted by the Jobber admin.
     scope = models.TextField(null=True, blank=True)
     expires_at = models.DateTimeField(null=True, blank=True)
+    # DB-backed coalescing marker for background_sync.py's webhook-
+    # triggered syncs -- set when a webhook arrives for this tenant WHILE
+    # a sync is already genuinely in flight (see
+    # background_sync.tenant_sync_in_flight()), so that in-flight sync's
+    # own trailing check (_consume_pending_resync()) can run exactly one
+    # more real pass after it finishes, instead of a 2nd webhook
+    # submitting a 2nd redundant background task. A real, shared Postgres
+    # field (not in-memory) so this works across all gunicorn worker
+    # processes, not just within one. Self-clears on its own even if
+    # nothing explicitly resets it -- _consume_pending_resync() always
+    # clears whatever value it finds, whether or not that value is fresh
+    # enough to warrant a trailing pass.
+    pending_resync_marked_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         db_table = 'jobber_accounts'
@@ -70,6 +83,24 @@ class JobberAccount(DateModel):
         refresh token on every refresh. The ``if`` guard is defensive — it
         protects against the (invalid) state of rotation being temporarily
         disabled, not normal behaviour.
+
+        A REFRESH (self.pk already set) saves with explicit update_fields,
+        touching only the token columns this method actually changes. A
+        bare save() here would rewrite EVERY column on this instance,
+        including one a concurrent process may have just written directly
+        to the database via its own targeted UPDATE (e.g.
+        background_sync.py's mark_pending_resync(), which updates
+        pending_resync_marked_at on this same row) -- silently overwriting
+        that real, concurrent write with whatever stale value this
+        in-memory instance happened to be holding since it was first
+        loaded, possibly well before the refresh. get_valid_access_token()
+        calls this on every real Jobber API call whose token is stale, so
+        this path runs routinely, not rarely.
+
+        The FIRST-EVER connect (self.pk still None) must stay a bare
+        save() -- update_fields only applies to an UPDATE; passing it here
+        raises ValueError("Cannot force an update in save() with no
+        primary key."), confirmed directly.
         """
         self.access_token = token_data['access_token']
         if token_data.get('refresh_token'):
@@ -82,7 +113,12 @@ class JobberAccount(DateModel):
         if expires_in:
             self.expires_at = timezone.now() + timedelta(seconds=int(expires_in))
 
-        self.save()
+        if self.pk is None:
+            self.save()
+        else:
+            self.save(update_fields=[
+                'access_token', 'refresh_token', 'token_type', 'scope', 'expires_at', 'updated_at',
+            ])
         return self
 
 
@@ -294,15 +330,13 @@ class JobberJob(DateModel):
     # disconnected in sync_tenant(), not the function).
     #
     # Nullable FK to the EARLIER JobberJob this one is a real callback of.
-    # Frozen EXACTLY ONCE, the same moment cross_job_callback_resolved
-    # below is first set True with a real match -- never re-evaluated
-    # again afterward, even if the matching conditions would no longer
-    # hold (e.g. a title edited later to remove the keyword). Same
-    # freeze-once philosophy as first_archived_at/is_callback above, for
-    # the same reason: a detection reflects real conditions at the moment
-    # confirmed, not "whatever the data says now". on_delete=SET_NULL
-    # (not CASCADE) -- the earlier job being deactivated/deleted shouldn't
-    # erase the fact that THIS job was already confirmed as its callback.
+    # Sticky once set: detect_cross_job_callbacks() never reassigns or
+    # clears it after the fact, even if the matching conditions would no
+    # longer hold (e.g. a title edited later to remove the keyword) --
+    # see that function's own docstring for the full reasoning.
+    # on_delete=SET_NULL (not CASCADE) -- the earlier job being
+    # deactivated/deleted shouldn't erase the fact that THIS job was
+    # already confirmed as its callback.
     cross_job_callback_of = models.ForeignKey(
         'self',
         on_delete=models.SET_NULL,
@@ -310,15 +344,13 @@ class JobberJob(DateModel):
         blank=True,
         related_name='cross_job_callbacks',
     )
-    # True once this job's real 30-day candidate window has been fully,
-    # permanently decided -- either a match was found and frozen above, OR
-    # CROSS_JOB_CALLBACK_WINDOW_DAYS has elapsed with no match. Needed
-    # because this detection re-scans a rolling window on every sync pass
-    # (unlike detect_and_freeze_callbacks()'s one-shot "just transitioned"
-    # trigger) -- without an explicit resolved state, a genuinely
-    # non-matching job would be re-checked forever. Mirrors this app's own
-    # existing "will NOT be retried" precedent for detect_and_freeze_
-    # callbacks()'s own dead-end cases, just needed explicitly here.
+    # No longer read or written by detect_cross_job_callbacks() -- that
+    # function computes a job's rescan eligibility fresh on every pass
+    # from cross_job_callback_of/cross_job_callback_bled_amount/
+    # jobber_created_at directly (see its own _needs_rescan() docstring)
+    # rather than from a persisted terminal flag. Kept here, unused, only
+    # for this app's additive-only schema discipline -- never backfilled,
+    # never dropped.
     cross_job_callback_resolved = models.BooleanField(default=False)
     # Same Option-1 dollar-calculation adaptation as the old system's
     # callback_bled_amount, just sourced from 2 separate jobs instead of
