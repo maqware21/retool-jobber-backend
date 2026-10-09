@@ -74,7 +74,7 @@ class JobberAccount(DateModel):
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
-    def store_tokens(self, token_data):
+    def store_tokens(self, token_data, extra_update_fields=None):
         """
         Persist a token payload from Jobber's token endpoint.
 
@@ -97,6 +97,17 @@ class JobberAccount(DateModel):
         calls this on every real Jobber API call whose token is stale, so
         this path runs routinely, not rarely.
 
+        extra_update_fields: field names the CALLER already set on self
+        before calling this, which also need persisting on a refresh --
+        e.g. oauth.py's reconnect flow sets ``is_active = True`` on an
+        existing (previously disconnected) row right before calling this;
+        without naming it here, that reactivation would be silently
+        dropped by the fixed update_fields list above (confirmed: this is
+        a real case, not a hypothetical one -- audited every real caller
+        of this method before adding this parameter). Ignored on a
+        first-ever connect (self.pk is None), since that path saves every
+        field unconditionally anyway.
+
         The FIRST-EVER connect (self.pk still None) must stay a bare
         save() -- update_fields only applies to an UPDATE; passing it here
         raises ValueError("Cannot force an update in save() with no
@@ -116,9 +127,10 @@ class JobberAccount(DateModel):
         if self.pk is None:
             self.save()
         else:
-            self.save(update_fields=[
-                'access_token', 'refresh_token', 'token_type', 'scope', 'expires_at', 'updated_at',
-            ])
+            update_fields = ['access_token', 'refresh_token', 'token_type', 'scope', 'expires_at', 'updated_at']
+            if extra_update_fields:
+                update_fields.extend(extra_update_fields)
+            self.save(update_fields=update_fields)
         return self
 
 

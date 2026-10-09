@@ -261,51 +261,79 @@ def _run_tenant_sync_safely(account, entities):
     failure in the trailing pass is logged at error level and NOT
     retried further here; the 10-minute staleness poll is the real
     backstop for anything still stale after that.
+
+    The whole body is wrapped in one outer try/except/finally, not just
+    the individual sync_tenant() calls: _did_own_pass() and
+    _consume_pending_resync() run OUTSIDE _run_one_pass()'s own
+    try/except, so without this outer net an exception from either of
+    them would propagate off this worker thread uncaught -- on a raw
+    ThreadPoolExecutor, nobody ever calls .result() on the Future this
+    runs as (submit_tenant_sync() doesn't keep a reference to it), so
+    that exception would be silently lost, never logged anywhere. The
+    outer `finally: close_old_connections()` is also required, not
+    redundant with _run_one_pass()'s own: _consume_pending_resync() runs
+    AFTER _run_one_pass() has already closed its connection, and opens
+    its own new one (select_for_update() inside a transaction) -- on the
+    "no trailing pass needed" path, nothing inside _run_one_pass() ever
+    runs again to close THAT connection, leaving it open on this pool
+    thread until some later invocation happens to reuse it.
     """
     tenant = account.tenant
     run_started_at = timezone.now()
-    run = None
 
     try:
-        run = _run_one_pass(account, entities, tenant)
+        run = None
+        try:
+            run = _run_one_pass(account, entities, tenant)
+        except Exception:
+            logger.exception(
+                "background_sync: sync_tenant() failed for tenant=%s "
+                "(webhook-triggered, entities=%s)",
+                tenant.id, entities,
+            )
+            _consume_pending_resync(tenant, after=run_started_at)
+            return
+
+        if not _did_own_pass(run, run_started_at):
+            logger.info(
+                "background_sync: tenant=%s's sync_tenant() call lost the claim to "
+                "another process already performing this pass -- not touching "
+                "the pending marker; whichever task actually did the work "
+                "owns that decision instead.",
+                tenant.id,
+            )
+            return
+
+        marked_at = _consume_pending_resync(tenant, after=run_started_at)
+        if marked_at is None:
+            logger.info(
+                "background_sync: tenant=%s's pass finished with no pending marker -- no trailing pass needed",
+                tenant.id,
+            )
+            return
+
+        logger.info(
+            "background_sync: coalesced event detected for tenant=%s (marked_at=%s, "
+            "during a pass started at %s) -- running exactly 1 trailing pass",
+            tenant.id, marked_at, run_started_at,
+        )
+        try:
+            _run_one_pass(account, entities, tenant)
+        except Exception:
+            logger.error(
+                "background_sync: trailing coalesced sync_tenant() failed for "
+                "tenant=%s -- not retrying further here; relying on the "
+                "10-minute staleness poll to catch up.",
+                tenant.id, exc_info=True,
+            )
     except Exception:
+        # Safety net for anything NOT already caught above -- most
+        # notably _did_own_pass()/_consume_pending_resync() raising,
+        # which otherwise run completely unprotected (see this
+        # docstring's own reasoning).
         logger.exception(
-            "background_sync: sync_tenant() failed for tenant=%s "
-            "(webhook-triggered, entities=%s)",
-            tenant.id, entities,
-        )
-        _consume_pending_resync(tenant, after=run_started_at)
-        return
-
-    if not _did_own_pass(run, run_started_at):
-        logger.info(
-            "background_sync: tenant=%s's sync_tenant() call lost the claim to "
-            "another process already performing this pass -- not touching "
-            "the pending marker; whichever task actually did the work "
-            "owns that decision instead.",
+            "background_sync: unexpected error in _run_tenant_sync_safely for tenant=%s",
             tenant.id,
         )
-        return
-
-    marked_at = _consume_pending_resync(tenant, after=run_started_at)
-    if marked_at is None:
-        logger.info(
-            "background_sync: tenant=%s's pass finished with no pending marker -- no trailing pass needed",
-            tenant.id,
-        )
-        return
-
-    logger.info(
-        "background_sync: coalesced event detected for tenant=%s (marked_at=%s, "
-        "during a pass started at %s) -- running exactly 1 trailing pass",
-        tenant.id, marked_at, run_started_at,
-    )
-    try:
-        _run_one_pass(account, entities, tenant)
-    except Exception:
-        logger.error(
-            "background_sync: trailing coalesced sync_tenant() failed for "
-            "tenant=%s -- not retrying further here; relying on the "
-            "10-minute staleness poll to catch up.",
-            tenant.id, exc_info=True,
-        )
+    finally:
+        close_old_connections()

@@ -159,3 +159,34 @@ class StoreTokensConcurrencySafetyTests(TestCase):
             account.pending_resync_marked_at, real_marked_at,
             "a token refresh must never overwrite a field it doesn't own, even from a stale in-memory copy",
         )
+
+
+class OuterSafetyNetTests(TestCase):
+    """An exception outside _run_one_pass() (e.g. in the marker consume step) must be logged, never escape."""
+
+    def test_exception_inside_marker_consume_is_logged_and_does_not_escape(self):
+        tenant = Tenant.objects.create()
+        account = JobberAccount.objects.create(tenant=tenant, access_token='x', refresh_token='y')
+
+        real_run = JobberSyncRun.objects.create(
+            tenant=tenant, status=JOBBER_SYNC_STATUS[1][0], claimed_at=timezone.now(),
+        )
+        # Bumped slightly into the future relative to its own creation so
+        # it's guaranteed >= _run_tenant_sync_safely's own run_started_at,
+        # captured a moment later -- status != 'running' plus this makes
+        # it a genuine "own pass" per _did_own_pass()'s real contract.
+        real_run.started_at = timezone.now() + timedelta(seconds=5)
+        real_run.save(update_fields=['started_at'])
+
+        with patch('apps.jobber.services.background_sync.sync_tenant', return_value=real_run), \
+             patch(
+                 'apps.jobber.services.background_sync._consume_pending_resync',
+                 side_effect=RuntimeError('simulated failure inside marker consume'),
+             ), \
+             self.assertLogs('apps.jobber.services.background_sync', level='ERROR') as logs:
+            _run_tenant_sync_safely(account, ['jobs'])  # must not raise
+
+        self.assertTrue(
+            any('unexpected error in _run_tenant_sync_safely' in message for message in logs.output),
+            f"expected the outer safety net to log the error; got: {logs.output}",
+        )
