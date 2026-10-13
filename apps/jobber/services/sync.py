@@ -119,12 +119,36 @@ def _claim_run(tenant):
     Jobber calls happen OUTSIDE this transaction; this only decides whether
     to proceed, then commits immediately.
 
+    Also select_for_update()s the tenant's own JobberAccount row FIRST,
+    before reading JobberSyncRun at all — confirmed real and necessary on
+    Postgres READ COMMITTED, not defensive paranoia: locking only the
+    LATEST JobberSyncRun row does NOT prevent 2 near-simultaneous callers
+    from both claiming a run, since SELECT ... FOR UPDATE only locks the
+    specific row a query already matched — it does nothing to stop a
+    second transaction from deciding that SAME (soon-to-be-stale) row is
+    non-running and creating its own new RUNNING row once the first
+    transaction commits; nothing locks the INSERT itself. JobberAccount
+    is a real, single, ALWAYS-EXISTING row per tenant (OneToOneField) --
+    locking it first turns this into a genuine mutex: a second concurrent
+    claimer blocks on that one row until the first transaction commits,
+    and only then reads JobberSyncRun -- by which point it sees the
+    first transaction's real, already-committed RUNNING row. Confirmed
+    no deadlock risk against the other 3 real callers that also touch
+    this same JobberAccount row (_consume_pending_resync(),
+    mark_pending_resync(), store_tokens()) -- every one of them acquires
+    at most this single lock and releases it (commits) before doing
+    anything else, so none of them can be holding a second, different
+    lock while waiting on this one; a deadlock needs a real cycle of
+    waits, which that structure can't form.
+
     Returns the freshly-created RUNNING row this caller should update when
     done, or None if another process already holds a non-stale lock (that
     caller should proceed against whatever's locally there now — an
     accepted trade, not an oversight).
     """
     with transaction.atomic():
+        JobberAccount.objects.select_for_update().filter(tenant=tenant).first()
+
         latest = (
             JobberSyncRun.objects.select_for_update()
             .filter(tenant=tenant)

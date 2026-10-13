@@ -132,7 +132,11 @@ class JobberCallbackView(APIView):
         if account is None:
             account = JobberAccount(tenant=tenant, access_token='', refresh_token='')
         account.is_active = True
-        account.store_tokens(token_data)
+        # Named explicitly -- on a reconnect, account.pk already exists,
+        # so store_tokens() only saves its own fixed token-field list by
+        # default; without naming is_active here too, reactivating a
+        # previously-disconnected account would be silently dropped.
+        account.store_tokens(token_data, extra_update_fields=['is_active'])
 
         if is_reconnect:
             self._invalidate_local_data(tenant)
