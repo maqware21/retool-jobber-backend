@@ -364,17 +364,24 @@ class JobberJob(DateModel):
     # for this app's additive-only schema discipline -- never backfilled,
     # never dropped.
     cross_job_callback_resolved = models.BooleanField(default=False)
-    # Same Option-1 dollar-calculation adaptation as the old system's
-    # callback_bled_amount, just sourced from 2 separate jobs instead of
-    # one split by first_archived_at: cross_job_callback_of's own real
-    # rate (its total / its own real logged hours) x THIS job's own real
-    # logged hours, or the same scheduled-time fallback + 12-hour ceiling
-    # if this job has no logged hours. Null whenever it genuinely can't be
+    # ESTIMATE MODE ONLY -- stored at detection time
+    # (_compute_cross_job_bled_amount() in cross_job_callback_detection.py)
+    # and read only while this job has no real logged hours of its own:
+    # cross_job_callback_of's own real rate (its total / its own real
+    # logged hours) x this job's own scheduled visit hours, capped at a
+    # 12-hour ceiling. The moment this job has any real logged hours,
+    # labour mode takes over and this field stops being read at all --
+    # each real contributor's own cost is computed fresh, from their own
+    # hours x their own rate, at READ time
+    # (technician_stats.py's _accumulate_technician_cross_job_callback_stats()),
+    # never stored here. Null whenever the estimate genuinely can't be
     # computed -- never a fabricated 0, same convention as
     # callback_bled_amount above.
     cross_job_callback_bled_amount = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
-    # Same meaning as callback_bled_amount_is_estimated above, for this
-    # separate field.
+    # True only when the stored amount above came from the scheduled-time
+    # estimate (estimate mode) -- always False, and unread, once the job
+    # has transitioned to labour mode. Same meaning as
+    # callback_bled_amount_is_estimated above, for this separate field.
     cross_job_callback_bled_amount_is_estimated = models.BooleanField(default=False)
 
     synced_at = models.DateTimeField()

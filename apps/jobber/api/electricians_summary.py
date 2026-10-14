@@ -207,10 +207,10 @@ def calculate_job_duration_seconds(job):
 
 def job_has_logged_labour_hours(job, hours_by_user=None):
     """
-    The real labour-mode switch for the callback-cost hybrid (see
-    callback_labour_cost_plan.md's Section 2): True once this job has any
-    REAL, merged tracked seconds from ANY of its active timesheet
-    entries — never a bare `.filter(is_active=True).exists()` check,
+    The real labour-mode switch for the callback-cost hybrid: True once
+    this job has any REAL, merged tracked seconds from ANY of its active
+    timesheet entries — never a bare `.filter(is_active=True).exists()`
+    check,
     which would also flip a job into labour mode for a still-running
     timer (ended_at still null, no real duration yet) or an entry that
     Jobber itself recorded with 0 real seconds. Both of those merge down

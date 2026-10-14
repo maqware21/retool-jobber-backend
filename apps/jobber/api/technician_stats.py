@@ -193,8 +193,7 @@ def _accumulate_technician_cross_job_callback_stats(tenant_id, period_start):
     """
     Per-technician cross-job callback counts and dollar attribution,
     sourced from the NEW cross-job model (cross_job_callback_detection.py)
-    instead of the old same-job-reopen one. Hybrid, mode-based, per
-    callback_labour_cost_plan.md's Section 2 (TL-approved):
+    instead of the old same-job-reopen one. Hybrid, mode-based:
 
       - LABOUR MODE (job_has_logged_labour_hours(job) is True -- real,
         merged tracked seconds exist ANYWHERE on this later job): each
@@ -227,14 +226,14 @@ def _accumulate_technician_cross_job_callback_stats(tenant_id, period_start):
 
     Population (both modes): the UNION of real assignees
     (_gather_job_assignees(job)) and real loggers (anyone with > 0 real
-    merged seconds via calculate_job_duration_by_user()) -- confirmed,
-    settled design (Section 3): count and cost use the same people, so a
-    non-assignee logger gets full credit instead of being silently
-    dropped. In estimate mode this union always collapses back to
-    "assignees only," since a real logger (by definition, > 0 hours)
-    would have already put the job into labour mode.
+    merged seconds via calculate_job_duration_by_user()) -- count and cost
+    use the same people, so a non-assignee logger gets full credit instead
+    of being silently dropped. In estimate mode this union always
+    collapses back to "assignees only," since a real logger (by
+    definition, > 0 hours) would have already put the job into labour
+    mode.
 
-    Decimal end to end for the new per-person math (Section 6):
+    Decimal end to end for the new per-person math:
     calculate_technician_labor_cost() already returns a real Decimal;
     the estimate-mode equal share (a float, from
     split_job_revenue_among_assignees()'s own float-based math,
