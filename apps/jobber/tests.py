@@ -20,7 +20,11 @@ from unittest.mock import patch
 from django.test import TestCase
 from django.utils import timezone
 
-from apps.jobber.models import JobberClient, JobberJob, JobberTimeSheetEntry, JobberUser
+from apps.jobber.api.technician_stats import (
+    _accumulate_technician_cross_job_callback_stats,
+    _merge_callback_stats,
+)
+from apps.jobber.models import JobberClient, JobberJob, JobberTimeSheetEntry, JobberUser, JobberVisit
 from apps.jobber.services import client
 from apps.jobber.services.cross_job_callback_detection import (
     CROSS_JOB_CALLBACK_AMOUNT_RESCAN_CEILING_DAYS,
@@ -67,13 +71,14 @@ class CrossJobCallbackDetectionTests(TestCase):
             synced_at=timezone.now(),
         )
 
-    def _log_hours(self, job, seconds):
-        JobberTimeSheetEntry.objects.create(
+    def _log_hours(self, job, seconds, rate=None):
+        return JobberTimeSheetEntry.objects.create(
             tenant=self.tenant,
             job=job,
             user=self.user,
             jobber_id=f'entry-{job.id}-{seconds}',
             final_duration_seconds=seconds,
+            labour_rate=rate,
             jobber_created_at=job.jobber_created_at,
             synced_at=timezone.now(),
         )
@@ -102,9 +107,9 @@ class CrossJobCallbackDetectionTests(TestCase):
             "match must stay sticky to the ORIGINAL earlier job, never switch to a nearer one found later",
         )
 
-    # ── 2. unknown -> estimated -> confirmed ────────────────────────────
+    # ── 2. unknown -> estimated -> labour mode (detection stops estimating) ──
 
-    def test_amount_unknown_then_estimated_then_confirmed(self):
+    def test_amount_unknown_then_estimated_then_labour_mode(self):
         now = timezone.now()
         earlier = self._make_job(1, created_at=now - timedelta(days=25), completed_at=now - timedelta(days=20), total=Decimal('1800'))
         self._log_hours(earlier, 4 * 3600)
@@ -132,13 +137,19 @@ class CrossJobCallbackDetectionTests(TestCase):
         expected_estimated = (Decimal('1800') / Decimal('4')) * Decimal('1.5')
         self.assertEqual(later.cross_job_callback_bled_amount, expected_estimated)
 
+        # A first real entry appears -- the whole job flips to labour mode.
+        # Detection must now skip its own live fetch and estimate entirely
+        # (the per-person figure is computed fresh, at read time, by
+        # technician_stats.py, never stored here) -- it only clears the
+        # now-stale estimate it had stored a moment ago.
         self._log_hours(later, 5 * 3600)
-        detect_cross_job_callbacks(self.account, self.tenant)
+        with patch.object(client, 'fetch_job_visits_for_callback_detection') as fetch_mock:
+            detect_cross_job_callbacks(self.account, self.tenant)
+        fetch_mock.assert_not_called()
         later.refresh_from_db()
         self.assertEqual(later.cross_job_callback_of_id, earlier.id, "sticky -- still the same earlier job")
+        self.assertIsNone(later.cross_job_callback_bled_amount, "labour mode has nothing to estimate -- the stale estimate must be cleared, not kept")
         self.assertFalse(later.cross_job_callback_bled_amount_is_estimated)
-        expected_confirmed = (Decimal('1800') / Decimal('4')) * Decimal('5')
-        self.assertEqual(later.cross_job_callback_bled_amount, expected_confirmed)
 
     # ── quantization: non-round hours must not rewrite every pass ───────
 
@@ -147,12 +158,22 @@ class CrossJobCallbackDetectionTests(TestCase):
         earlier = self._make_job(1, created_at=now - timedelta(days=25), completed_at=now - timedelta(days=20), total=Decimal('1800'))
         self._log_hours(earlier, int(3.25 * 3600))  # a deliberately non-round rate: 1800/3.25 repeats
         later = self._make_job(2, created_at=now - timedelta(days=1), title='Follow-up visit — no charge')
-        self._log_hours(later, 5 * 3600)
+        # later stays in ESTIMATE mode (no real hours of its own) -- a
+        # deliberately non-round scheduled duration to exercise the SAME
+        # quantization concern on the estimate-mode fallback.
+        scheduled_start = now - timedelta(hours=2)
+        scheduled_end = scheduled_start + timedelta(hours=1, minutes=20)
+        fake_visit = {
+            'id': 'visit-later', 'createdAt': now.isoformat(),
+            'startAt': scheduled_start.isoformat(), 'endAt': scheduled_end.isoformat(),
+        }
 
-        detect_cross_job_callbacks(self.account, self.tenant)
+        with patch.object(client, 'fetch_job_visits_for_callback_detection', return_value=[fake_visit]):
+            detect_cross_job_callbacks(self.account, self.tenant)
         later.refresh_from_db()
         amount_after_first_pass = later.cross_job_callback_bled_amount
         self.assertIsNotNone(amount_after_first_pass)
+        self.assertTrue(later.cross_job_callback_bled_amount_is_estimated)
         self.assertEqual(
             amount_after_first_pass, amount_after_first_pass.quantize(Decimal('0.01')),
             "stored amount must already be quantized to 2 decimal places, matching the field's own decimal_places=2",
@@ -162,8 +183,9 @@ class CrossJobCallbackDetectionTests(TestCase):
         # must compute the IDENTICAL quantized value AND must not even
         # issue a save() for it (the real "otherwise every pass rewrites"
         # concern -- value stability alone doesn't prove that).
-        with patch.object(JobberJob, 'save', autospec=True, side_effect=JobberJob.save) as save_spy:
-            detect_cross_job_callbacks(self.account, self.tenant)
+        with patch.object(client, 'fetch_job_visits_for_callback_detection', return_value=[fake_visit]):
+            with patch.object(JobberJob, 'save', autospec=True, side_effect=JobberJob.save) as save_spy:
+                detect_cross_job_callbacks(self.account, self.tenant)
         later.refresh_from_db()
         self.assertEqual(
             later.cross_job_callback_bled_amount, amount_after_first_pass,
@@ -176,9 +198,12 @@ class CrossJobCallbackDetectionTests(TestCase):
             "comparison would otherwise rewrite this row on every single pass",
         )
 
-    # ── 3. failed fetch keeps the prior amount ──────────────────────────
+    # ── 3. failed fetch, while still in estimate mode, keeps the prior amount ──
 
     def test_failed_fetch_keeps_prior_amount(self):
+        # Scoped to ESTIMATE mode specifically -- `later` never gets a real
+        # logged entry anywhere in this test, so the live fetch stays the
+        # only path to its amount throughout.
         now = timezone.now()
         earlier = self._make_job(1, created_at=now - timedelta(days=25), completed_at=now - timedelta(days=20), total=Decimal('1800'))
         self._log_hours(earlier, 4 * 3600)
@@ -250,28 +275,159 @@ class CrossJobCallbackDetectionTests(TestCase):
         later.refresh_from_db()
         self.assertIsNone(later.cross_job_callback_bled_amount, "past the 90-day ceiling, the amount must stay unknown, not get recomputed")
 
-    # ── 6. confirmed job within 30 days still recomputes ────────────────
+    # ── 5b. a legacy non-estimated amount with no real hours still needs rescan ──
 
-    def test_confirmed_job_within_30_days_still_recomputes_on_hours_change(self):
+    def test_legacy_non_estimated_amount_with_no_hours_still_gets_rescanned(self):
+        """
+        _needs_rescan()'s amount-rescan branch must check this job's REAL
+        current hours, never the stored cross_job_callback_bled_amount/
+        _is_estimated fields themselves -- a job can carry a non-null,
+        non-estimated amount left over from before this hybrid existed,
+        while genuinely still having zero real logged hours. That job is
+        NOT settled; it must still be rescanned.
+        """
+        now = timezone.now()
+        earlier = self._make_job(1, created_at=now - timedelta(days=200), completed_at=now - timedelta(days=150), total=Decimal('1800'))
+        self._log_hours(earlier, 4 * 3600)
+        later = self._make_job(
+            2, created_at=now - timedelta(days=CROSS_JOB_CALLBACK_WINDOW_DAYS + 5),
+            title='Follow-up visit — no charge',
+        )
+        later.cross_job_callback_of = earlier
+        later.cross_job_callback_bled_amount = Decimal('500.00')
+        later.cross_job_callback_bled_amount_is_estimated = False
+        later.save(update_fields=['cross_job_callback_of', 'cross_job_callback_bled_amount', 'cross_job_callback_bled_amount_is_estimated'])
+
+        self.assertTrue(
+            _needs_rescan(later, now),
+            "a legacy non-estimated stored amount with no real hours logged must still read as unsettled -- it's not actually confirmed",
+        )
+
+    # ── 6. mode transition is visible at READ time, before any rescan ───
+
+    def test_matched_job_in_estimate_mode_reads_as_labour_mode_once_hours_appear(self):
+        """
+        A job matched and stored with a real `~` estimate must have its
+        READ-TIME cost reflect labour mode the instant a first real entry
+        appears, with no detection pass in between -- the read path
+        (_accumulate_technician_cross_job_callback_stats()) checks this
+        job's REAL current hours fresh on every call, never trusting the
+        now-stale stored estimate.
+        """
         now = timezone.now()
         earlier = self._make_job(1, created_at=now - timedelta(days=25), completed_at=now - timedelta(days=20), total=Decimal('1800'))
         self._log_hours(earlier, 4 * 3600)
         later = self._make_job(2, created_at=now - timedelta(days=5), title='Follow-up visit — no charge')
-        self._log_hours(later, 3 * 3600)
 
-        detect_cross_job_callbacks(self.account, self.tenant)
+        scheduled_start = now - timedelta(hours=2)
+        scheduled_end = scheduled_start + timedelta(hours=1, minutes=30)
+        fake_visit = {
+            'id': 'visit-later', 'createdAt': now.isoformat(),
+            'startAt': scheduled_start.isoformat(), 'endAt': scheduled_end.isoformat(),
+        }
+        with patch.object(client, 'fetch_job_visits_for_callback_detection', return_value=[fake_visit]):
+            detect_cross_job_callbacks(self.account, self.tenant)
         later.refresh_from_db()
-        first_amount = later.cross_job_callback_bled_amount
-        self.assertFalse(later.cross_job_callback_bled_amount_is_estimated)
-        self.assertEqual(first_amount, (Decimal('1800') / Decimal('4')) * Decimal('3'))
+        self.assertTrue(later.cross_job_callback_bled_amount_is_estimated)
+        stale_estimate = later.cross_job_callback_bled_amount
+        self.assertIsNotNone(stale_estimate)
 
-        self._log_hours(later, 2 * 3600)  # more real hours logged afterward
-        detect_cross_job_callbacks(self.account, self.tenant)
-        later.refresh_from_db()
+        # A first real entry appears -- deliberately no detection pass
+        # runs again before reading the stats below.
+        self._log_hours(later, 2 * 3600, rate=Decimal('30'))
+
+        period_start = now - timedelta(days=90)
+        stats = _accumulate_technician_cross_job_callback_stats(self.tenant.id, period_start)
+        self.assertIn(self.user.id, stats)
         self.assertEqual(
-            later.cross_job_callback_bled_amount, (Decimal('1800') / Decimal('4')) * Decimal('5'),
-            "a job still within its own 30-day window must keep recomputing even once confirmed",
+            stats[self.user.id]['callback_dollars_lost'], 60.0,
+            "the real, confirmed labour-mode figure (2h x $30), computed fresh -- never the stale stored ~ estimate",
         )
+        self.assertFalse(stats[self.user.id]['has_estimated_callback_cost'])
+        self.assertNotEqual(Decimal(str(stats[self.user.id]['callback_dollars_lost'])), stale_estimate)
+
+    # ── 7. round trip: estimate -> labour (cleared, no live fetch) -> estimate again (recomputed) ──
+
+    def test_round_trip_estimate_cleared_by_labour_then_recomputed_on_return_to_estimate(self):
+        """
+        A matched job with a stored estimate; a real entry flips it to
+        labour mode and detect_cross_job_callbacks() clears the now-stale
+        estimate WITHOUT ever touching the live fetch (nothing left to
+        estimate once real hours exist); the entry is then deleted,
+        dropping the job back to zero real hours, and a second detection
+        pass -- live fetch mocked again, with a deliberately different
+        schedule -- recomputes and stores a FRESH estimate, flagged
+        estimated. The accumulator must then read that fresh `~`
+        estimate, not the first one.
+        """
+        now = timezone.now()
+        earlier = self._make_job(1, created_at=now - timedelta(days=25), completed_at=now - timedelta(days=20), total=Decimal('1800'))
+        self._log_hours(earlier, 4 * 3600)
+        later = self._make_job(2, created_at=now - timedelta(days=1), title='Follow-up visit — no charge')
+        # A real assignee is needed for the ESTIMATE-mode accumulator read
+        # at the end -- it attributes the stored estimate to assignees,
+        # never to loggers (there are none left once the entry is deleted).
+        visit = JobberVisit.objects.create(
+            tenant=self.tenant, job=later, jobber_id='visit-later-roundtrip', synced_at=timezone.now(),
+        )
+        visit.assigned_users.set([self.user])
+
+        scheduled_start = now - timedelta(hours=2)
+        scheduled_end = scheduled_start + timedelta(hours=1, minutes=30)
+        fake_visit = {
+            'id': 'visit-later', 'createdAt': now.isoformat(),
+            'startAt': scheduled_start.isoformat(), 'endAt': scheduled_end.isoformat(),
+        }
+        with patch.object(client, 'fetch_job_visits_for_callback_detection', return_value=[fake_visit]):
+            detect_cross_job_callbacks(self.account, self.tenant)
+        later.refresh_from_db()
+        self.assertEqual(later.cross_job_callback_of_id, earlier.id)
+        first_estimate = later.cross_job_callback_bled_amount
+        self.assertIsNotNone(first_estimate)
+        self.assertTrue(later.cross_job_callback_bled_amount_is_estimated)
+
+        # A real entry appears -- the job flips to labour mode. Detection
+        # must clear the stale estimate without ever touching the live
+        # fetch (nothing left for it to estimate).
+        entry = self._log_hours(later, 2 * 3600, rate=Decimal('30'))
+        with patch.object(client, 'fetch_job_visits_for_callback_detection') as fetch_mock:
+            detect_cross_job_callbacks(self.account, self.tenant)
+        fetch_mock.assert_not_called()
+        later.refresh_from_db()
+        self.assertEqual(later.cross_job_callback_of_id, earlier.id, "sticky -- still the same earlier job")
+        self.assertIsNone(later.cross_job_callback_bled_amount, "labour mode has nothing to estimate -- cleared, not kept")
+        self.assertFalse(later.cross_job_callback_bled_amount_is_estimated)
+
+        # The only real entry is removed -- zero real hours again, back to
+        # estimate mode. A second real pass, with a deliberately different
+        # live-fetch result, must recompute and store a FRESH estimate --
+        # not resurrect the first one.
+        entry.delete()
+        second_scheduled_start = now - timedelta(hours=3)
+        second_scheduled_end = second_scheduled_start + timedelta(hours=1)
+        second_fake_visit = {
+            'id': 'visit-later-2', 'createdAt': now.isoformat(),
+            'startAt': second_scheduled_start.isoformat(), 'endAt': second_scheduled_end.isoformat(),
+        }
+        with patch.object(client, 'fetch_job_visits_for_callback_detection', return_value=[second_fake_visit]):
+            detect_cross_job_callbacks(self.account, self.tenant)
+        later.refresh_from_db()
+        self.assertEqual(later.cross_job_callback_of_id, earlier.id, "sticky -- still the same earlier job")
+        second_estimate = later.cross_job_callback_bled_amount
+        self.assertIsNotNone(second_estimate)
+        self.assertTrue(later.cross_job_callback_bled_amount_is_estimated)
+        self.assertNotEqual(
+            second_estimate, first_estimate,
+            "a FRESH estimate, recomputed from the current schedule -- not the stale first one",
+        )
+
+        # The accumulator, with no real hours left anywhere on the job,
+        # must read this fresh stored estimate.
+        period_start = now - timedelta(days=90)
+        stats = _accumulate_technician_cross_job_callback_stats(self.tenant.id, period_start)
+        self.assertIn(self.user.id, stats)
+        self.assertEqual(Decimal(str(stats[self.user.id]['callback_dollars_lost'])), second_estimate)
+        self.assertTrue(stats[self.user.id]['has_estimated_callback_cost'])
 
 
 class CrossJobCallbackPerJobIsolationTests(TestCase):
@@ -334,7 +490,7 @@ class CrossJobCallbackPerJobIsolationTests(TestCase):
 
 class CrossJobCallbackRealScenarioRegressionTests(TestCase):
     """
-    Recreates the real, already-validated tenant_id=6 research scenario
+    Recreates a real, already-validated research scenario
     (research_alternative_callback_detection.py's own Rule D result --
     E1/E2 matched, F1/F2/G1 did not) as local fixtures, confirming the
     event-driven/sticky-match rewrite preserves the exact same real-
@@ -403,3 +559,214 @@ class CrossJobCallbackRealScenarioRegressionTests(TestCase):
         detect_cross_job_callbacks(self.account, self.tenant)
         f3.refresh_from_db()
         self.assertIsNone(f3.cross_job_callback_of, "the service_type safeguard must block a match even with address+client+keyword all agreeing")
+
+
+class CallbackLabourCostHybridTests(TestCase):
+    """
+    _accumulate_technician_cross_job_callback_stats()'s hybrid: labour
+    mode (per-person hours x own rate, 3 real outcomes) when real hours
+    are logged anywhere on the later job, today's stored estimate
+    (honoured only when genuinely flagged estimated) otherwise. Calls the real
+    accumulator (and _merge_callback_stats()) directly against real rows
+    -- detect_cross_job_callbacks() itself (and its live-fetch estimate
+    path) is exercised separately, by CrossJobCallbackDetectionTests
+    above; these tests set cross_job_callback_of/
+    cross_job_callback_bled_amount directly instead of running detection.
+    """
+
+    def setUp(self):
+        self.tenant = Tenant.objects.create()
+        self.client_row = JobberClient.objects.create(
+            tenant=self.tenant, jobber_id='client-hybrid', name='Hybrid Client', synced_at=timezone.now(),
+        )
+        self.hannah = JobberUser.objects.create(
+            tenant=self.tenant, jobber_id='user-hannah', name='Hannah', synced_at=timezone.now(),
+        )
+        self.owen = JobberUser.objects.create(
+            tenant=self.tenant, jobber_id='user-owen', name='Owen', synced_at=timezone.now(),
+        )
+        self.casey = JobberUser.objects.create(
+            tenant=self.tenant, jobber_id='user-casey', name='Casey', synced_at=timezone.now(),
+        )
+        now = timezone.now()
+        # A real row for cross_job_callback_of to point at -- its own
+        # content is irrelevant to the accumulator under test, which only
+        # ever reads it via the isnull filter.
+        self.earlier = JobberJob.objects.create(
+            tenant=self.tenant, client=self.client_row, jobber_id='job-earlier', job_number=1,
+            title='Original job', description='Original job',
+            job_status='archived', status_display='Archived',
+            service_type=_SERVICE_TYPE, total=Decimal('1800'),
+            jobber_created_at=now - timedelta(days=20), completed_at=now - timedelta(days=15),
+            property_id=_PROPERTY_ID, synced_at=timezone.now(),
+        )
+        self.period_start = now - timedelta(days=90)
+        self._next_job_number = 100
+
+    def _make_callback_job(self, bled_amount=None, is_estimated=False):
+        self._next_job_number += 1
+        job_number = self._next_job_number
+        return JobberJob.objects.create(
+            tenant=self.tenant, client=self.client_row,
+            jobber_id=f'job-cb-{job_number}', job_number=job_number,
+            title='Follow-up visit — no charge', description='Follow-up visit — no charge',
+            job_status='requires_invoicing', status_display='Requires Invoicing',
+            service_type=_SERVICE_TYPE, total=Decimal('0'),
+            jobber_created_at=timezone.now() - timedelta(days=1),
+            property_id=_PROPERTY_ID, synced_at=timezone.now(),
+            cross_job_callback_of=self.earlier,
+            cross_job_callback_bled_amount=bled_amount,
+            cross_job_callback_bled_amount_is_estimated=is_estimated,
+        )
+
+    def _assign(self, job, *users):
+        visit = JobberVisit.objects.create(
+            tenant=self.tenant, job=job,
+            jobber_id=f'visit-{job.id}-{"-".join(str(u.id) for u in users)}',
+            synced_at=timezone.now(),
+        )
+        visit.assigned_users.set(users)
+        return visit
+
+    def _log_hours(self, job, user, seconds, rate=None):
+        return JobberTimeSheetEntry.objects.create(
+            tenant=self.tenant, job=job, user=user,
+            jobber_id=f'entry-{job.id}-{user.id}-{seconds}-{rate}',
+            final_duration_seconds=seconds,
+            labour_rate=rate,
+            jobber_created_at=job.jobber_created_at,
+            synced_at=timezone.now(),
+        )
+
+    # ── labour mode: own hours x own rate, never a split of a total ─────
+
+    def test_labour_mode_confirmed_cost_accumulates_across_jobs(self):
+        job1 = self._make_callback_job()
+        self._assign(job1, self.hannah)
+        self._log_hours(job1, self.hannah, 6 * 3600, rate=Decimal('40'))
+
+        job2 = self._make_callback_job()
+        self._assign(job2, self.hannah)
+        self._log_hours(job2, self.hannah, 3 * 3600, rate=Decimal('40'))
+
+        stats = _accumulate_technician_cross_job_callback_stats(self.tenant.id, self.period_start)
+
+        self.assertEqual(stats[self.hannah.id]['callback_dollars_lost'], 360.0, "6h x $40 ($240) + 3h x $40 ($120)")
+        self.assertEqual(stats[self.hannah.id]['callback_visits_done'], 2)
+        self.assertFalse(stats[self.hannah.id]['has_unknown_callback_cost'])
+
+    def test_labour_mode_two_assignees_get_own_card_not_proportional_split(self):
+        job = self._make_callback_job()
+        self._assign(job, self.hannah, self.owen)
+        self._log_hours(job, self.hannah, 6 * 3600, rate=Decimal('40'))
+        self._log_hours(job, self.owen, 2 * 3600, rate=Decimal('22'))
+
+        stats = _accumulate_technician_cross_job_callback_stats(self.tenant.id, self.period_start)
+
+        self.assertEqual(stats[self.hannah.id]['callback_dollars_lost'], 240.0, "Hannah's OWN hours x OWN rate, never a split of a job-level total")
+        self.assertEqual(stats[self.owen.id]['callback_dollars_lost'], 44.0, "Owen's OWN hours x OWN rate")
+
+    def test_labour_mode_three_per_person_outcomes_on_one_job(self):
+        job = self._make_callback_job()
+        # Owen: assigned, but no entries of his OWN -- case (a), someone
+        # else (Hannah) logged real hours, so the job IS in labour mode.
+        self._assign(job, self.hannah, self.owen)
+        self._log_hours(job, self.hannah, 4 * 3600, rate=Decimal('40'))  # case (b)
+        # Casey: a real logger who is NOT a formal assignee, with no
+        # usable rate -- case (c), AND a real test of the union-of-
+        # assignees-and-loggers population rule.
+        self._log_hours(job, self.casey, 3 * 3600, rate=None)
+
+        stats = _accumulate_technician_cross_job_callback_stats(self.tenant.id, self.period_start)
+
+        self.assertEqual(stats[self.hannah.id]['callback_dollars_lost'], 160.0)
+        self.assertFalse(stats[self.hannah.id]['has_unknown_callback_cost'])
+
+        self.assertEqual(stats[self.owen.id]['callback_dollars_lost'], 0.0, "case (a): a real, confirmed $0, not unknown")
+        self.assertFalse(stats[self.owen.id]['has_unknown_callback_cost'])
+        self.assertEqual(stats[self.owen.id]['callback_visits_done'], 1)
+
+        self.assertEqual(stats[self.casey.id]['callback_dollars_lost'], 0.0)
+        self.assertTrue(stats[self.casey.id]['has_unknown_callback_cost'], "case (c): real entries, no usable rate -- genuinely unknown")
+        self.assertEqual(stats[self.casey.id]['callback_visits_done'], 1, "a non-assignee real logger still gets full visit credit")
+
+    def test_deleting_all_entries_returns_a_job_to_estimate_mode(self):
+        job = self._make_callback_job(bled_amount=Decimal('150.00'), is_estimated=True)
+        self._assign(job, self.hannah)
+        entry = self._log_hours(job, self.hannah, 4 * 3600, rate=Decimal('40'))
+
+        stats = _accumulate_technician_cross_job_callback_stats(self.tenant.id, self.period_start)
+        self.assertEqual(stats[self.hannah.id]['callback_dollars_lost'], 160.0, "labour mode first -- 4h x $40")
+        self.assertFalse(stats[self.hannah.id]['has_estimated_callback_cost'])
+
+        # The only real entry on this job is removed -- the job has zero
+        # real logged hours again, so it must read back as estimate mode,
+        # honouring the stored `~` amount once more.
+        entry.delete()
+        stats = _accumulate_technician_cross_job_callback_stats(self.tenant.id, self.period_start)
+        self.assertEqual(stats[self.hannah.id]['callback_dollars_lost'], 150.0, "back to the stored estimate, no real hours left anywhere on the job")
+        self.assertTrue(stats[self.hannah.id]['has_estimated_callback_cost'])
+
+    # ── estimate mode ─────────────────────────────────────────────────
+
+    def test_zero_second_entry_stays_in_estimate_mode(self):
+        job = self._make_callback_job(bled_amount=Decimal('150.00'), is_estimated=True)
+        self._assign(job, self.hannah)
+        # A 0-second entry is NOT logged hours -- must not flip the job
+        # into labour mode.
+        self._log_hours(job, self.hannah, 0, rate=Decimal('40'))
+
+        stats = _accumulate_technician_cross_job_callback_stats(self.tenant.id, self.period_start)
+
+        self.assertEqual(stats[self.hannah.id]['callback_dollars_lost'], 150.0)
+        self.assertTrue(stats[self.hannah.id]['has_estimated_callback_cost'])
+        self.assertFalse(stats[self.hannah.id]['has_unknown_callback_cost'])
+
+    def test_estimate_mode_two_assignees_equal_split_both_flagged(self):
+        job = self._make_callback_job(bled_amount=Decimal('300.00'), is_estimated=True)
+        self._assign(job, self.hannah, self.owen)
+
+        stats = _accumulate_technician_cross_job_callback_stats(self.tenant.id, self.period_start)
+
+        self.assertEqual(stats[self.hannah.id]['callback_dollars_lost'], 150.0, "$300 estimate split equally across 2 real assignees")
+        self.assertEqual(stats[self.owen.id]['callback_dollars_lost'], 150.0)
+        self.assertTrue(stats[self.hannah.id]['has_estimated_callback_cost'])
+        self.assertTrue(stats[self.owen.id]['has_estimated_callback_cost'])
+
+    def test_legacy_stored_non_estimated_amount_is_unknown(self):
+        # Genuinely zero logged hours (estimate-mode eligible), but the
+        # stored amount is NOT flagged estimated -- a leftover of the old
+        # per-job-total formula, not a real confirmed figure under the
+        # new hybrid. Must be treated as unknown, never reused.
+        job = self._make_callback_job(bled_amount=Decimal('500.00'), is_estimated=False)
+        self._assign(job, self.hannah)
+
+        stats = _accumulate_technician_cross_job_callback_stats(self.tenant.id, self.period_start)
+
+        self.assertEqual(stats[self.hannah.id]['callback_dollars_lost'], 0.0)
+        self.assertTrue(stats[self.hannah.id]['has_unknown_callback_cost'])
+        self.assertFalse(stats[self.hannah.id]['has_estimated_callback_cost'])
+
+    # ── Decimal/float merge boundary ──────────────────────────────────
+
+    def test_merge_callback_stats_combines_old_float_and_new_decimal_boundary(self):
+        job = self._make_callback_job()
+        self._assign(job, self.hannah)
+        self._log_hours(job, self.hannah, 6 * 3600, rate=Decimal('40'))
+
+        new_stats = _accumulate_technician_cross_job_callback_stats(self.tenant.id, self.period_start)
+        old_stats = {
+            self.hannah.id: {
+                'callback_visits_done': 1,
+                'callback_dollars_lost': 100.0,
+                'has_unknown_callback_cost': False,
+                'has_estimated_callback_cost': False,
+            },
+        }
+
+        # Must not raise TypeError (Decimal + float) -- both accumulators'
+        # own dicts are plain floats at this boundary.
+        merged = _merge_callback_stats(old_stats, new_stats)
+
+        self.assertEqual(merged[self.hannah.id]['callback_dollars_lost'], 340.0)
+        self.assertEqual(merged[self.hannah.id]['callback_visits_done'], 2)

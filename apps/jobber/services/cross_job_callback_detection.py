@@ -27,35 +27,19 @@ only, but is no longer read or written anywhere in this module.
 """
 import logging
 from datetime import timedelta
-from decimal import ROUND_HALF_UP, Decimal
 
 from django.utils import timezone
 
-from apps.jobber.api.electricians_summary import calculate_job_duration_by_user
+from apps.jobber.api.electricians_summary import (
+    _quantize_money,
+    calculate_job_duration_by_user,
+    job_has_logged_labour_hours,
+)
 from apps.jobber.models import JobberJob
 from apps.jobber.services import client
 from apps.jobber.services.sync import CALLBACK_SCHEDULED_HOURS_CEILING, _to_datetime, _to_decimal
 
 logger = logging.getLogger(__name__)
-
-# cross_job_callback_bled_amount is a DecimalField(decimal_places=2) --
-# but job_rate * hours is plain, un-rounded Decimal division/
-# multiplication, which routinely produces far more than 2 decimal
-# places (real logged hours are rarely round numbers, e.g. 3.25h gives a
-# repeating decimal). No other quantization convention exists anywhere
-# else in this codebase (detect_and_freeze_callbacks() never needed one,
-# since it writes its own amount exactly once and never recomputes-and-
-# compares). Without rounding to the SAME precision the field itself
-# stores, a freshly recomputed amount would never equal the already-
-# rounded stored value, and detect_cross_job_callbacks()'s own "save
-# only when changed" check would rewrite this field on every single
-# pass, forever, even when nothing real actually changed.
-_MONEY_QUANTUM = Decimal('0.01')
-
-
-def _quantize_money(amount):
-    return amount.quantize(_MONEY_QUANTUM, rounding=ROUND_HALF_UP)
-
 
 # The real, fixed match-eligibility window from the client's own
 # proposal -- the gap between the 2 jobs' own real timestamps, a fixed
@@ -113,12 +97,18 @@ def _needs_rescan(job, now):
          state within this window -- a confirmed, already-settled job
          still gets re-examined until its own window closes; a known,
          accepted minor inefficiency, not a correctness gap.
-      2. It's ALREADY matched (cross_job_callback_of is set) AND its
-         amount is still unknown or estimated (not yet a real,
-         logged-hours-confirmed figure) AND it's within
+      2. It's ALREADY matched (cross_job_callback_of is set) AND it still
+         has NO real logged labour hours of its own (still estimate
+         mode, per job_has_logged_labour_hours() -- not yet a real,
+         per-person labour-mode figure) AND it's within
          CROSS_JOB_CALLBACK_AMOUNT_RESCAN_CEILING_DAYS (90 days) of
-         creation -- a longer leash specifically for the amount, past
-         the match-eligibility window itself.
+         creation -- a longer leash specifically for the estimate, past
+         the match-eligibility window itself. Checked against this job's
+         own REAL current timesheet entries, never against the stored
+         cross_job_callback_bled_amount/_is_estimated fields themselves
+         -- a legacy stored amount that predates this check (non-null,
+         not flagged estimated) must not be mistaken for "settled" when
+         the job genuinely still has no logged hours.
 
     A job with no real jobber_created_at can't have either condition
     evaluated honestly, so it's excluded -- same "no data != assumed"
@@ -127,10 +117,11 @@ def _needs_rescan(job, now):
     An UNMATCHED job older than 30 days returns False permanently (not
     via a stored flag -- simply because condition 1 can never be true
     again for it, and condition 2 requires a match that doesn't exist).
-    A MATCHED job with a real, confirmed (non-estimated) amount, once
-    past 30 days, also returns False (condition 1 no longer true;
-    condition 2 excludes a confirmed amount by design) -- nothing left
-    to recompute.
+    A MATCHED job that already has real logged hours (already in labour
+    mode), once past 30 days, also returns False (condition 1 no longer
+    true; condition 2 excludes a job already in labour mode by design)
+    -- once labour mode starts, there's nothing left to rescan for that
+    job's estimate ever again.
     """
     if job.jobber_created_at is None:
         return False
@@ -138,11 +129,8 @@ def _needs_rescan(job, now):
     if age <= timedelta(days=CROSS_JOB_CALLBACK_WINDOW_DAYS):
         return True
     if job.cross_job_callback_of_id is not None:
-        amount_unsettled = (
-            job.cross_job_callback_bled_amount is None
-            or job.cross_job_callback_bled_amount_is_estimated
-        )
-        if amount_unsettled and age <= timedelta(days=CROSS_JOB_CALLBACK_AMOUNT_RESCAN_CEILING_DAYS):
+        still_estimate_mode = not job_has_logged_labour_hours(job)
+        if still_estimate_mode and age <= timedelta(days=CROSS_JOB_CALLBACK_AMOUNT_RESCAN_CEILING_DAYS):
             return True
     return False
 
@@ -202,13 +190,19 @@ def _find_earlier_match(job, candidates):
 
 def _compute_cross_job_bled_amount(account, earlier_job, later_job):
     """
+    ESTIMATE MODE ONLY -- the real per-person labour-mode figure is never
+    computed here; once later_job has any real logged hours of its own,
+    technician_stats.py's _accumulate_technician_cross_job_callback_stats()
+    computes each contributor's own hours x their own rate fresh, at read
+    time, from local entries, entirely bypassing this function's result.
+    This function skips its own live fetch outright once that's true --
+    there's nothing left for it to estimate.
+
     A genuine no-charge job still carries a real, non-zero Job.total --
     Jobber prices line items independently of whether the job is ever
-    invoiced. This adapts the existing rate formula across 2 separate
-    jobs instead of one job split by first_archived_at: earlier_job's
-    own real rate (its total / its own real logged hours) x later_job's
-    own real logged hours, or the same scheduled-time fallback +
-    CALLBACK_SCHEDULED_HOURS_CEILING if later_job has no logged hours.
+    invoiced. earlier_job's own real rate (its total / its own real
+    logged hours) x later_job's own real SCHEDULED visit hours, capped at
+    CALLBACK_SCHEDULED_HOURS_CEILING.
 
     Returns (amount_or_None, is_estimated, fetch_failed) -- a real
     3-way distinction, not 2:
@@ -223,32 +217,31 @@ def _compute_cross_job_bled_amount(account, earlier_job, later_job):
       - fetch_failed=False means amount/is_estimated ARE the real,
         current, honest answer -- including a genuine (None, False),
         which means real data was actually checked and there is
-        genuinely no usable cost basis right now. The caller SHOULD
-        write this, even if it downgrades a previous estimated/
-        confirmed value (e.g. logged hours were deleted and no usable
-        schedule exists either) -- that's the honest current truth, not
-        a failure, same "no data != 0" convention as everywhere else.
+        genuinely no usable cost basis right now, OR that later_job has
+        already moved into labour mode (nothing to estimate). The caller
+        SHOULD write this, even if it downgrades a previous estimated
+        value (e.g. real hours just got logged, or no usable schedule
+        exists) -- that's the honest current truth, not a failure, same
+        "no data != 0" convention as everywhere else.
 
     Safe against stale/incomplete local timesheet data on purpose:
     calculate_job_duration_by_user() is a pure local-DB read with a
     confirmed "{} on zero entries" contract (its own docstring), never
-    an exception -- so earlier_hours/later_hours simply come back 0 on
-    stale/missing data, which the `earlier_hours <= 0` check below
-    already turns into a real, successful (not failed) None result.
+    an exception -- so earlier_hours simply comes back 0 on stale/missing
+    data, which the `earlier_hours <= 0` check below already turns into a
+    real, successful (not failed) None result.
     """
+    if job_has_logged_labour_hours(later_job):
+        return None, False, False
+
     earlier_hours = sum(calculate_job_duration_by_user(earlier_job).values()) / 3600
     if earlier_hours <= 0 or earlier_job.total is None:
         return None, False, False
     job_rate = earlier_job.total / _to_decimal(earlier_hours)
 
-    later_hours_by_user = calculate_job_duration_by_user(later_job)
-    later_hours = sum(later_hours_by_user.values()) / 3600
-    if later_hours_by_user and later_hours > 0:
-        return _quantize_money(job_rate * _to_decimal(later_hours)), False, False
-
-    # No logged hours on the later job -- same scheduled-time fallback as
-    # detect_and_freeze_callbacks(), reusing its EXACT existing live
-    # fetch (fetch_job_visits_for_callback_detection already carries
+    # No logged hours on the later job -- the real scheduled-time fallback,
+    # reusing detect_and_freeze_callbacks()'s EXACT existing live fetch
+    # (fetch_job_visits_for_callback_detection already carries
     # startAt/endAt per visit -- no new query needed for this).
     try:
         visits_raw = client.fetch_job_visits_for_callback_detection(account, later_job.jobber_id)
@@ -322,7 +315,7 @@ def detect_cross_job_callbacks(account, tenant):
     block that still has sync_invoices()/sync_expenses() ahead of it
     (confirmed directly in sync.py) -- an unhandled exception from one
     bad job here would otherwise propagate out, mark the WHOLE sync
-    pass as failed, and skip invoices/expenses for every tenant on every
+    pass as failed, and skip invoices/expenses for this tenant on every
     pass, not just fail to process that one job. An exception here is
     logged with the job's own id and that job is skipped; every other
     candidate still gets processed normally in the same pass.

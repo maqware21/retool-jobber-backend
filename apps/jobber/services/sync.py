@@ -639,9 +639,9 @@ def detect_and_freeze_callbacks(account, tenant, job_ids_to_check):
     THIS FUNCTION IS THE SINGLE, SOLE PLACE the "what counts as a callback"
     definition lives — no other view, serializer, or frontend logic should
     ever duplicate or re-derive it. is_callback/callback_bled_amount are
-    only ever written here; backfill_callback_bled_amount.py recomputes
-    callback_bled_amount using this exact same formula, it does not encode
-    a second definition.
+    only ever written here; any future one-off backfill that recomputes
+    callback_bled_amount for historical data must reuse this exact same
+    formula, not encode a second definition.
 
     DELIBERATE, KNOWN PROPERTY, not a hidden limitation — since every
     result here is frozen at write time and never re-evaluated: a FUTURE
