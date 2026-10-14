@@ -20,7 +20,11 @@ from unittest.mock import patch
 from django.test import TestCase
 from django.utils import timezone
 
-from apps.jobber.models import JobberClient, JobberJob, JobberTimeSheetEntry, JobberUser
+from apps.jobber.api.technician_stats import (
+    _accumulate_technician_cross_job_callback_stats,
+    _merge_callback_stats,
+)
+from apps.jobber.models import JobberClient, JobberJob, JobberTimeSheetEntry, JobberUser, JobberVisit
 from apps.jobber.services import client
 from apps.jobber.services.cross_job_callback_detection import (
     CROSS_JOB_CALLBACK_AMOUNT_RESCAN_CEILING_DAYS,
@@ -403,3 +407,187 @@ class CrossJobCallbackRealScenarioRegressionTests(TestCase):
         detect_cross_job_callbacks(self.account, self.tenant)
         f3.refresh_from_db()
         self.assertIsNone(f3.cross_job_callback_of, "the service_type safeguard must block a match even with address+client+keyword all agreeing")
+
+
+class CallbackLabourCostHybridTests(TestCase):
+    """
+    _accumulate_technician_cross_job_callback_stats()'s TL-approved hybrid
+    (callback_labour_cost_plan.md Section 2): labour mode (per-person
+    hours x own rate, 3 real outcomes) when real hours are logged
+    anywhere on the later job, today's stored estimate (honoured only
+    when genuinely flagged estimated) otherwise. Calls the real
+    accumulator (and _merge_callback_stats()) directly against real rows
+    -- detect_cross_job_callbacks() itself (and its live-fetch estimate
+    path) is exercised separately, by CrossJobCallbackDetectionTests
+    above; these tests set cross_job_callback_of/
+    cross_job_callback_bled_amount directly instead of running detection.
+    """
+
+    def setUp(self):
+        self.tenant = Tenant.objects.create()
+        self.client_row = JobberClient.objects.create(
+            tenant=self.tenant, jobber_id='client-hybrid', name='Hybrid Client', synced_at=timezone.now(),
+        )
+        self.hannah = JobberUser.objects.create(
+            tenant=self.tenant, jobber_id='user-hannah', name='Hannah', synced_at=timezone.now(),
+        )
+        self.owen = JobberUser.objects.create(
+            tenant=self.tenant, jobber_id='user-owen', name='Owen', synced_at=timezone.now(),
+        )
+        self.casey = JobberUser.objects.create(
+            tenant=self.tenant, jobber_id='user-casey', name='Casey', synced_at=timezone.now(),
+        )
+        now = timezone.now()
+        # A real row for cross_job_callback_of to point at -- its own
+        # content is irrelevant to the accumulator under test, which only
+        # ever reads it via the isnull filter.
+        self.earlier = JobberJob.objects.create(
+            tenant=self.tenant, client=self.client_row, jobber_id='job-earlier', job_number=1,
+            title='Original job', description='Original job',
+            job_status='archived', status_display='Archived',
+            service_type=_SERVICE_TYPE, total=Decimal('1800'),
+            jobber_created_at=now - timedelta(days=20), completed_at=now - timedelta(days=15),
+            property_id=_PROPERTY_ID, synced_at=timezone.now(),
+        )
+        self.period_start = now - timedelta(days=90)
+        self._next_job_number = 100
+
+    def _make_callback_job(self, bled_amount=None, is_estimated=False):
+        self._next_job_number += 1
+        job_number = self._next_job_number
+        return JobberJob.objects.create(
+            tenant=self.tenant, client=self.client_row,
+            jobber_id=f'job-cb-{job_number}', job_number=job_number,
+            title='Follow-up visit — no charge', description='Follow-up visit — no charge',
+            job_status='requires_invoicing', status_display='Requires Invoicing',
+            service_type=_SERVICE_TYPE, total=Decimal('0'),
+            jobber_created_at=timezone.now() - timedelta(days=1),
+            property_id=_PROPERTY_ID, synced_at=timezone.now(),
+            cross_job_callback_of=self.earlier,
+            cross_job_callback_bled_amount=bled_amount,
+            cross_job_callback_bled_amount_is_estimated=is_estimated,
+        )
+
+    def _assign(self, job, *users):
+        visit = JobberVisit.objects.create(
+            tenant=self.tenant, job=job,
+            jobber_id=f'visit-{job.id}-{"-".join(str(u.id) for u in users)}',
+            synced_at=timezone.now(),
+        )
+        visit.assigned_users.set(users)
+        return visit
+
+    def _log_hours(self, job, user, seconds, rate=None):
+        JobberTimeSheetEntry.objects.create(
+            tenant=self.tenant, job=job, user=user,
+            jobber_id=f'entry-{job.id}-{user.id}-{seconds}-{rate}',
+            final_duration_seconds=seconds,
+            labour_rate=rate,
+            jobber_created_at=job.jobber_created_at,
+            synced_at=timezone.now(),
+        )
+
+    # ── labour mode: own hours x own rate, never a split of a total ─────
+
+    def test_labour_mode_confirmed_cost_accumulates_across_jobs(self):
+        job1 = self._make_callback_job()
+        self._assign(job1, self.hannah)
+        self._log_hours(job1, self.hannah, 6 * 3600, rate=Decimal('40'))
+
+        job2 = self._make_callback_job()
+        self._assign(job2, self.hannah)
+        self._log_hours(job2, self.hannah, 3 * 3600, rate=Decimal('40'))
+
+        stats = _accumulate_technician_cross_job_callback_stats(self.tenant.id, self.period_start)
+
+        self.assertEqual(stats[self.hannah.id]['callback_dollars_lost'], 360.0, "6h x $40 ($240) + 3h x $40 ($120)")
+        self.assertEqual(stats[self.hannah.id]['callback_visits_done'], 2)
+        self.assertFalse(stats[self.hannah.id]['has_unknown_callback_cost'])
+
+    def test_labour_mode_two_assignees_get_own_card_not_proportional_split(self):
+        job = self._make_callback_job()
+        self._assign(job, self.hannah, self.owen)
+        self._log_hours(job, self.hannah, 6 * 3600, rate=Decimal('40'))
+        self._log_hours(job, self.owen, 2 * 3600, rate=Decimal('22'))
+
+        stats = _accumulate_technician_cross_job_callback_stats(self.tenant.id, self.period_start)
+
+        self.assertEqual(stats[self.hannah.id]['callback_dollars_lost'], 240.0, "Hannah's OWN hours x OWN rate, never a split of a job-level total")
+        self.assertEqual(stats[self.owen.id]['callback_dollars_lost'], 44.0, "Owen's OWN hours x OWN rate")
+
+    def test_labour_mode_three_per_person_outcomes_on_one_job(self):
+        job = self._make_callback_job()
+        # Owen: assigned, but no entries of his OWN -- case (a), someone
+        # else (Hannah) logged real hours, so the job IS in labour mode.
+        self._assign(job, self.hannah, self.owen)
+        self._log_hours(job, self.hannah, 4 * 3600, rate=Decimal('40'))  # case (b)
+        # Casey: a real logger who is NOT a formal assignee, with no
+        # usable rate -- case (c), AND a real test of the union-of-
+        # assignees-and-loggers population rule (Section 3).
+        self._log_hours(job, self.casey, 3 * 3600, rate=None)
+
+        stats = _accumulate_technician_cross_job_callback_stats(self.tenant.id, self.period_start)
+
+        self.assertEqual(stats[self.hannah.id]['callback_dollars_lost'], 160.0)
+        self.assertFalse(stats[self.hannah.id]['has_unknown_callback_cost'])
+
+        self.assertEqual(stats[self.owen.id]['callback_dollars_lost'], 0.0, "case (a): a real, confirmed $0, not unknown")
+        self.assertFalse(stats[self.owen.id]['has_unknown_callback_cost'])
+        self.assertEqual(stats[self.owen.id]['callback_visits_done'], 1)
+
+        self.assertEqual(stats[self.casey.id]['callback_dollars_lost'], 0.0)
+        self.assertTrue(stats[self.casey.id]['has_unknown_callback_cost'], "case (c): real entries, no usable rate -- genuinely unknown")
+        self.assertEqual(stats[self.casey.id]['callback_visits_done'], 1, "a non-assignee real logger still gets full visit credit")
+
+    # ── estimate mode ─────────────────────────────────────────────────
+
+    def test_zero_second_entry_stays_in_estimate_mode(self):
+        job = self._make_callback_job(bled_amount=Decimal('150.00'), is_estimated=True)
+        self._assign(job, self.hannah)
+        # A 0-second entry is NOT logged hours -- must not flip the job
+        # into labour mode.
+        self._log_hours(job, self.hannah, 0, rate=Decimal('40'))
+
+        stats = _accumulate_technician_cross_job_callback_stats(self.tenant.id, self.period_start)
+
+        self.assertEqual(stats[self.hannah.id]['callback_dollars_lost'], 150.0)
+        self.assertTrue(stats[self.hannah.id]['has_estimated_callback_cost'])
+        self.assertFalse(stats[self.hannah.id]['has_unknown_callback_cost'])
+
+    def test_legacy_stored_non_estimated_amount_is_unknown(self):
+        # Genuinely zero logged hours (estimate-mode eligible), but the
+        # stored amount is NOT flagged estimated -- a leftover of the old
+        # per-job-total formula, not a real confirmed figure under the
+        # new hybrid. Must be treated as unknown, never reused.
+        job = self._make_callback_job(bled_amount=Decimal('500.00'), is_estimated=False)
+        self._assign(job, self.hannah)
+
+        stats = _accumulate_technician_cross_job_callback_stats(self.tenant.id, self.period_start)
+
+        self.assertEqual(stats[self.hannah.id]['callback_dollars_lost'], 0.0)
+        self.assertTrue(stats[self.hannah.id]['has_unknown_callback_cost'])
+        self.assertFalse(stats[self.hannah.id]['has_estimated_callback_cost'])
+
+    # ── Decimal/float merge boundary (Section 6) ─────────────────────
+
+    def test_merge_callback_stats_combines_old_float_and_new_decimal_boundary(self):
+        job = self._make_callback_job()
+        self._assign(job, self.hannah)
+        self._log_hours(job, self.hannah, 6 * 3600, rate=Decimal('40'))
+
+        new_stats = _accumulate_technician_cross_job_callback_stats(self.tenant.id, self.period_start)
+        old_stats = {
+            self.hannah.id: {
+                'callback_visits_done': 1,
+                'callback_dollars_lost': 100.0,
+                'has_unknown_callback_cost': False,
+                'has_estimated_callback_cost': False,
+            },
+        }
+
+        # Must not raise TypeError (Decimal + float) -- both accumulators'
+        # own dicts are plain floats at this boundary.
+        merged = _merge_callback_stats(old_stats, new_stats)
+
+        self.assertEqual(merged[self.hannah.id]['callback_dollars_lost'], 340.0)
+        self.assertEqual(merged[self.hannah.id]['callback_visits_done'], 2)

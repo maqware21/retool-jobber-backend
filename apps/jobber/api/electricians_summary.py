@@ -1,6 +1,6 @@
 import logging
 from datetime import timedelta
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 
 from dateutil.relativedelta import relativedelta
 from django.db.models import Min, Sum
@@ -203,6 +203,48 @@ def calculate_job_duration_seconds(job):
     if not per_user:
         return None
     return int(round(sum(per_user.values())))
+
+
+def job_has_logged_labour_hours(job, hours_by_user=None):
+    """
+    The real labour-mode switch for the callback-cost hybrid (see
+    callback_labour_cost_plan.md's Section 2): True once this job has any
+    REAL, merged tracked seconds from ANY of its active timesheet
+    entries — never a bare `.filter(is_active=True).exists()` check,
+    which would also flip a job into labour mode for a still-running
+    timer (ended_at still null, no real duration yet) or an entry that
+    Jobber itself recorded with 0 real seconds. Both of those merge down
+    to 0 real seconds via calculate_job_duration_by_user()/
+    _merge_intervals() above, so neither one flips this.
+
+    hours_by_user: pass calculate_job_duration_by_user(job)'s own
+    already-computed dict when the caller has one (e.g. it also needs it
+    for per-person hours/cost right after this check) to avoid a second,
+    identical query — computed fresh here otherwise. This is a per-JOB
+    switch, not a per-person one, by design: one real logged hour
+    anywhere on the job flips the WHOLE job into labour mode for every
+    person on it.
+    """
+    if hours_by_user is None:
+        hours_by_user = calculate_job_duration_by_user(job)
+    return sum(hours_by_user.values()) > 0
+
+
+# cross_job_callback_bled_amount/callback_bled_amount are both
+# DecimalField(decimal_places=2) -- but job_rate * hours, or hours *
+# labour_rate, are plain, un-rounded Decimal division/multiplication,
+# which routinely produce far more than 2 decimal places (real logged
+# hours are rarely round numbers, e.g. 3.25h gives a repeating decimal).
+# Shared here (not duplicated per caller) so every money figure in the
+# callback-cost pipeline — cross_job_callback_detection.py's own
+# estimate-mode amount, and technician_stats.py's new labour-mode
+# per-person figures — quantizes to the SAME precision the stored field
+# itself uses, via the SAME rounding rule.
+_MONEY_QUANTUM = Decimal('0.01')
+
+
+def _quantize_money(amount):
+    return amount.quantize(_MONEY_QUANTUM, rounding=ROUND_HALF_UP)
 
 
 def _technician_labour_rate(job, user_id):

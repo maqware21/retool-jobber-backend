@@ -27,35 +27,15 @@ only, but is no longer read or written anywhere in this module.
 """
 import logging
 from datetime import timedelta
-from decimal import ROUND_HALF_UP, Decimal
 
 from django.utils import timezone
 
-from apps.jobber.api.electricians_summary import calculate_job_duration_by_user
+from apps.jobber.api.electricians_summary import _quantize_money, calculate_job_duration_by_user
 from apps.jobber.models import JobberJob
 from apps.jobber.services import client
 from apps.jobber.services.sync import CALLBACK_SCHEDULED_HOURS_CEILING, _to_datetime, _to_decimal
 
 logger = logging.getLogger(__name__)
-
-# cross_job_callback_bled_amount is a DecimalField(decimal_places=2) --
-# but job_rate * hours is plain, un-rounded Decimal division/
-# multiplication, which routinely produces far more than 2 decimal
-# places (real logged hours are rarely round numbers, e.g. 3.25h gives a
-# repeating decimal). No other quantization convention exists anywhere
-# else in this codebase (detect_and_freeze_callbacks() never needed one,
-# since it writes its own amount exactly once and never recomputes-and-
-# compares). Without rounding to the SAME precision the field itself
-# stores, a freshly recomputed amount would never equal the already-
-# rounded stored value, and detect_cross_job_callbacks()'s own "save
-# only when changed" check would rewrite this field on every single
-# pass, forever, even when nothing real actually changed.
-_MONEY_QUANTUM = Decimal('0.01')
-
-
-def _quantize_money(amount):
-    return amount.quantize(_MONEY_QUANTUM, rounding=ROUND_HALF_UP)
-
 
 # The real, fixed match-eligibility window from the client's own
 # proposal -- the gap between the 2 jobs' own real timestamps, a fixed

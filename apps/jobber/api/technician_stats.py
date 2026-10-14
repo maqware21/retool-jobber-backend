@@ -12,9 +12,11 @@ from apps.goals.utils import current_month, current_year
 from apps.jobber.api.electricians_summary import (
     PERIOD_MONTHS,
     _gather_job_assignees,
+    _quantize_money,
     calculate_job_duration_by_user,
     calculate_technician_labor_cost,
     calculate_top_earner,
+    job_has_logged_labour_hours,
     split_job_revenue_among_assignees,
 )
 from apps.jobber.models import JobberAccount, JobberJob, JobberUser
@@ -190,40 +192,66 @@ def _accumulate_technician_callback_stats(archived_jobs):
 def _accumulate_technician_cross_job_callback_stats(tenant_id, period_start):
     """
     Per-technician cross-job callback counts and dollar attribution,
-    mirroring _accumulate_technician_callback_stats() above's exact
-    return shape and semantics, sourced from the NEW cross-job model
-    (cross_job_callback_detection.py) instead of the old same-job-reopen
-    one.
+    sourced from the NEW cross-job model (cross_job_callback_detection.py)
+    instead of the old same-job-reopen one. Hybrid, mode-based, per
+    callback_labour_cost_plan.md's Section 2 (TL-approved):
 
-    Population: every real JobberJob with cross_job_callback_of NOT
-    null for this tenant, windowed by THIS (later) job's own real
-    jobber_created_at >= period_start -- deliberately NOT
-    job_status='archived' + completed_at the way the old population
-    above is windowed. Confirmed via real data (tenant_id=6's own JOB-5)
-    that a genuine, already-detected, already-priced cross-job callback
-    can sit at job_status='requires_invoicing' indefinitely -- a real
-    no-charge job has no invoice to close it out, so it may never reach
-    'archived' or get a real completed_at at all. Gating on either would
-    silently exclude a real, confirmed callback from ever appearing
-    here.
+      - LABOUR MODE (job_has_logged_labour_hours(job) is True -- real,
+        merged tracked seconds exist ANYWHERE on this later job): each
+        real contributor's OWN hours x their OWN rate, never a split of
+        one job-level total. 3 real, distinct per-person outcomes:
+          (a) no entries of their OWN, while someone else on the job
+              logged real hours -> a real, confirmed $0, no flag.
+          (b) entries with a usable rate -> hours x rate, the confirmed
+              figure, no flag.
+          (c) entries, but none carry a usable rate (same
+              _technician_labour_rate() exclusion rule as elsewhere) ->
+              unknown, has_unknown_callback_cost=True.
+        Reuses calculate_technician_labor_cost() directly (None
+        collapses cases (a)/(c) together; disambiguated here via this
+        person's own real hours, since (a) is hours<=0 and (c) is
+        hours>0 with no usable rate).
 
-    Attribution: the LATER job's own real assignees
-    (_gather_job_assignees(job) -- every one of its visits'
-    assigned_users, deduped), full credit each, same "no-split" rule
-    callback_visits_done already uses above -- there's no separate
-    "callback visit" to single out in this model; the entire later job
-    IS the callback.
+      - ESTIMATE MODE (zero real logged hours anywhere on the job):
+        today's unchanged formula, stored at detection time. The stored
+        cross_job_callback_bled_amount is honoured ONLY when
+        cross_job_callback_bled_amount_is_estimated is True -- a stored,
+        NON-estimated amount in estimate mode is a leftover of the old
+        per-job-total formula (predates this hybrid), not a real
+        confirmed figure, so it's treated as unknown rather than reused.
+        A real, honoured estimate is split equally among all real
+        assignees, reusing split_job_revenue_among_assignees()'s own
+        existing "nobody tracked time -> equal split" branch (every
+        assignee's hours passed in as 0, since by definition nobody has
+        logged any in estimate mode) -- no new split logic needed.
 
-    callback_dollars_lost: cross_job_callback_bled_amount split via
-    split_job_revenue_among_assignees(), weighted by the later job's own
-    REAL LOGGED HOURS (whole job -- no archival split needed, since the
-    2 jobs are already separate rows) -- same reuse of the existing
-    4-rule split logic the old function above already uses, not
-    re-derived.
+    Population (both modes): the UNION of real assignees
+    (_gather_job_assignees(job)) and real loggers (anyone with > 0 real
+    merged seconds via calculate_job_duration_by_user()) -- confirmed,
+    settled design (Section 3): count and cost use the same people, so a
+    non-assignee logger gets full credit instead of being silently
+    dropped. In estimate mode this union always collapses back to
+    "assignees only," since a real logger (by definition, > 0 hours)
+    would have already put the job into labour mode.
+
+    Decimal end to end for the new per-person math (Section 6):
+    calculate_technician_labor_cost() already returns a real Decimal;
+    the estimate-mode equal share (a float, from
+    split_job_revenue_among_assignees()'s own float-based math,
+    unchanged) is converted to Decimal before being combined. Each
+    person's own contribution is quantized to cents via _quantize_money()
+    as it's added, so repeated reads are stable. Converted to float ONLY
+    at this function's own return boundary below -- the OLD accumulator
+    above (_accumulate_technician_callback_stats()) already returns
+    plain floats throughout, and _merge_callback_stats() combines the two
+    via plain `+=`; Decimal + float raises TypeError, so this boundary
+    conversion is what keeps that merge safe.
 
     has_unknown_callback_cost / has_estimated_callback_cost: same
-    meaning as above, read from cross_job_callback_bled_amount /
-    cross_job_callback_bled_amount_is_estimated instead.
+    meaning as the old accumulator's fields -- has_estimated_callback_cost
+    is only ever set in estimate mode (a labour-mode figure is always
+    either a real confirmed number or genuinely unknown, never an
+    estimate).
     """
     later_jobs = JobberJob.objects.filter(
         tenant_id=tenant_id,
@@ -234,37 +262,66 @@ def _accumulate_technician_cross_job_callback_stats(tenant_id, period_start):
     stats = {}
     for job in later_jobs:
         assignees = _gather_job_assignees(job)
-        if not assignees:
+        hours_by_user = calculate_job_duration_by_user(job)
+        loggers = {user_id for user_id, seconds in hours_by_user.items() if seconds > 0}
+        population = set(assignees) | loggers
+        if not population:
             continue
 
-        has_known_amount = job.cross_job_callback_bled_amount is not None
-        is_estimated_amount = has_known_amount and job.cross_job_callback_bled_amount_is_estimated
+        per_person_cost = {}
+        unknown_users = set()
+        estimated_users = set()
 
-        dollar_shares = {}
-        if has_known_amount:
-            hours_by_user = calculate_job_duration_by_user(job)
-            hours_by_user = {user_id: hours_by_user.get(user_id, 0) for user_id in assignees}
-            dollar_shares = split_job_revenue_among_assignees(
-                float(job.cross_job_callback_bled_amount), hours_by_user,
+        if job_has_logged_labour_hours(job, hours_by_user):
+            for user_id in population:
+                cost = calculate_technician_labor_cost(job, user_id, hours_by_user)
+                if cost is not None:
+                    # Case (b): a usable rate -> hours x rate, confirmed.
+                    per_person_cost[user_id] = _quantize_money(cost)
+                elif hours_by_user.get(user_id, 0) > 0:
+                    # Case (c): real entries, no usable rate -> unknown.
+                    unknown_users.add(user_id)
+                # Case (a) (hours <= 0): a real, confirmed $0 -- no entry
+                # in per_person_cost, no flag.
+        else:
+            has_known_amount = (
+                job.cross_job_callback_bled_amount is not None
+                and job.cross_job_callback_bled_amount_is_estimated
             )
+            if has_known_amount and assignees:
+                zero_hours = {user_id: 0 for user_id in assignees}
+                shares = split_job_revenue_among_assignees(
+                    float(job.cross_job_callback_bled_amount), zero_hours,
+                )
+                for user_id, share in shares.items():
+                    per_person_cost[user_id] = _quantize_money(Decimal(str(share)))
+                estimated_users = set(assignees)
+            else:
+                # No stored amount, or a stored NON-estimated amount in
+                # estimate mode (a leftover of the old formula) -- the
+                # whole job's cost is genuinely unknown.
+                unknown_users = set(population)
 
-        for user_id in assignees:
+        for user_id in population:
             entry = stats.setdefault(
                 user_id,
                 {
                     'callback_visits_done': 0,
-                    'callback_dollars_lost': 0.0,
+                    'callback_dollars_lost': Decimal('0'),
                     'has_unknown_callback_cost': False,
                     'has_estimated_callback_cost': False,
                 },
             )
             entry['callback_visits_done'] += 1
-            if has_known_amount:
-                entry['callback_dollars_lost'] += dollar_shares.get(user_id, 0.0)
-                if is_estimated_amount:
-                    entry['has_estimated_callback_cost'] = True
-            else:
+            if user_id in per_person_cost:
+                entry['callback_dollars_lost'] += per_person_cost[user_id]
+            if user_id in unknown_users:
                 entry['has_unknown_callback_cost'] = True
+            if user_id in estimated_users:
+                entry['has_estimated_callback_cost'] = True
+
+    for entry in stats.values():
+        entry['callback_dollars_lost'] = float(entry['callback_dollars_lost'])
     return stats
 
 
