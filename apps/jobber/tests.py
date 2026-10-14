@@ -346,6 +346,89 @@ class CrossJobCallbackDetectionTests(TestCase):
         self.assertFalse(stats[self.user.id]['has_estimated_callback_cost'])
         self.assertNotEqual(Decimal(str(stats[self.user.id]['callback_dollars_lost'])), stale_estimate)
 
+    # ── 7. round trip: estimate -> labour (cleared, no live fetch) -> estimate again (recomputed) ──
+
+    def test_round_trip_estimate_cleared_by_labour_then_recomputed_on_return_to_estimate(self):
+        """
+        A matched job with a stored estimate; a real entry flips it to
+        labour mode and detect_cross_job_callbacks() clears the now-stale
+        estimate WITHOUT ever touching the live fetch (nothing left to
+        estimate once real hours exist); the entry is then deleted,
+        dropping the job back to zero real hours, and a second detection
+        pass -- live fetch mocked again, with a deliberately different
+        schedule -- recomputes and stores a FRESH estimate, flagged
+        estimated. The accumulator must then read that fresh `~`
+        estimate, not the first one.
+        """
+        now = timezone.now()
+        earlier = self._make_job(1, created_at=now - timedelta(days=25), completed_at=now - timedelta(days=20), total=Decimal('1800'))
+        self._log_hours(earlier, 4 * 3600)
+        later = self._make_job(2, created_at=now - timedelta(days=1), title='Follow-up visit — no charge')
+        # A real assignee is needed for the ESTIMATE-mode accumulator read
+        # at the end -- it attributes the stored estimate to assignees,
+        # never to loggers (there are none left once the entry is deleted).
+        visit = JobberVisit.objects.create(
+            tenant=self.tenant, job=later, jobber_id='visit-later-roundtrip', synced_at=timezone.now(),
+        )
+        visit.assigned_users.set([self.user])
+
+        scheduled_start = now - timedelta(hours=2)
+        scheduled_end = scheduled_start + timedelta(hours=1, minutes=30)
+        fake_visit = {
+            'id': 'visit-later', 'createdAt': now.isoformat(),
+            'startAt': scheduled_start.isoformat(), 'endAt': scheduled_end.isoformat(),
+        }
+        with patch.object(client, 'fetch_job_visits_for_callback_detection', return_value=[fake_visit]):
+            detect_cross_job_callbacks(self.account, self.tenant)
+        later.refresh_from_db()
+        self.assertEqual(later.cross_job_callback_of_id, earlier.id)
+        first_estimate = later.cross_job_callback_bled_amount
+        self.assertIsNotNone(first_estimate)
+        self.assertTrue(later.cross_job_callback_bled_amount_is_estimated)
+
+        # A real entry appears -- the job flips to labour mode. Detection
+        # must clear the stale estimate without ever touching the live
+        # fetch (nothing left for it to estimate).
+        entry = self._log_hours(later, 2 * 3600, rate=Decimal('30'))
+        with patch.object(client, 'fetch_job_visits_for_callback_detection') as fetch_mock:
+            detect_cross_job_callbacks(self.account, self.tenant)
+        fetch_mock.assert_not_called()
+        later.refresh_from_db()
+        self.assertEqual(later.cross_job_callback_of_id, earlier.id, "sticky -- still the same earlier job")
+        self.assertIsNone(later.cross_job_callback_bled_amount, "labour mode has nothing to estimate -- cleared, not kept")
+        self.assertFalse(later.cross_job_callback_bled_amount_is_estimated)
+
+        # The only real entry is removed -- zero real hours again, back to
+        # estimate mode. A second real pass, with a deliberately different
+        # live-fetch result, must recompute and store a FRESH estimate --
+        # not resurrect the first one.
+        entry.delete()
+        second_scheduled_start = now - timedelta(hours=3)
+        second_scheduled_end = second_scheduled_start + timedelta(hours=1)
+        second_fake_visit = {
+            'id': 'visit-later-2', 'createdAt': now.isoformat(),
+            'startAt': second_scheduled_start.isoformat(), 'endAt': second_scheduled_end.isoformat(),
+        }
+        with patch.object(client, 'fetch_job_visits_for_callback_detection', return_value=[second_fake_visit]):
+            detect_cross_job_callbacks(self.account, self.tenant)
+        later.refresh_from_db()
+        self.assertEqual(later.cross_job_callback_of_id, earlier.id, "sticky -- still the same earlier job")
+        second_estimate = later.cross_job_callback_bled_amount
+        self.assertIsNotNone(second_estimate)
+        self.assertTrue(later.cross_job_callback_bled_amount_is_estimated)
+        self.assertNotEqual(
+            second_estimate, first_estimate,
+            "a FRESH estimate, recomputed from the current schedule -- not the stale first one",
+        )
+
+        # The accumulator, with no real hours left anywhere on the job,
+        # must read this fresh stored estimate.
+        period_start = now - timedelta(days=90)
+        stats = _accumulate_technician_cross_job_callback_stats(self.tenant.id, period_start)
+        self.assertIn(self.user.id, stats)
+        self.assertEqual(Decimal(str(stats[self.user.id]['callback_dollars_lost'])), second_estimate)
+        self.assertTrue(stats[self.user.id]['has_estimated_callback_cost'])
+
 
 class CrossJobCallbackPerJobIsolationTests(TestCase):
     """One bad job must not stop the rest of the same pass from processing."""
@@ -407,7 +490,7 @@ class CrossJobCallbackPerJobIsolationTests(TestCase):
 
 class CrossJobCallbackRealScenarioRegressionTests(TestCase):
     """
-    Recreates the real, already-validated tenant_id=6 research scenario
+    Recreates a real, already-validated research scenario
     (research_alternative_callback_detection.py's own Rule D result --
     E1/E2 matched, F1/F2/G1 did not) as local fixtures, confirming the
     event-driven/sticky-match rewrite preserves the exact same real-

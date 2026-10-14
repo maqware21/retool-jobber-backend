@@ -315,7 +315,7 @@ def detect_cross_job_callbacks(account, tenant):
     block that still has sync_invoices()/sync_expenses() ahead of it
     (confirmed directly in sync.py) -- an unhandled exception from one
     bad job here would otherwise propagate out, mark the WHOLE sync
-    pass as failed, and skip invoices/expenses for every tenant on every
+    pass as failed, and skip invoices/expenses for this tenant on every
     pass, not just fail to process that one job. An exception here is
     logged with the job's own id and that job is skipped; every other
     candidate still gets processed normally in the same pass.
