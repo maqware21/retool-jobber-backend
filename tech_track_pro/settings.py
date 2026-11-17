@@ -37,6 +37,7 @@ THIRD_PARTY_APPS = [
 LOCAL_APPS = [
     'apps.users.apps.UsersConfig',
     'apps.tenants.apps.TenantsConfig',
+    'apps.billing.apps.BillingConfig',
     'apps.jobber.apps.JobberConfig',
     'apps.goals.apps.GoalsConfig',
     'apps.alerts.apps.AlertsConfig',
