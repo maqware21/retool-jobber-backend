@@ -37,6 +37,7 @@ THIRD_PARTY_APPS = [
 LOCAL_APPS = [
     'apps.users.apps.UsersConfig',
     'apps.tenants.apps.TenantsConfig',
+    'apps.billing.apps.BillingConfig',
     'apps.jobber.apps.JobberConfig',
     'apps.goals.apps.GoalsConfig',
     'apps.alerts.apps.AlertsConfig',
@@ -162,6 +163,16 @@ JOBBER_CONNECT_FAILURE_URL = config(
     'JOBBER_CONNECT_FAILURE_URL',
     default='http://localhost:5173/jobber/failed',
 )
+
+# ── Stripe ────────────────────────────────────────────────────────────────────
+# All empty by default so the app boots without them; the billing code checks
+# for them where it needs them. STRIPE_API_VERSION is the version the pinned
+# stripe library targets; an empty env value falls back to it.
+
+STRIPE_SECRET_KEY = config('STRIPE_SECRET_KEY', default='')
+STRIPE_WEBHOOK_SECRET = config('STRIPE_WEBHOOK_SECRET', default='')
+STRIPE_PRICE_ID = config('STRIPE_PRICE_ID', default='')
+STRIPE_API_VERSION = config('STRIPE_API_VERSION', default='') or '2026-10-28.endive'
 
 # ── Swagger ───────────────────────────────────────────────────────────────────
 

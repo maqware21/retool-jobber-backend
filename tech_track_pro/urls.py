@@ -20,6 +20,7 @@ urlpatterns = [
 
     # v1 routes
     path('v1/', include('apps.users.urls')),
+    path('v1/billing/', include('apps.billing.urls')),
     path('v1/jobber/', include('apps.jobber.urls')),
     path('v1/goals/', include('apps.goals.urls')),
     path('v1/alerts/', include('apps.alerts.urls')),
