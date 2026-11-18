@@ -15,9 +15,11 @@ METADATA_FLOW = 'flow'
 METADATA_FLOW_RESUBSCRIBE = 'resubscribe'
 METADATA_TENANT_ID = 'tenant_id'
 
-# Stripe statuses of a subscription that still exists and may recover, so a
-# second sign-up for the same email must not start another one.
-LIVE_STATUSES = frozenset({'trialing', 'active', 'past_due', 'unpaid'})
+# Stripe statuses that mean the subscription is over and cannot recover. Only
+# a row in one of these may take a new subscription. Any other status,
+# including a blank one and any status Stripe adds later, may still be
+# billing, so overwriting its ids could orphan a live Stripe subscription.
+ENDED_STATUSES = frozenset({'canceled', 'incomplete_expired'})
 
 _PRIVILEGED_ROLES = frozenset({'admin', 'superadmin'})
 
@@ -100,11 +102,13 @@ def provision_from_checkout_session(session):
         new subscription id; no tenant or user is created;
       - the email belongs to a User with no tenant: a Tenant and
         Subscription are attached to that user;
-      - the email belongs to a User whose tenant has a live or exempt
-        subscription, or to an admin: nothing is created and the existing
-        row is flagged for review;
-      - the email belongs to a User whose tenant has no live subscription:
-        that tenant's row takes the new subscription;
+      - the email belongs to a User whose tenant row is exempt, or has a
+        subscription that is not known to have ended, or belongs to an
+        admin: nothing is created and the existing row is flagged for
+        review;
+      - the email belongs to a User whose tenant row has ended
+        ('canceled' or 'incomplete_expired') or never held a subscription
+        id: that row takes the new subscription;
       - otherwise a Tenant, a User with an unusable password and the
         customer role, and a Subscription are created in one transaction.
     """
@@ -138,7 +142,10 @@ def provision_from_checkout_session(session):
         )
         return ProvisionResult(Outcome.UNMATCHED, note='Stripe ids already in use')
 
-    user = User.objects.filter(email=email).first()
+    # Emails are compared case-insensitively because older rows may not be
+    # lower-cased. Deactivated users (is_active=False) are still found:
+    # User is not soft-deleted, so its email stays taken.
+    user = User.objects.filter(email__iexact=email).order_by('pk').first()
     with transaction.atomic():
         if user is None:
             return _create_new_account(session, email, session_id, subscription_id, customer_id)
@@ -254,10 +261,14 @@ def _existing_user(user, email, session_id, subscription_id, customer_id):
         )
         return ProvisionResult(Outcome.REACTIVATED, subscription=row, user=user)
 
-    if row.billing_exempt or row.status in LIVE_STATUSES:
+    may_take_new_subscription = (
+        row.status in ENDED_STATUSES or not row.stripe_subscription_id
+    )
+    if row.billing_exempt or not may_take_new_subscription:
         note = (
             f"Checkout session {session_id} (subscription {subscription_id}) was paid for "
-            "an email that already has a live or exempt subscription. Nothing was created."
+            "an email whose subscription is exempt or not known to have ended. "
+            "Nothing was created."
         )
         row.needs_review = True
         row.review_note = _append_note(row.review_note, note)

@@ -5,6 +5,7 @@ from django.test import TestCase
 
 from apps.billing.models import Subscription
 from apps.billing.services.provisioning import (
+    ENDED_STATUSES,
     Outcome,
     ProvisioningError,
     provision_from_checkout_session,
@@ -291,6 +292,109 @@ class ExistingUserTests(CountsMixin, TestCase):
         self.assertEqual(result.outcome, Outcome.REACTIVATED)
         self.assertEqual(Subscription.objects.get(tenant=tenant).stripe_subscription_id, 'sub_1')
         self.assertEqual(Tenant.objects.count(), 1)
+
+
+    def reset(self):
+        Subscription.objects.all().delete()
+        User.objects.all().delete()
+        Tenant.objects.all().delete()
+
+    def test_a_mixed_case_existing_email_matches(self):
+        user = User.objects.create(email='New.Buyer@Example.com', first_name='M', password='x')
+        user.user_permissions.add(Permission.objects.get(codename='customer'))
+
+        result = provision_from_checkout_session(session())
+
+        self.assertEqual(result.outcome, Outcome.ATTACHED)
+        self.assertEqual(result.user, user)
+        self.assertEqual(User.objects.count(), 1)
+
+    def test_users_are_not_soft_deleted(self):
+        # User does not inherit SafeDeleteModel and has no `deleted` field,
+        # so a removed user cannot hide behind a default manager.
+        self.assertNotIn('deleted', [f.name for f in User._meta.get_fields()])
+        self.assertTrue(User._meta.get_field('email').unique)
+
+    def test_a_deactivated_user_is_still_found_and_nothing_collides_on_create(self):
+        user = make_user(self.EMAIL)
+        user.is_active = False
+        user.save(update_fields=['is_active'])
+
+        result = provision_from_checkout_session(session())
+
+        self.assertEqual(result.outcome, Outcome.ATTACHED)
+        self.assertEqual(User.objects.count(), 1)
+
+    def test_only_an_ended_status_may_take_a_new_subscription(self):
+        for status in sorted(ENDED_STATUSES):
+            with self.subTest(status=status):
+                self.reset()
+                tenant = Tenant.objects.create()
+                make_user(self.EMAIL, tenant=tenant)
+                row = Subscription.objects.create(
+                    tenant=tenant, status=status, stripe_subscription_id='sub_old',
+                    stripe_checkout_session_id='cs_old',
+                )
+
+                result = provision_from_checkout_session(session())
+
+                self.assertEqual(result.outcome, Outcome.REACTIVATED)
+                row.refresh_from_db()
+                self.assertEqual(row.stripe_subscription_id, 'sub_1')
+                self.assertFalse(row.needs_review)
+
+    def test_any_other_status_with_a_subscription_id_is_a_collision(self):
+        statuses = [
+            'trialing', 'active', 'past_due', 'unpaid', 'incomplete', 'paused',
+            '', 'a_status_stripe_adds_later',
+        ]
+        for status in statuses:
+            with self.subTest(status=status):
+                self.reset()
+                tenant = Tenant.objects.create()
+                make_user(self.EMAIL, tenant=tenant)
+                row = Subscription.objects.create(
+                    tenant=tenant, status=status, stripe_subscription_id='sub_billing',
+                )
+                before = self.counts()
+
+                with self.assertLogs('apps.billing.services.provisioning', level='ERROR'):
+                    result = provision_from_checkout_session(session())
+
+                self.assertEqual(result.outcome, Outcome.COLLISION)
+                self.assertEqual(self.counts(), before)
+                row.refresh_from_db()
+                self.assertTrue(row.needs_review)
+                self.assertEqual(row.stripe_subscription_id, 'sub_billing')
+                self.assertNotEqual(row.stripe_checkout_session_id, 'cs_1')
+
+    def test_a_row_that_never_held_a_subscription_id_takes_the_new_one(self):
+        tenant = Tenant.objects.create()
+        make_user(self.EMAIL, tenant=tenant)
+        row = Subscription.objects.create(tenant=tenant)
+
+        result = provision_from_checkout_session(session())
+
+        self.assertEqual(result.outcome, Outcome.REACTIVATED)
+        row.refresh_from_db()
+        self.assertEqual(row.stripe_subscription_id, 'sub_1')
+        self.assertFalse(row.needs_review)
+
+    def test_an_exempt_row_is_a_collision_whatever_its_status(self):
+        for status in ('', 'canceled'):
+            with self.subTest(status=status):
+                self.reset()
+                tenant = Tenant.objects.create()
+                make_user(self.EMAIL, tenant=tenant)
+                row = Subscription.objects.create(tenant=tenant, billing_exempt=True, status=status)
+
+                with self.assertLogs('apps.billing.services.provisioning', level='ERROR'):
+                    result = provision_from_checkout_session(session())
+
+                self.assertEqual(result.outcome, Outcome.COLLISION)
+                row.refresh_from_db()
+                self.assertTrue(row.needs_review)
+                self.assertIsNone(row.stripe_subscription_id)
 
 
 class ResubscribeTests(CountsMixin, TestCase):

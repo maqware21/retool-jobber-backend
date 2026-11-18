@@ -5,7 +5,7 @@ from django.conf import settings
 from django.db import transaction
 
 from apps.billing.models import Subscription
-from apps.billing.services.stripe_client import get_client
+from apps.billing.services.stripe_client import StripeNotConfigured, get_client
 
 logger = logging.getLogger(__name__)
 
@@ -40,13 +40,18 @@ def refresh_from_stripe(stripe_subscription_id):
     Nothing from a webhook payload is used, so the order events arrive in
     cannot matter: the row always ends up as Stripe reports it now.
     Nothing is changed when no row has this subscription id, or when the
-    subscription is not on STRIPE_PRICE_ID.
+    subscription is not on STRIPE_PRICE_ID. An empty STRIPE_PRICE_ID is a
+    configuration error and raises StripeNotConfigured, so the caller fails
+    and Stripe redelivers the event once the setting is fixed.
 
     The row is locked before Stripe is asked, so two refreshes of one
     subscription run one after the other and the later one fetches the
     later state. `current_period_end` is read from the subscription item
     because the pinned API version no longer puts it on the subscription.
     """
+    if not settings.STRIPE_PRICE_ID:
+        raise StripeNotConfigured('STRIPE_PRICE_ID is not set.')
+
     with transaction.atomic():
         row = (
             Subscription.objects.select_for_update()

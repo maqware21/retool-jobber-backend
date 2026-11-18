@@ -5,6 +5,7 @@ import stripe
 from django.test import TestCase, override_settings
 
 from apps.billing.models import Subscription
+from apps.billing.services.stripe_client import StripeNotConfigured
 from apps.billing.services.sync import refresh_from_stripe
 from apps.tenants.models import Tenant
 
@@ -132,11 +133,12 @@ class RefreshFromStripeTests(TestCase):
         self.assertEqual(self.row.status, '')
 
     @override_settings(STRIPE_PRICE_ID='')
-    def test_without_a_configured_price_nothing_matches(self):
+    def test_an_empty_price_setting_raises_and_changes_nothing(self):
         self.retrieve.return_value = stripe_subscription()
 
-        with self.assertLogs('apps.billing.services.sync', level='WARNING'):
-            self.assertIsNone(refresh_from_stripe('sub_1'))
+        with self.assertRaises(StripeNotConfigured):
+            refresh_from_stripe('sub_1')
 
+        self.retrieve.assert_not_called()
         self.row.refresh_from_db()
         self.assertEqual(self.row.status, '')
