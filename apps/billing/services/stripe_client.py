@@ -35,6 +35,18 @@ def get_client():
     )
 
 
+def to_plain(stripe_object):
+    """
+    Convert a Stripe API object (or a webhook event) to plain dicts and
+    lists. Stripe objects are not dicts: they have no `.get()`, and a
+    subscription's `items` field is reached only by subscript. Plain
+    containers pass through unchanged.
+    """
+    if hasattr(stripe_object, 'to_dict'):
+        return stripe_object.to_dict()
+    return stripe_object
+
+
 def make_idempotency_key(scope, *parts):
     """
     Build an idempotency key from a stable value, so a retry of the same

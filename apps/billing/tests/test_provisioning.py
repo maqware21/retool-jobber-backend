@@ -315,15 +315,67 @@ class ExistingUserTests(CountsMixin, TestCase):
         self.assertNotIn('deleted', [f.name for f in User._meta.get_fields()])
         self.assertTrue(User._meta.get_field('email').unique)
 
-    def test_a_deactivated_user_is_still_found_and_nothing_collides_on_create(self):
-        user = make_user(self.EMAIL)
+    def deactivate(self, user):
         user.is_active = False
         user.save(update_fields=['is_active'])
 
-        result = provision_from_checkout_session(session())
+    def test_a_deactivated_user_with_no_tenant_is_a_collision_that_creates_nothing(self):
+        user = make_user(self.EMAIL)
+        self.deactivate(user)
 
-        self.assertEqual(result.outcome, Outcome.ATTACHED)
-        self.assertEqual(User.objects.count(), 1)
+        with self.assertLogs('apps.billing.services.provisioning', level='ERROR'):
+            result = provision_from_checkout_session(session())
+
+        self.assertEqual(result.outcome, Outcome.COLLISION)
+        self.assertIn('deactivated user', result.note)
+        self.assertIsNone(result.subscription)
+        self.assertEqual(self.counts(), (0, 1, 0))
+        user.refresh_from_db()
+        self.assertIsNone(user.tenant_id)
+
+    def test_a_deactivated_user_with_a_tenant_row_flags_it_for_review(self):
+        for exempt in (False, True):
+            with self.subTest(exempt=exempt):
+                self.reset()
+                tenant = Tenant.objects.create()
+                self.deactivate(make_user(self.EMAIL, tenant=tenant))
+                row = Subscription.objects.create(
+                    tenant=tenant, billing_exempt=exempt, status='canceled',
+                    stripe_subscription_id='sub_old',
+                )
+                before = self.counts()
+
+                with self.assertLogs('apps.billing.services.provisioning', level='ERROR'):
+                    result = provision_from_checkout_session(session())
+
+                self.assertEqual(result.outcome, Outcome.COLLISION)
+                self.assertEqual(result.subscription, row)
+                self.assertEqual(self.counts(), before)
+                row.refresh_from_db()
+                self.assertTrue(row.needs_review)
+                self.assertIn('deactivated user', row.review_note)
+                self.assertEqual(row.stripe_subscription_id, 'sub_old')
+
+    def test_a_deactivated_user_with_a_tenant_but_no_row_creates_nothing(self):
+        tenant = Tenant.objects.create()
+        self.deactivate(make_user(self.EMAIL, tenant=tenant))
+
+        with self.assertLogs('apps.billing.services.provisioning', level='ERROR'):
+            result = provision_from_checkout_session(session())
+
+        self.assertEqual(result.outcome, Outcome.COLLISION)
+        self.assertIsNone(result.subscription)
+        self.assertEqual(self.counts(), (1, 1, 0))
+
+    def test_a_deactivated_staff_user_is_reported_as_staff(self):
+        user = make_user(self.EMAIL, permission='admin')
+        self.deactivate(user)
+
+        with self.assertLogs('apps.billing.services.provisioning', level='ERROR'):
+            result = provision_from_checkout_session(session())
+
+        self.assertEqual(result.outcome, Outcome.COLLISION)
+        self.assertIn('staff', result.note)
 
     def test_only_an_ended_status_may_take_a_new_subscription(self):
         for status in sorted(ENDED_STATUSES):

@@ -5,7 +5,7 @@ from django.conf import settings
 from django.db import transaction
 
 from apps.billing.models import Subscription
-from apps.billing.services.stripe_client import StripeNotConfigured, get_client
+from apps.billing.services.stripe_client import StripeNotConfigured, get_client, to_plain
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +65,7 @@ def refresh_from_stripe(stripe_subscription_id):
             )
             return None
 
-        stripe_subscription = get_client().v1.subscriptions.retrieve(stripe_subscription_id)
+        stripe_subscription = to_plain(get_client().v1.subscriptions.retrieve(stripe_subscription_id))
 
         item = _our_item(stripe_subscription)
         if item is None:

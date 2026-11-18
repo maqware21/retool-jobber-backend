@@ -88,6 +88,12 @@ def _append_note(existing, note):
     return f"{existing}\n{note}".strip() if existing else note
 
 
+def flag_for_review(row, note):
+    row.needs_review = True
+    row.review_note = _append_note(row.review_note, note)
+    row.save(update_fields=['needs_review', 'review_note', 'updated_at'])
+
+
 def provision_from_checkout_session(session):
     """
     Turn a completed Checkout Session into billing state.
@@ -100,6 +106,8 @@ def provision_from_checkout_session(session):
       - a Subscription already holds this session id: nothing to do;
       - a resubscribe session (metadata): the tenant's existing row gets the
         new subscription id; no tenant or user is created;
+      - the email belongs to a deactivated User (is_active=False): nothing
+        is created and that user's tenant row, if any, is flagged for review;
       - the email belongs to a User with no tenant: a Tenant and
         Subscription are attached to that user;
       - the email belongs to a User whose tenant row is exempt, or has a
@@ -237,6 +245,23 @@ def _existing_user(user, email, session_id, subscription_id, customer_id):
             Outcome.COLLISION, user=user, note='email belongs to a platform staff user',
         )
 
+    if not user.is_active:
+        note = (
+            f"Checkout session {session_id} (subscription {subscription_id}) was paid for "
+            "an email that belongs to a deactivated user. Nothing was created."
+        )
+        row = (
+            Subscription.objects.select_for_update().filter(tenant_id=user.tenant_id).first()
+            if user.tenant_id is not None else None
+        )
+        if row is not None:
+            flag_for_review(row, note)
+        logger.error(
+            "Checkout session %s used the email of a deactivated user (id=%s); nothing created.",
+            session_id, user.pk,
+        )
+        return ProvisionResult(Outcome.COLLISION, subscription=row, user=user, note=note)
+
     if user.tenant_id is None:
         tenant = Tenant.objects.create()
         user.tenant = tenant
@@ -270,9 +295,7 @@ def _existing_user(user, email, session_id, subscription_id, customer_id):
             "an email whose subscription is exempt or not known to have ended. "
             "Nothing was created."
         )
-        row.needs_review = True
-        row.review_note = _append_note(row.review_note, note)
-        row.save(update_fields=['needs_review', 'review_note', 'updated_at'])
+        flag_for_review(row, note)
         logger.error(
             "Checkout session %s collides with tenant %s (user id=%s); flagged for review.",
             session_id, user.tenant_id, user.pk,

@@ -59,6 +59,19 @@ class RefreshFromStripeTests(TestCase):
         self.assertEqual(self.row.canceled_at, utc(CANCELED_AT))
         self.assertEqual(self.row.stripe_customer_id, 'cus_9')
 
+    def test_accepts_a_real_stripe_object_which_has_no_get(self):
+        self.retrieve.return_value = stripe.Subscription.construct_from(
+            stripe_subscription(), 'test-key-not-real',
+        )
+        self.assertFalse(hasattr(self.retrieve.return_value, 'get'))
+
+        refresh_from_stripe('sub_1')
+
+        self.row.refresh_from_db()
+        self.assertEqual(self.row.status, 'active')
+        self.assertEqual(self.row.current_period_end, utc(PERIOD_END))
+        self.assertEqual(self.row.stripe_customer_id, 'cus_9')
+
     def test_overwrites_earlier_values_with_what_stripe_reports_now(self):
         self.row.status = 'trialing'
         self.row.trial_end = utc(TRIAL_END)

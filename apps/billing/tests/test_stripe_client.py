@@ -11,6 +11,7 @@ from apps.billing.services.stripe_client import (
     StripeNotConfigured,
     get_client,
     make_idempotency_key,
+    to_plain,
 )
 
 
@@ -63,6 +64,23 @@ class GlobalKeyTests(SimpleTestCase):
             if 'tests' not in path.parts and pattern.search(path.read_text(encoding='utf-8'))
         ]
         self.assertEqual(offenders, [])
+
+
+class ToPlainTests(SimpleTestCase):
+    def test_a_stripe_object_becomes_plain_dicts_and_lists(self):
+        obj = stripe.Subscription.construct_from(
+            {'id': 'sub_1', 'items': {'object': 'list', 'data': [{'price': {'id': 'p'}}]}},
+            'test-key-not-real',
+        )
+        plain = to_plain(obj)
+        self.assertIs(type(plain), dict)
+        self.assertEqual(plain['items']['data'][0]['price']['id'], 'p')
+        self.assertIs(type(plain['items']['data']), list)
+        self.assertIsNone(plain.get('missing'))
+
+    def test_plain_containers_pass_through(self):
+        data = {'a': [1, {'b': 2}]}
+        self.assertIs(to_plain(data), data)
 
 
 class IdempotencyKeyTests(SimpleTestCase):
