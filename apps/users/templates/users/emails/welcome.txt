@@ -1,0 +1,11 @@
+{% autoescape off %}Hi {{ first_name }},
+
+Welcome to TechTrackPro. Your account is ready. The last step is choosing a password.
+
+Choose a password here:
+{{ link }}
+
+This link works once and expires in {{ valid_days }} day{{ valid_days|pluralize }}. If it has expired, use "Forgot password" on the sign-in page to get a new one.
+
+TechTrackPro
+{% endautoescape %}

@@ -10,6 +10,7 @@ from apps.billing.services.provisioning import (
     ProvisioningError,
     provision_from_checkout_session,
 )
+from apps.billing.tests.support import SyncBackgroundMixin
 from apps.tenants.models import Tenant
 from apps.users.models import User
 
@@ -45,7 +46,7 @@ class CountsMixin:
         return (Tenant.objects.count(), User.objects.count(), Subscription.objects.count())
 
 
-class NewAccountTests(CountsMixin, TestCase):
+class NewAccountTests(CountsMixin, SyncBackgroundMixin, TestCase):
     def test_creates_tenant_user_and_subscription(self):
         with self.captureOnCommitCallbacks(execute=True):
             result = provision_from_checkout_session(session())
@@ -122,7 +123,7 @@ class NewAccountTests(CountsMixin, TestCase):
         self.assertEqual(self.counts(), (0, 0, 0))
 
 
-class IgnoredSessionTests(CountsMixin, TestCase):
+class IgnoredSessionTests(CountsMixin, SyncBackgroundMixin, TestCase):
     def test_a_payment_mode_session_is_ignored(self):
         result = provision_from_checkout_session(session(mode='payment'))
         self.assertEqual(result.outcome, Outcome.IGNORED)
@@ -164,7 +165,7 @@ class IgnoredSessionTests(CountsMixin, TestCase):
         self.assertEqual(self.counts(), (1, 0, 1))
 
 
-class RedeliveryTests(CountsMixin, TestCase):
+class RedeliveryTests(CountsMixin, SyncBackgroundMixin, TestCase):
     def test_the_same_session_twice_changes_nothing_the_second_time(self):
         first = provision_from_checkout_session(session())
         counts = self.counts()
@@ -174,7 +175,7 @@ class RedeliveryTests(CountsMixin, TestCase):
         self.assertEqual(self.counts(), counts)
 
 
-class ExistingUserTests(CountsMixin, TestCase):
+class ExistingUserTests(CountsMixin, SyncBackgroundMixin, TestCase):
     EMAIL = 'new.buyer@example.com'
 
     def test_a_user_with_no_tenant_gets_a_tenant_and_subscription(self):
@@ -449,7 +450,7 @@ class ExistingUserTests(CountsMixin, TestCase):
                 self.assertIsNone(row.stripe_subscription_id)
 
 
-class ResubscribeTests(CountsMixin, TestCase):
+class ResubscribeTests(CountsMixin, SyncBackgroundMixin, TestCase):
     def setUp(self):
         self.tenant = Tenant.objects.create()
         make_user('owner@example.com', tenant=self.tenant)

@@ -1,0 +1,11 @@
+{% autoescape off %}Hi {{ first_name }},
+
+We received a request to set the password for your TechTrackPro account.
+
+Choose a password here:
+{{ link }}
+
+This link works once and expires in {{ valid_days }} day{{ valid_days|pluralize }}. If you did not ask for this, you can ignore this email; your password will not change.
+
+TechTrackPro
+{% endautoescape %}

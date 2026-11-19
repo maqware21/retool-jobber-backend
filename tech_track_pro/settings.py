@@ -105,6 +105,15 @@ REST_FRAMEWORK = {
     ],
     'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.LimitOffsetPagination',
     'PAGE_SIZE': DEFAULT_LIMIT,
+    # Only views that name a throttle class are throttled. Counts live in the
+    # default Django cache (local memory: per gunicorn worker, reset on restart).
+    'DEFAULT_THROTTLE_RATES': {
+        'forgot_password': '5/hour',
+        'reset_password': '20/hour',
+    },
+    # Nginx is the one proxy in front of Django, so the client address is the
+    # last X-Forwarded-For entry; earlier entries are client-supplied.
+    'NUM_PROXIES': config('NUM_PROXIES', default=1, cast=int),
 }
 
 # ── JWT ───────────────────────────────────────────────────────────────────────
@@ -163,6 +172,25 @@ JOBBER_CONNECT_FAILURE_URL = config(
     'JOBBER_CONNECT_FAILURE_URL',
     default='http://localhost:5173/jobber/failed',
 )
+
+# ── Email ─────────────────────────────────────────────────────────────────────
+# Standard Django SMTP settings; any SMTP-speaking provider works. The default
+# backend prints messages to the console, so nothing is sent until
+# EMAIL_BACKEND and the SMTP values are set. APP_BASE_URL is the frontend
+# origin that links in emails point at.
+
+EMAIL_BACKEND = config('EMAIL_BACKEND', default='django.core.mail.backends.console.EmailBackend')
+EMAIL_HOST = config('EMAIL_HOST', default='localhost')
+EMAIL_PORT = config('EMAIL_PORT', default=25, cast=int)
+EMAIL_HOST_USER = config('EMAIL_HOST_USER', default='')
+EMAIL_HOST_PASSWORD = config('EMAIL_HOST_PASSWORD', default='')
+EMAIL_USE_TLS = config('EMAIL_USE_TLS', default=False, cast=bool)
+EMAIL_TIMEOUT = 10  # seconds; a stalled SMTP server must not hang a worker
+DEFAULT_FROM_EMAIL = config('DEFAULT_FROM_EMAIL', default='TechTrackPro <no-reply@techtrackpro.com>')
+APP_BASE_URL = config('APP_BASE_URL', default='https://app.techtrackpro.com')
+
+# Lifetime of a password-reset or set-password link, in seconds (3 days).
+PASSWORD_RESET_TIMEOUT = config('PASSWORD_RESET_TIMEOUT', default=60 * 60 * 24 * 3, cast=int)
 
 # ── Stripe ────────────────────────────────────────────────────────────────────
 # All empty by default so the app boots without them; the billing code checks

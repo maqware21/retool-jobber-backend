@@ -29,7 +29,9 @@ MESSAGES = dict(
     # ── Password ──────────────────────────────────────────────────────────────
     PASSWORD_WEAK="Password must be at least 8 characters and include at least one digit and one uppercase letter.",
     PASSWORD_MISMATCH="Old password is incorrect.",
-    PASSWORD_RESET_COMING_SOON="Password reset via email is not yet enabled. Please contact support.",
+    PASSWORD_RESET_EMAIL_SENT="If an account exists for that email, a link to set a password has been sent.",
+    PASSWORD_RESET_INVALID_LINK="This link is invalid or has expired. Please request a new one.",
+    PASSWORD_RESET_DONE="Your password has been set. You can now sign in.",
 
     # ── Token ─────────────────────────────────────────────────────────────────
     INVALID_TOKEN="Token is invalid or expired.",
